@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Aside",
+  "description": "Ask focused follow-up questions from long ChatGPT answers without losing your place.",
+  "version": "0.1.0",
+  "permissions": ["storage", "clipboardWrite", "tabs", "scripting", "windows"],
+  "host_permissions": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+  "background": {
+    "service_worker": "assets/background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "js": ["assets/root-content.js"],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["assets/*"],
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"]
+    }
+  ]
+}

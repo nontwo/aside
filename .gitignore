@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+.local/
+.git/
+.DS_Store
+*.log
+*.tmp
+*.temp
+.env
+.env.*
+tmp/
+temp/
+screenshots/
+public-release/
+aside-public/

@@ -1,0 +1,23 @@
+{
+  "name": "aside",
+  "version": "0.1.0",
+  "description": "Ask focused follow-up questions from long ChatGPT answers without losing your place.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "node ./scripts/build.mjs",
+    "smoke:local": "node ./scripts/local-only-smoke.mjs",
+    "audit:public": "node ./scripts/audit-public.mjs",
+    "export:public": "node ./scripts/export-public.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.269",
+    "jsdom": "^24.1.0",
+    "puppeteer-core": "^24.40.0",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.0",
+    "vitest": "^2.0.5"
+  }
+}
