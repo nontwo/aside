@@ -7,8 +7,10 @@ const root = process.cwd();
 const targetDir = path.resolve(process.argv[2] ?? path.join(root, '..', 'aside-public'));
 const copyEntries = [
   '.gitignore',
+  '.github',
   'LICENSE',
   'README.md',
+  'course-submission',
   'package.json',
   'package-lock.json',
   'tsconfig.json',

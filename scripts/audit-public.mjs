@@ -4,7 +4,10 @@ import process from 'node:process';
 
 const root = path.resolve(process.argv[2] ?? process.cwd());
 const ignoredDirNames = new Set(['.git', 'node_modules', 'dist', 'coverage', '.local']);
-const selfAuditRelativePath = path.join('scripts', 'audit-public.mjs');
+const auditScriptRelativePaths = new Set([
+  path.join('scripts', 'audit-public.mjs'),
+  path.join('scripts', 'audit-submission.mjs')
+]);
 const forbiddenFileNames = new Set([
   '.DS_Store',
   'inspect-chatgpt.mjs',
@@ -74,7 +77,7 @@ async function walk(dir, results = []) {
       continue;
     }
 
-    if (relativePath === selfAuditRelativePath) {
+    if (auditScriptRelativePaths.has(relativePath)) {
       continue;
     }
 

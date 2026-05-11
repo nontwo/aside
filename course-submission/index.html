@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Follow the Sentence, Not the Thread | Aside</title>
+    <meta
+      name="description"
+      content="Aside is a Text as Data app that turns selected passages in long AI answers into local-context branch prompts."
+    />
+    <link rel="stylesheet" href="./assets/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#app" aria-label="Aside home">
+        <span class="brand-mark">A</span>
+        <span>Aside</span>
+      </a>
+      <nav aria-label="Project links">
+        <a href="#app">Demo</a>
+        <a href="./report/report.html">Report</a>
+        <a href="./replication/">Replication</a>
+        <a href="./extension/">Extension</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="intro-grid" aria-label="Project introduction">
+        <div class="intro-copy">
+          <p class="eyebrow">Text as Data Course Project</p>
+          <h1>Follow the Sentence, Not the Thread</h1>
+          <p class="subtitle">
+            Aside is a local-context branching system for long AI conversations.
+            It treats a selected passage as the unit of analysis, builds a small
+            evidence window around it, and turns that local text into a focused
+            follow-up prompt.
+          </p>
+          <div class="intro-body">
+            <p>
+              Long AI answers are dense: one response can contain definitions,
+              comparisons, caveats, examples, and action items. A normal
+              follow-up often drifts because the model sees the entire thread.
+              Aside asks a narrower question: what if the selected sentence is
+              the object the system must explain?
+            </p>
+            <p>
+              The demo below exposes the workflow as text data. Select a passage
+              and watch the app segment the source answer, anchor the selection,
+              score terms, build a context window, and stage a branch that can
+              run beside the main reading flow.
+            </p>
+          </div>
+          <div class="hero-actions">
+            <a class="button primary" href="#app">Run the simulator</a>
+            <a class="button secondary" href="./report/report.html">Read the report</a>
+          </div>
+        </div>
+
+        <aside class="method-summary" aria-label="Method summary">
+          <h2>What the app computes</h2>
+          <ol>
+            <li>
+              <strong>Sentence anchor</strong>
+              <span>Find the selected sentence inside a long source answer.</span>
+            </li>
+            <li>
+              <strong>Local evidence</strong>
+              <span>Keep the selected passage plus nearby context, not the whole thread.</span>
+            </li>
+            <li>
+              <strong>Text signal</strong>
+              <span>Tokenize the passage and surface high-frequency non-stopword terms.</span>
+            </li>
+            <li>
+              <strong>Branch prompt</strong>
+              <span>Generate a reproducible prompt for Ask, Why, or New-tab flows.</span>
+            </li>
+          </ol>
+        </aside>
+      </section>
+
+      <section class="problem-strip" aria-label="Project stakes">
+        <article>
+          <span class="strip-number">01</span>
+          <h2>Problem</h2>
+          <p>Follow-up prompts lose precision when the model relies on unrelated thread history.</p>
+        </article>
+        <article>
+          <span class="strip-number">02</span>
+          <h2>Method</h2>
+          <p>Selected text becomes structured data: anchor, window, terms, prompt sections.</p>
+        </article>
+        <article>
+          <span class="strip-number">03</span>
+          <h2>App</h2>
+          <p>Readers can open multiple local branches without losing their place in the source.</p>
+        </article>
+      </section>
+
+      <section id="app" class="demo-shell" aria-label="Interactive Aside simulator">
+        <div class="demo-header">
+          <div>
+            <p class="eyebrow">Interactive simulator</p>
+            <h2>Branch from a passage</h2>
+          </div>
+          <label class="dataset-picker">
+            <span>Sample text</span>
+            <select id="datasetSelect"></select>
+          </label>
+        </div>
+
+        <div class="control-bar" aria-label="Branch controls">
+          <label class="question-box">
+            <span>Follow-up question</span>
+            <textarea id="questionInput" rows="2">Why does this passage matter?</textarea>
+          </label>
+          <div class="kind-panel">
+            <span>Branch kind</span>
+            <div class="kind-toggle" aria-label="Branch kind">
+              <button id="persistentKind" class="active" type="button">Persistent</button>
+              <button id="temporaryKind" type="button">Temporary</button>
+            </div>
+          </div>
+          <div class="branch-actions" aria-label="Branch actions">
+            <button id="askAction" class="primary-action" type="button">Ask</button>
+            <button id="whyAction" type="button">Why</button>
+            <button id="newTabAction" type="button">New-tab</button>
+          </div>
+        </div>
+
+        <div class="dashboard-grid">
+          <section class="source-pane" aria-label="Source answer">
+            <div class="pane-header">
+              <div>
+                <h3 id="sourceTitle">Source answer</h3>
+                <p id="sourceMeta">Loading sample data...</p>
+              </div>
+              <button id="resetSelection" class="ghost-button" type="button">Reset</button>
+            </div>
+            <article id="sourceText" class="source-text" tabindex="0"></article>
+          </section>
+
+          <aside class="analysis-pane" aria-label="Selection analysis">
+            <section class="analysis-section selected-block">
+              <div class="section-title">
+                <h3>Selected passage</h3>
+                <span id="selectionBadge">none</span>
+              </div>
+              <p id="selectedPassage" class="selected-passage">
+                Select a sentence in the source answer.
+              </p>
+            </section>
+
+            <section class="analysis-section metrics-grid" aria-label="Text metrics">
+              <div>
+                <span id="tokenCount" class="metric-small">0</span>
+                <span class="label">tokens</span>
+              </div>
+              <div>
+                <span id="sentenceCount" class="metric-small">0</span>
+                <span class="label">sentences</span>
+              </div>
+              <div>
+                <span id="contextCount" class="metric-small">0</span>
+                <span class="label">context</span>
+              </div>
+            </section>
+
+            <section class="analysis-section">
+              <h3>High-signal terms</h3>
+              <div id="keywordList" class="keyword-list"></div>
+            </section>
+
+            <section class="analysis-section">
+              <h3>Local context window</h3>
+              <p id="contextWindow" class="context-window"></p>
+            </section>
+
+            <section class="analysis-section">
+              <h3>Method trace</h3>
+              <ol id="methodTrace" class="method-trace"></ol>
+            </section>
+          </aside>
+
+          <section class="branch-lab" aria-label="Branch simulator">
+            <div class="section-title lab-title">
+              <div>
+                <h3>Branch simulator</h3>
+                <p id="branchSummary">No branch has been staged yet.</p>
+              </div>
+              <span id="branchCount" class="count-pill">0</span>
+            </div>
+            <pre id="promptOutput" class="prompt-output"></pre>
+            <div id="branchCards" class="branch-cards" aria-live="polite"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="deliverables">
+        <div>
+          <p class="eyebrow">Submission materials</p>
+          <h2>Public app, report, replication package, and preserved extension</h2>
+        </div>
+        <div class="deliverable-links">
+          <a href="./report/report.html">Report</a>
+          <a href="./replication/">Replication</a>
+          <a href="./data/sample_conversations.jsonl">Synthetic data</a>
+          <a href="./extension/">Extension artifact</a>
+        </div>
+      </section>
+    </main>
+
+    <script src="./assets/app.js" type="module"></script>
+  </body>
+</html>

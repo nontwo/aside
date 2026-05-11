@@ -39,6 +39,24 @@ npm run build
 
 4. Reload `chatgpt.com`, select assistant text, and try `Ask`, `Why`, or `New-tab`.
 
+## Course submission package
+
+The Text as Data course submission lives in [`course-submission/`](./course-submission/). It includes a static public demo, synthetic sample data, a report, replication notes, and a preserved extension artifact.
+
+Folder structure:
+- root source files are the Chromium extension and shared build/test tooling
+- `course-submission/` is the canonical course website and replication package
+- generated exports or zip-ready packages should live outside the repo, such as `/tmp/aside-course-submission`
+
+```bash
+npm run build:submission
+npm run audit:submission
+npm run smoke:submission
+npm run package:submission
+```
+
+The GitHub Pages workflow publishes `course-submission/` as the public project site.
+
 ## Verification
 
 ```bash

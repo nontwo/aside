@@ -6,9 +6,13 @@
   "type": "module",
   "scripts": {
     "build": "node ./scripts/build.mjs",
+    "build:submission": "node ./scripts/build-submission.mjs",
     "smoke:local": "node ./scripts/local-only-smoke.mjs",
+    "smoke:submission": "node ./scripts/smoke-submission.mjs",
     "audit:public": "node ./scripts/audit-public.mjs",
+    "audit:submission": "node ./scripts/audit-submission.mjs",
     "export:public": "node ./scripts/export-public.mjs",
+    "package:submission": "node ./scripts/package-submission.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },
