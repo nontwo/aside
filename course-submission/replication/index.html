@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Replication Package | Aside</title>
+    <link rel="stylesheet" href="../assets/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="../index.html" aria-label="Aside home">
+        <span class="brand-mark">A</span>
+        <span>Aside</span>
+      </a>
+      <nav aria-label="Project links">
+        <a href="../index.html#app">Demo</a>
+        <a href="../report/report.html">Report</a>
+        <a href="../data/sample_conversations.jsonl">Data</a>
+        <a href="../extension/">Extension</a>
+      </nav>
+    </header>
+
+    <main class="doc-page">
+      <section class="doc-card">
+        <p class="eyebrow">Replication Package</p>
+        <h1>Reproduce the Aside course project</h1>
+        <p class="subtitle">
+          This page documents the exact local commands for rebuilding the static
+          app, regenerating the report, auditing the submission, and inspecting
+          the preserved browser extension artifact.
+        </p>
+
+        <h2>Requirements</h2>
+        <ul>
+          <li>Node.js 20 or newer</li>
+          <li>npm</li>
+          <li>A Chromium browser for optional extension inspection</li>
+        </ul>
+
+        <h2>Build and verify the static app</h2>
+        <pre><code>npm install
+npm run build:submission
+npm run audit:submission
+npm run smoke:submission</code></pre>
+
+        <p>
+          The app is fully static and loads synthetic data from
+          <a href="../data/sample_conversations.jsonl">sample_conversations.jsonl</a>.
+          It does not require a backend, API key, private profile, or real
+          conversation log.
+        </p>
+
+        <h2>Full project check</h2>
+        <pre><code>npm test
+npx tsc --noEmit
+npm run build
+npm run audit:public
+npm run build:submission
+npm run audit:submission
+npm run smoke:submission</code></pre>
+
+        <h2>Extension artifact</h2>
+        <p>
+          Running <code>npm run build:submission</code> copies the current Aside
+          extension build into <code>course-submission/extension/dist</code>.
+          See the <a href="../extension/">extension artifact page</a> for manual
+          inspection steps.
+        </p>
+
+        <p class="doc-note">
+          Source notes are also kept in <a href="./README.md">README.md</a> for
+          reviewers who inspect the repository directly.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>

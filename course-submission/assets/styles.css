@@ -583,6 +583,62 @@ textarea {
   justify-content: end;
 }
 
+.doc-page {
+  margin: 0 auto;
+  max-width: 980px;
+  padding: 28px 18px 56px;
+}
+
+.doc-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  padding: clamp(22px, 5vw, 48px);
+}
+
+.doc-card h1 {
+  margin-bottom: 16px;
+}
+
+.doc-card h2 {
+  border-top: 1px solid var(--line);
+  margin-top: 30px;
+  padding-top: 24px;
+}
+
+.doc-card li,
+.doc-card p {
+  color: #334052;
+  font-size: 1rem;
+}
+
+.doc-card pre {
+  background: #17202a;
+  border-radius: 8px;
+  color: #f6f4ef;
+  overflow: auto;
+  padding: 16px;
+}
+
+.doc-card code {
+  background: #eee9df;
+  border-radius: 4px;
+  padding: 0.12em 0.3em;
+}
+
+.doc-card pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.doc-note {
+  background: var(--panel-strong);
+  border-left: 4px solid var(--accent);
+  margin-top: 28px;
+  padding: 12px 14px;
+}
+
 @media (max-width: 1120px) {
   .intro-grid,
   .dashboard-grid {

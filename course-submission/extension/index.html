@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Extension Artifact | Aside</title>
+    <link rel="stylesheet" href="../assets/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="../index.html" aria-label="Aside home">
+        <span class="brand-mark">A</span>
+        <span>Aside</span>
+      </a>
+      <nav aria-label="Project links">
+        <a href="../index.html#app">Demo</a>
+        <a href="../report/report.html">Report</a>
+        <a href="../replication/">Replication</a>
+        <a href="../data/sample_conversations.jsonl">Data</a>
+      </nav>
+    </header>
+
+    <main class="doc-page">
+      <section class="doc-card">
+        <p class="eyebrow">Extension Artifact</p>
+        <h1>Preserved Aside browser extension</h1>
+        <p class="subtitle">
+          The course website is a static Text as Data demo. This folder preserves
+          the companion Chromium extension artifact so reviewers can inspect the
+          original interaction design separately.
+        </p>
+
+        <h2>Artifact location</h2>
+        <p>
+          The build artifact is generated at
+          <code>course-submission/extension/dist</code> by
+          <code>npm run build:submission</code>.
+        </p>
+
+        <h2>Manual inspection</h2>
+        <ol>
+          <li>Run <code>npm install</code>.</li>
+          <li>Run <code>npm run build:submission</code>.</li>
+          <li>Open <code>chrome://extensions/</code>.</li>
+          <li>Enable Developer Mode.</li>
+          <li>Select <code>course-submission/extension/dist</code> with "Load unpacked".</li>
+          <li>Open ChatGPT, select text in an assistant answer, and try Aside's branch actions.</li>
+        </ol>
+
+        <h2>Privacy note</h2>
+        <p>
+          The public course demo uses only synthetic sample data. The extension
+          can operate on real ChatGPT pages during manual testing, but no private
+          conversations are included in this repository.
+        </p>
+
+        <p class="doc-note">
+          Source notes are also kept in <a href="./README.md">README.md</a> for
+          reviewers who inspect the repository directly.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>
