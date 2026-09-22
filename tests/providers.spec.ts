@@ -11,7 +11,7 @@ import {
   findChatAdapterForUrl,
   getAdapter
 } from '../src/shared/providers';
-import { surfaceIsAvailable } from '../src/shared/providers/types';
+import { surfaceIsAvailable, surfaceMayBeAttempted } from '../src/shared/providers/types';
 
 describe('provider routing', () => {
   it('routes each chat origin to its own adapter', () => {
@@ -147,9 +147,9 @@ describe('scope keys never collide across providers', () => {
 });
 
 describe('declared capabilities are explicit, not optimistic', () => {
-  it('states Claude cannot be embedded and says why', () => {
-    expect(claudeAdapter.surfaces.embedded).toBe('unsupported');
+  it('explains what happens to a Claude branch, without claiming the surface works', () => {
     expect(claudeAdapter.surfaces.detail).toMatch(/frame/i);
+    expect(surfaceIsAvailable(claudeAdapter.surfaces.embedded)).toBe(false);
   });
 
   it('claims no surface as live-verified, because none has been run against a live account', () => {
@@ -164,10 +164,37 @@ describe('declared capabilities are explicit, not optimistic', () => {
 
   it('still offers the surfaces it has fixture evidence for', () => {
     // Honesty about evidence must not turn into refusing to run: `fixture-only`
-    // is offered, `unsupported` is not.
+    // is offered, `unverified` is not *claimed*.
     expect(surfaceIsAvailable(claudeAdapter.surfaces.nativeWindow)).toBe(true);
     expect(surfaceIsAvailable(claudeAdapter.surfaces.embedded)).toBe(false);
     expect(surfaceIsAvailable(chatgptAdapter.surfaces.embedded)).toBe(true);
+  });
+
+  it('separates what may be attempted from what may be claimed', () => {
+    // The defect this exists for: Claude's embedded surface was marked
+    // unsupported on an unchecked assumption, and because the same flag gated the
+    // attempt, nothing could ever check it. An unverified surface is tried once.
+    expect(claudeAdapter.surfaces.embedded).toBe('unverified');
+    expect(surfaceIsAvailable(claudeAdapter.surfaces.embedded)).toBe(false);
+    expect(surfaceMayBeAttempted(claudeAdapter.surfaces.embedded)).toBe(true);
+  });
+
+  it('stops attempting a surface once it has been observed to fail', () => {
+    expect(surfaceMayBeAttempted(claudeAdapter.surfaces.embedded, 'refused')).toBe(false);
+    expect(surfaceMayBeAttempted(claudeAdapter.surfaces.embedded, 'worked')).toBe(true);
+  });
+
+  it('never attempts a surface declared unsupported, whatever was observed', () => {
+    // An observation must not be able to grant a surface a provider does not have.
+    expect(surfaceMayBeAttempted('unsupported', 'unknown')).toBe(false);
+    expect(surfaceMayBeAttempted('unsupported', 'refused')).toBe(false);
+  });
+
+  it('no longer states as fact that claude.ai refuses to be framed', () => {
+    // It sends X-Frame-Options: SAMEORIGIN and no frame-ancestors directive, and
+    // Aside's frame is a same-origin child of the claude.ai page.
+    expect(claudeAdapter.surfaces.detail).not.toMatch(/refuses to be embedded/i);
+    expect(claudeAdapter.surfaces.detail).toMatch(/falls back/i);
   });
 
   it('records that Claude Incognito leaves a project but ChatGPT Temporary Chat does not', () => {

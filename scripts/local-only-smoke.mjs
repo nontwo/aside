@@ -15,6 +15,9 @@ const headless = process.env.HEADLESS !== 'false';
 const includeNativeWindowSmoke = process.env.SKIP_NATIVE_WINDOW_SMOKE !== 'true';
 
 let routeMap = {};
+
+/** Paths the fixture server should refuse to let be framed. Reset per scenario. */
+let refuseFramingForPaths = [];
 let claudeRouteMap = {};
 
 function sleep(ms) {
@@ -298,11 +301,21 @@ async function fulfillPausedRequest(session, event) {
   }
 
   const servedBody = resolveRouteBody(url.hostname, url.pathname);
+  const headers = [{ name: 'Content-Type', value: 'text/html; charset=utf-8' }];
+
+  // Lets a scenario model a provider that refuses to be framed, so the fallback
+  // is proved by observation rather than asserted from an assumption about
+  // headers — which is exactly the assumption that turned out to be wrong.
+  if (refuseFramingForPaths.some((path) => url.pathname.startsWith(path))) {
+    headers.push({ name: 'X-Frame-Options', value: 'DENY' });
+    headers.push({ name: 'Content-Security-Policy', value: "frame-ancestors 'none'" });
+  }
+
   await session
     .send('Fetch.fulfillRequest', {
       requestId,
       responseCode: 200,
-      responseHeaders: [{ name: 'Content-Type', value: 'text/html; charset=utf-8' }],
+      responseHeaders: headers,
       body: Buffer.from(servedBody, 'utf8').toString('base64')
     })
     .catch(() => {});
@@ -436,10 +449,24 @@ async function selectAssistantText(page) {
  *             path can catch.
  */
 async function injectNativeAskButton(page, options = {}) {
-  const { placement = 'right', variant = 'attributed', delayMs = 0 } = options;
+  const {
+    placement = 'right',
+    variant = 'attributed',
+    delayMs = 0,
+    // A REALISTIC stacking value, not a near-maximum one. The first version of
+    // this hard-coded 2147483646, which is above Aside's host: that guaranteed the
+    // provider popup always painted on top, so the harness could only ever exercise
+    // the "something covers Aside" direction. The live defect was the opposite one,
+    // and at any ordinary z-index it is Aside that ends up on top.
+    zIndex = 50,
+    // 'flat' is a single positioned pill. 'nested' wraps a relative content box in
+    // a fixed positioner, the shape popup libraries emit — which breaks any
+    // detector that sniffs `position` on the element it happens to hit.
+    shape = 'flat'
+  } = options;
 
   await page.evaluate(
-    (placementMode, variantMode, delay) => {
+    (placementMode, variantMode, delay, zIndexValue, shapeMode) => {
       const range = getSelection()?.getRangeAt(0);
       if (!range) {
         throw new Error('No selection range was available.');
@@ -469,7 +496,7 @@ async function injectNativeAskButton(page, options = {}) {
       pill.style.borderRadius = '999px';
       pill.style.background = '#ffffff';
       pill.style.boxShadow = '0 8px 24px rgba(0,0,0,0.18)';
-      pill.style.zIndex = '2147483646';
+      pill.style.zIndex = String(zIndexValue);
 
       // Clamped into the viewport, as a real popup is. Without this the 'right'
       // placement pushes a 430px pill off the edge at 768px — and how far off
@@ -489,13 +516,26 @@ async function injectNativeAskButton(page, options = {}) {
         pill.style.left = `${clampLeft(rect.right + 16)}px`;
       }
 
+      // Where the buttons actually go: directly in the pill, or inside a
+      // statically-positioned content box for the 'nested' shape.
+      let content = pill;
+      if (shapeMode === 'nested') {
+        content = document.createElement('div');
+        content.style.position = 'relative';
+        content.style.display = 'flex';
+        content.style.alignItems = 'center';
+        content.style.width = '100%';
+        content.style.height = '100%';
+        pill.append(content);
+      }
+
       ['Ask ChatGPT', 'Share highlighted'].forEach((label, index) => {
         if (index > 0) {
           const divider = document.createElement('span');
           divider.style.width = '1px';
           divider.style.height = '20px';
           divider.style.background = 'rgba(0,0,0,0.12)';
-          pill.append(divider);
+          content.append(divider);
         }
         const button = document.createElement('button');
         button.setAttribute('aria-label', label);
@@ -504,7 +544,7 @@ async function injectNativeAskButton(page, options = {}) {
         button.style.height = '100%';
         button.style.border = 'none';
         button.style.background = 'transparent';
-        pill.append(button);
+        content.append(button);
       });
 
       const mount = () => document.body.append(pill);
@@ -518,12 +558,50 @@ async function injectNativeAskButton(page, options = {}) {
     },
     placement,
     variant,
-    delayMs
+    delayMs,
+    zIndex,
+    shape
   );
 
   if (delayMs > 0) {
     await sleep(delayMs + 400);
   }
+}
+
+/**
+ * Is every control in the provider's own popup still clickable?
+ *
+ * The mirror of readAsideOcclusion, and the one that matters more: Aside's host
+ * sits near the maximum z-index, so Aside covering the provider is the likely
+ * direction, not the other way round. Samples the centre and both horizontal
+ * quartiles of each control, because a partial cover is still a cover — the live
+ * screenshot showed a native label clipped mid-word.
+ */
+async function readNativePopupOcclusion(page) {
+  return page.evaluate(() => {
+    const popup = document.querySelector('[data-native-selection-popup]');
+    if (!(popup instanceof HTMLElement)) {
+      return { applicable: false, covered: [], allReachable: true };
+    }
+
+    const covered = [];
+    Array.from(popup.querySelectorAll('button')).forEach((button) => {
+      const rect = button.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        return;
+      }
+      const y = rect.top + rect.height / 2;
+      [0.25, 0.5, 0.75].forEach((fraction) => {
+        const x = rect.left + rect.width * fraction;
+        const topmost = document.elementFromPoint(x, y);
+        if (topmost?.closest('#aside-root')) {
+          covered.push({ label: button.textContent?.trim() ?? '', at: fraction });
+        }
+      });
+    });
+
+    return { applicable: true, covered, allReachable: covered.length === 0 };
+  });
 }
 
 /**
@@ -726,9 +804,14 @@ async function runNonProjectScenario(browser) {
     });
     // The live case: the popup is centred above the selection, exactly where Aside
     // wants to be, and carries nothing any selector was written for.
-    await injectNativeAskButton(page, { placement: 'above', variant: 'bare' });
+    await injectNativeAskButton(page, {
+      placement: 'above',
+      variant: 'bare',
+      shape: 'nested'
+    });
     await sleep(500);
     const askOcclusion = await readAsideOcclusion(page);
+    const nativeOcclusion = await readNativePopupOcclusion(page);
 
     const askState = await page.evaluate(() => {
       const buttons = Array.from(
@@ -968,6 +1051,7 @@ async function runNonProjectScenario(browser) {
     return {
       askState,
       askOcclusion,
+      nativeOcclusion,
       darkThemeState,
       liveResult,
       minimizedState,
@@ -1723,6 +1807,11 @@ async function selectClaudeAssistantText(page) {
 
 async function runClaudeScenario(browser, { variant = 'current' } = {}) {
   routeMap = { '*': buildSourceHtml() };
+  // These two scenarios model a Claude that DOES refuse to be framed, so the
+  // driven-window fallback below is proved by observation. Whether the real
+  // claude.ai refuses is not something this harness can know — which is the point:
+  // the product now finds out by looking, instead of being told by a comment.
+  refuseFramingForPaths = ['/new', '/chat/'];
   claudeRouteMap = {
     '/chat/source-claude': buildClaudeSourceHtml({ variant }),
     '/new': buildClaudeComposerHtml({}),
@@ -1789,7 +1878,10 @@ async function runClaudeScenario(browser, { variant = 'current' } = {}) {
       document.querySelector('.aside-panel:not([hidden]) button[type="submit"]')?.click();
     });
 
-    // Claude cannot be embedded, so the branch must open in a driven window.
+    // This fixture refuses framing, so the branch must fall back to a driven
+    // window — and must do so from the frame's observed failure, not from a
+    // hard-coded capability flag.
+
     const branchPage = await waitForAdditionalPage(browser, existingPages, 45_000);
     branchPage.on('pageerror', (err) => console.error('CLAUDE BRANCH PAGEERROR', err.message));
     try {
@@ -1848,6 +1940,93 @@ async function runClaudeScenario(browser, { variant = 'current' } = {}) {
 }
 
 
+/**
+ * Claude with framing allowed: the branch must run in the in-page panel.
+ *
+ * The owner reported every Claude branch opening a separate window. The cause was
+ * a capability flag set to 'unsupported' from an unchecked assumption — and
+ * because the same flag gated the attempt, nothing could ever disprove it. This
+ * asserts the attempt now happens.
+ */
+async function runClaudeEmbeddedScenario(browser) {
+  routeMap = { '*': buildSourceHtml() };
+  refuseFramingForPaths = [];
+  claudeRouteMap = {
+    '/chat/source-claude-embedded': buildClaudeSourceHtml({ variant: 'current' }),
+    '/new': buildClaudeComposerHtml({}),
+    '*': buildClaudeComposerHtml({})
+  };
+
+  const page = await createClaudePage(browser, '/chat/source-claude-embedded');
+  const existingPages = await browser.pages();
+
+  try {
+    await selectClaudeAssistantText(page);
+    await page.waitForFunction(
+      () => {
+        const toolbar = document.querySelector('#aside-selection-toolbar');
+        return toolbar instanceof HTMLElement && !toolbar.hidden;
+      },
+      { timeout: 10_000 }
+    );
+
+    await page.evaluate(() => document.querySelector('#aside-ask-button')?.click());
+    await page.waitForSelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', {
+      timeout: 10_000
+    });
+    await setPanelBranchKind(page, 'persistent');
+    await page.type(
+      '.aside-panel:not([hidden]) textarea[data-aside-role="question"]',
+      'Why this assumption?'
+    );
+    await page.evaluate(() => {
+      document.querySelector('.aside-panel:not([hidden]) button[type="submit"]')?.click();
+    });
+
+    // The frame is pointed at about:blank first to force a real document load, so
+    // wait for the actual provider URL rather than sampling once.
+    await page.waitForFunction(
+      () => {
+        const frame = document.querySelector('.aside-panel:not([hidden]) iframe.aside-frame');
+        return frame instanceof HTMLIFrameElement && frame.src.includes('claude.ai');
+      },
+      { timeout: 20_000 }
+    ).catch(() => {});
+
+    const pagesAfter = await browser.pages();
+
+    return {
+      framedInPanel: await page.evaluate(() => {
+        const frame = document.querySelector('.aside-panel:not([hidden]) iframe.aside-frame');
+        const shell = document.querySelector('.aside-panel:not([hidden]) .aside-frame-shell');
+        return (
+          frame instanceof HTMLIFrameElement &&
+          frame.src.includes('claude.ai') &&
+          shell instanceof HTMLElement &&
+          !shell.hidden
+        );
+      }),
+      frameSrc: await page.evaluate(
+        () =>
+          document.querySelector('.aside-panel:not([hidden]) iframe.aside-frame')?.src ?? null
+      ),
+      panelStatus: await page.evaluate(
+        () =>
+          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')
+            ?.textContent ?? null
+      ),
+      // No separate window: the whole point of the report.
+      openedSeparateWindow: pagesAfter.length > existingPages.length
+    };
+  } finally {
+    const pages = await browser.pages();
+    await Promise.all(
+      pages.filter((candidate) => !existingPages.includes(candidate)).map((c) => c.close().catch(() => {}))
+    );
+    await page.close();
+  }
+}
+
 const SCREENSHOT_DIR = process.env.CAPTURE_SCREENSHOTS ?? null;
 
 async function capture(page, name) {
@@ -1889,13 +2068,14 @@ async function runLayoutMatrixScenario(browser) {
           // own after the selection has settled, and only the MutationObserver tells
           // Aside about it. Reselecting here re-ran the whole selection pipeline and
           // hid the fact that the observer path had no coverage at all.
-          await injectNativeAskButton(page, { placement: 'right', delayMs: 200 });
+          await injectNativeAskButton(page, { placement: 'above', delayMs: 200 });
           await page.waitForFunction(() => {
             const toolbar = document.querySelector('#aside-selection-toolbar');
             return toolbar instanceof HTMLElement && !toolbar.hidden;
           }, { timeout: 10_000 });
 
           const occlusion = await readAsideOcclusion(page);
+          const nativeOcclusion = await readNativePopupOcclusion(page);
 
           await capture(page, `toolbar-${label}`);
 
@@ -1946,7 +2126,7 @@ async function runLayoutMatrixScenario(browser) {
             };
           });
 
-          results.push({ label, ...measured, occlusion });
+          results.push({ label, ...measured, occlusion, nativeOcclusion });
         } finally {
           await page.close();
         }
@@ -2034,6 +2214,7 @@ try {
   const temporaryChatBlocked = await runTemporaryChatBlockedScenario(browser);
   const claudeCurrent = await runClaudeScenario(browser, { variant: 'current' });
   const claudeLegacy = await runClaudeScenario(browser, { variant: 'legacy' });
+  const claudeEmbedded = await runClaudeEmbeddedScenario(browser);
   const layoutMatrix = await runLayoutMatrixScenario(browser);
   const crossTab = await runCrossTabScenario(browser);
   const failure = await runFailureScenario(browser);
@@ -2050,6 +2231,7 @@ try {
     layoutMatrix,
     claudeCurrent,
     claudeLegacy,
+    claudeEmbedded,
     crossTab,
     failure
   };
@@ -2071,6 +2253,7 @@ try {
       // And, for a popup that mounted after Aside had already placed itself:
       // nothing of Aside's is painted over.
       entry.occlusion?.allReachable !== true ||
+      entry.nativeOcclusion?.allReachable !== true ||
       // The rail is either placed in the gutter or replaced by the compact launcher.
       !(entry.placement === 'left-gutter' || entry.launcherShown) ||
       entry.theme !== (entry.label.endsWith('dark') ? 'dark' : 'light')
@@ -2137,6 +2320,24 @@ try {
   if (nonProject.askOcclusion?.allReachable !== true) {
     throw new Error(
       `Aside's own controls were covered by provider UI: ${JSON.stringify(nonProject.askOcclusion)}`
+    );
+  }
+
+  // The direction that actually shipped: Aside's host sits near the maximum
+  // z-index, so Aside covering the provider is the likely failure, not the
+  // reverse. Nothing asserted this until a live Claude run found it.
+  if (nonProject.nativeOcclusion?.allReachable !== true) {
+    throw new Error(
+      `Aside covered the provider's own controls: ${JSON.stringify(nonProject.nativeOcclusion)}`
+    );
+  }
+
+  // Claude must ATTEMPT the in-page panel. It opened a separate window for every
+  // branch because a capability flag said embedding was impossible — an assumption
+  // that, because the same flag gated the attempt, nothing could ever disprove.
+  if (claudeEmbedded.framedInPanel !== true || claudeEmbedded.openedSeparateWindow !== false) {
+    throw new Error(
+      `Claude did not run its branch in the in-page panel: ${JSON.stringify(claudeEmbedded)}`
     );
   }
 

@@ -41,10 +41,10 @@ to be readable, the rail is replaced by the compact entry in verified free space
 | | ChatGPT | Claude |
 | --- | --- | --- |
 | Origins | `chatgpt.com`, `chat.openai.com` | `claude.ai` |
-| Branch surface | embedded panel | window Aside drives (claude.ai refuses framing) |
+| Branch surface | embedded panel | embedded panel attempted first; falls back to a window Aside drives if claude.ai refuses to be framed |
 | Private mode | Temporary Chat | Incognito chat |
 | Private mode caveats | controls history, not personalization; can later be saved to history from ChatGPT | unavailable inside projects, so starting one leaves the project; a closed Incognito chat cannot be reopened |
-| Evidence level | `fixture-only` | `fixture-only` |
+| Evidence level | `fixture-only` | `fixture-only` (embedded surface: `unverified`, attempted once and observed) |
 | Verified against | offline fixtures and the live site's DOM conventions | offline fixtures only |
 
 No surface is declared `verified`. In this codebase that level means the adapter

@@ -29,7 +29,9 @@ Context section and each provider's private-mode note.
 - [ ] Select text in an assistant answer. The provider's own selection actions
       appear exactly as they did before, in the same place.
 - [ ] Click one of them. It does what it always did.
-- [ ] Aside's toolbar sits *beside* them, labelled `Aside`, overlapping nothing.
+- [ ] Aside's toolbar sits *beside* them, labelled `Aside`, overlapping nothing —
+      in **either** direction. Check the provider's own buttons are fully visible
+      and clickable, not just that Aside's are.
 - [ ] Select with the keyboard (Shift+Arrow) and copy with Cmd/Ctrl+C. Both work.
 - [ ] Open a provider menu and press Escape. The menu closes; Aside does not
       swallow it.
@@ -52,8 +54,11 @@ On ChatGPT and again on Claude:
 - [ ] `Ask` opens a panel. The **Context** section shows the passage, the answer
       blocks it read, and a preview of the exact text that will be sent.
 - [ ] Untick a block; the preview shrinks. Tick the preceding question; it appears.
-- [ ] Send. The answer addresses the passage. On ChatGPT it runs in the panel; on
-      Claude it runs in a window Aside opens (claude.ai refuses to be framed).
+- [ ] Send. The answer addresses the passage. On both providers Aside first tries
+      to run it in the in-page panel. If claude.ai refuses to be framed, the branch
+      should move to a window Aside opens **by itself**, without an error — and
+      stay there for the rest of the session. Tell me which of the two you see on
+      Claude: that is the one thing offline testing cannot settle.
 - [ ] Ask a follow-up inside the branch. It still works.
 - [ ] Minimize, restore, and use **Jump to origin** — the original passage is
       highlighted and you have not lost your reading position.

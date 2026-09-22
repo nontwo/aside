@@ -55,7 +55,8 @@ import {
 import type { BranchContext, ContextBlock } from '../shared/context';
 import { attachElementToHost, ensureExtensionHostElement } from './ui-host';
 import { findFreeCorner, findLeftGutterSlot, findSafePlacement } from '../shared/placement';
-import { surfaceIsAvailable } from '../shared/providers/types';
+import { surfaceMayBeAttempted } from '../shared/providers/types';
+import type { SurfaceObservation } from '../shared/providers/types';
 import type { Rect } from '../shared/placement';
 import {
   getActionLabel,
@@ -1721,6 +1722,8 @@ function hideAskButton(clearSelection = true): void {
     currentSelectionDraft = null;
     currentSelectionPayload = null;
     currentSelectionRect = null;
+    // What was in the way of the last selection says nothing about the next one.
+    dodgedProviderNodes = [];
   }
   hideSelectionToolbar();
 }
@@ -1888,52 +1891,232 @@ function nearestPositionedAncestor(element: Element): HTMLElement | null {
  * only what genuinely is. This needs no provider knowledge and survives a
  * redesign.
  */
-function findOccludingRects(toolbar: HTMLElement): Rect[] {
+/**
+ * Things a provider renders that a user is meant to be able to click.
+ *
+ * The harm being detected is "a provider control is unreachable because Aside is
+ * on top of it", so a control is exactly the right granularity to reserve: never
+ * a wrapper, which could be the size of the reading column.
+ */
+const CONFLICT_CONTROL_SELECTOR =
+  'button, [role="button"], [role="menuitem"], [role="option"], [role="tab"], a[href], input, select, textarea';
+
+/** Points across an element's own rect. A centre-only probe misses a partial cover. */
+function gridProbePoints(box: DOMRect, columns = 7, rows = 3): Array<[number, number]> {
+  const points: Array<[number, number]> = [];
+  for (let column = 0; column < columns; column += 1) {
+    for (let row = 0; row < rows; row += 1) {
+      const x = box.left + (box.width * (column + 0.5)) / columns;
+      const y = box.top + (box.height * (row + 0.5)) / rows;
+      if (x >= 0 && y >= 0 && x <= window.innerWidth && y <= window.innerHeight) {
+        points.push([x, y]);
+      }
+    }
+  }
+  return points;
+}
+
+/**
+ * The provider control Aside is sitting on top of at this point, if any.
+ *
+ * The stack at a point inside Aside reads [aside button, aside toolbar, aside host,
+ * ...page..., main, body, html]. Skipping Aside's own entries and looking for a
+ * control answers "am I covering something clickable" without knowing anything
+ * about the provider's markup. Ordinary page content — the message being read,
+ * the scroll container, body — contains no control at that point and yields
+ * nothing, so a normal selection produces no conflict at all.
+ */
+function coveredControlAt(stack: Element[]): HTMLElement | null {
+  let index = 0;
+  while (index < stack.length && isAsideOwned(stack[index])) {
+    index += 1;
+  }
+
+  // Nothing of Aside's was on top here, so this point belongs to the
+  // over-direction branch instead.
+  if (index === 0) {
+    return null;
+  }
+
+  for (let cursor = index; cursor < stack.length; cursor += 1) {
+    const element = stack[cursor];
+    if (isAsideOwned(element)) {
+      continue;
+    }
+    if (element === document.body || element === document.documentElement) {
+      break;
+    }
+    const control = element.closest<HTMLElement>(CONFLICT_CONTROL_SELECTOR);
+    if (control && !isAsideOwned(control)) {
+      return control;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Everything Aside is in visual conflict with, in both directions.
+ *
+ * The first version of this only looked upwards — "is something painted over
+ * me?" — which is the rarer case. `#aside-root` is fixed at z-index 2147483643
+ * and creates a stacking context, so against any realistic provider z-index it is
+ * Aside that ends up on top. On claude.ai that silenced the probe completely: it
+ * found Aside's own button topmost at every point, concluded all was well, and
+ * left Aside sitting over Claude's selection popup.
+ *
+ * Paint order answers both questions from the same hit test.
+ */
+function findLayoutConflicts(element: HTMLElement): HTMLElement[] {
   if (typeof document.elementsFromPoint !== 'function') {
     return [];
   }
 
-  const controls = Array.from(toolbar.querySelectorAll<HTMLElement>('button'));
-  const probes: HTMLElement[] = controls.length ? controls : [toolbar];
+  const box = element.getBoundingClientRect();
+  if (box.width <= 0 || box.height <= 0) {
+    return [];
+  }
+
   const viewportArea = Math.max(window.innerWidth * window.innerHeight, 1);
   const seen = new Set<Element>();
-  const rects: Rect[] = [];
+  const found: HTMLElement[] = [];
 
-  probes.forEach((probe) => {
-    const box = probe.getBoundingClientRect();
-    if (box.width <= 0 || box.height <= 0) {
+  gridProbePoints(box).forEach(([x, y]) => {
+    const stack = document.elementsFromPoint(x, y);
+    if (!stack.length) {
       return;
     }
 
-    const x = box.left + box.width / 2;
-    const y = box.top + box.height / 2;
-    if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) {
+    let candidate: HTMLElement | null;
+    if (!isAsideOwned(stack[0])) {
+      // Something is painted over Aside. Reserve the floating container it
+      // belongs to, not the leaf that happened to be hit.
+      candidate = nearestPositionedAncestor(stack[0]) ?? (stack[0] as HTMLElement);
+      const rect = candidate.getBoundingClientRect();
+      // A full-page overlay or a scroll container is not a popup, and dodging one
+      // is impossible by definition.
+      if (rect.width * rect.height > viewportArea * MAX_OCCLUDER_VIEWPORT_FRACTION) {
+        return;
+      }
+    } else {
+      candidate = coveredControlAt(stack);
+    }
+
+    if (!candidate || seen.has(candidate) || isAsideOwned(candidate)) {
       return;
     }
 
-    const topmost = document.elementsFromPoint(x, y)[0];
-    if (!topmost || isAsideOwned(topmost)) {
-      return;
-    }
-
-    const container = nearestPositionedAncestor(topmost) ?? topmost;
-    if (seen.has(container) || isAsideOwned(container)) {
-      return;
-    }
-    seen.add(container);
-
-    const rect = container.getBoundingClientRect();
+    const rect = candidate.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) {
       return;
     }
-    if (rect.width * rect.height > viewportArea * MAX_OCCLUDER_VIEWPORT_FRACTION) {
-      return;
-    }
 
-    rects.push(toRect(rect));
+    seen.add(candidate);
+    found.push(candidate);
   });
 
+  return found;
+}
+
+/**
+ * Provider nodes this selection has already been moved out of the way of.
+ *
+ * Elements, not rectangles, and remembered rather than recomputed per placement.
+ * Every re-entry path — scroll, resize, the layout observer — rebuilds `reserved`
+ * from `collectReservedRegions()`, which is selector-driven and by definition
+ * cannot see these (that is why the probe exists). Without a memory the toolbar is
+ * put straight back where it was just moved from, the probe moves it again, and
+ * the two take turns forever. Elements also re-measure themselves correctly after
+ * a scroll and report their own removal, which a stored rectangle cannot.
+ */
+let dodgedProviderNodes: HTMLElement[] = [];
+
+/**
+ * Whether the embedded surface actually worked on this provider, this session.
+ *
+ * Session-scoped deliberately: a provider can change its framing headers, or an
+ * enterprise policy can, and a refusal remembered across sessions would make that
+ * permanent from Aside's side.
+ */
+let embeddedSurfaceObservation: SurfaceObservation = 'unknown';
+
+function recordEmbeddedObservation(observed: SurfaceObservation, reason: string): void {
+  if (embeddedSurfaceObservation === observed) {
+    return;
+  }
+  embeddedSurfaceObservation = observed;
+  console.info(`[Aside] embedded surface on ${provider.id}: ${observed} (${reason})`);
+}
+
+/**
+ * Did the frame actually load the provider, or an error page?
+ *
+ * A same-origin document is readable; a frame refused by X-Frame-Options or a CSP
+ * frame-ancestors directive lands on the browser's own error page, which is not.
+ * That is an observable property of the rendered page rather than an assumption
+ * about headers — which is the whole point, since the assumption is what was
+ * wrong.
+ *
+ * Returns null when it cannot be told apart, so an inconclusive read never
+ * disables a surface.
+ */
+function embeddedFrameWasRefused(iframe: HTMLIFrameElement): boolean | null {
+  if (!iframe.src || iframe.src === 'about:blank') {
+    return null;
+  }
+  try {
+    const doc = iframe.contentDocument;
+    if (!doc) {
+      return true;
+    }
+    // A refused frame can also present as an empty document with no location.
+    if (doc.location?.href === 'about:blank' && !doc.body?.childElementCount) {
+      return null;
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+const MAX_REMEMBERED_CONFLICTS = 8;
+
+function liveRectsFor(nodes: HTMLElement[]): { rects: Rect[]; live: HTMLElement[] } {
+  const rects: Rect[] = [];
+  const live: HTMLElement[] = [];
+
+  nodes.forEach((node) => {
+    // A popup that closed stops being reserved. `isConnected` plus a non-zero box
+    // is the cheap liveness test; this runs on every scroll frame, so it
+    // deliberately avoids getComputedStyle.
+    if (!node.isConnected) {
+      return;
+    }
+    const box = node.getBoundingClientRect();
+    if (box.width <= 0 || box.height <= 0) {
+      return;
+    }
+    live.push(node);
+    rects.push(toRect(box));
+  });
+
+  return { rects, live };
+}
+
+function liveDodgedRects(): Rect[] {
+  const { rects, live } = liveRectsFor(dodgedProviderNodes);
+  dodgedProviderNodes = live;
   return rects;
+}
+
+function rememberConflicts(into: HTMLElement[], found: HTMLElement[]): HTMLElement[] {
+  const merged = [...into];
+  found.forEach((node) => {
+    if (!merged.includes(node)) {
+      merged.push(node);
+    }
+  });
+  return merged.slice(-MAX_REMEMBERED_CONFLICTS);
 }
 
 let occlusionRecheckFrame: number | undefined;
@@ -1955,16 +2138,17 @@ function scheduleOcclusionRecheck(anchor: DOMRect): void {
       return;
     }
 
-    const occluding = findOccludingRects(selectionToolbar);
-    if (!occluding.length) {
+    const found = findLayoutConflicts(selectionToolbar);
+    if (!found.length) {
       return;
     }
 
-    positionSelectionToolbar(anchor, occluding);
+    dodgedProviderNodes = rememberConflicts(dodgedProviderNodes, found);
+    positionSelectionToolbar(anchor, true);
   });
 }
 
-function positionSelectionToolbar(rect: DOMRect, extraReserved: Rect[] = []): void {
+function positionSelectionToolbar(rect: DOMRect, isRetry = false): void {
   const toolbar = ensureSelectionToolbar();
   currentSelectionRect = rect;
 
@@ -1982,7 +2166,15 @@ function positionSelectionToolbar(rect: DOMRect, extraReserved: Rect[] = []): vo
     anchor: toRect(rect),
     size,
     viewport: { width: window.innerWidth, height: window.innerHeight },
-    reserved: [...collectReservedRegions(), ...extraReserved]
+    // Remembered conflicts are seeded on EVERY placement, not just the retry:
+    // otherwise the next scroll or provider mutation re-derives the position from
+    // selectors alone and undoes the dodge.
+    reserved: [...collectReservedRegions(), ...liveDodgedRects()],
+    // Both providers put their own selection popup above the selection. That is a
+    // convention this repo cannot verify, not a fact — so 'above' stays reachable
+    // and the detector still runs there; preferring 'below' just means the common
+    // case does not need detecting at all.
+    order: ['below', 'right', 'left', 'above']
   });
 
   if (!placement) {
@@ -2005,9 +2197,9 @@ function positionSelectionToolbar(rect: DOMRect, extraReserved: Rect[] = []): vo
   // would always report Aside itself on top and never see the occluder.
   toolbar.style.visibility = '';
 
-  // Only the first pass re-checks. A pass that already carries occluders is the
-  // retry, and must not schedule another.
-  if (!extraReserved.length) {
+  // Only the first pass re-checks; the retry must not schedule another, or a
+  // provider that repositions its popup in response would be chased forever.
+  if (!isRetry) {
     scheduleOcclusionRecheck(rect);
   }
 }
@@ -2171,6 +2363,10 @@ function installNativeLayoutObserver(): void {
       window.cancelAnimationFrame(occlusionRecheckFrame);
       occlusionRecheckFrame = undefined;
     }
+    if (railConflictFrame !== undefined) {
+      window.cancelAnimationFrame(railConflictFrame);
+      railConflictFrame = undefined;
+    }
   });
 }
 
@@ -2278,17 +2474,120 @@ function readingColumnRect(): Rect | null {
  * When the gutter is too tight to be readable the rail is replaced by the compact
  * launcher rather than being forced back to the right edge over native controls.
  */
-function positionTabBar(): void {
+/**
+ * Provider nodes the rail has been moved out of the way of.
+ *
+ * Kept separately from the selection toolbar's: the rail is persistent UI in the
+ * gutter, the toolbar is transient and sits next to the text. What obstructs one
+ * says nothing about the other.
+ */
+let dodgedRailNodes: HTMLElement[] = [];
+
+let railConflictFrame: number | undefined;
+
+/**
+ * Is this point in the gutter genuinely empty?
+ *
+ * Stricter than the selection toolbar's test, and deliberately so. The toolbar is
+ * meant to sit beside the text, so only a covered *control* is a problem. The rail
+ * is meant to sit in whitespace outside the reading column, so anything the
+ * provider rendered there — a conversation title, a label, a heading, not just a
+ * control — means this is not whitespace.
+ *
+ * Free means: nothing but the document, or a layout wrapper the conversation
+ * itself lives inside. A sibling subtree is provider chrome.
+ */
+function railPointIsFree(element: Element, conversationContainer: HTMLElement | null): boolean {
+  if (element === document.body || element === document.documentElement) {
+    return true;
+  }
+  if (!conversationContainer) {
+    // With no conversation container to reason about, fall back to the weaker
+    // test rather than refusing every slot.
+    return !element.closest(CONFLICT_CONTROL_SELECTOR);
+  }
+  return element === conversationContainer || element.contains(conversationContainer);
+}
+
+function findRailConflicts(rail: HTMLElement): HTMLElement[] {
+  if (typeof document.elementsFromPoint !== 'function') {
+    return [];
+  }
+
+  const box = rail.getBoundingClientRect();
+  if (box.width <= 0 || box.height <= 0) {
+    return [];
+  }
+
+  const conversationContainer = provider.layout.getConversationScrollContainer(document);
+  const viewportArea = Math.max(window.innerWidth * window.innerHeight, 1);
+  const seen = new Set<Element>();
+  const found: HTMLElement[] = [];
+
+  gridProbePoints(box, 2, 5).forEach(([x, y]) => {
+    const stack = document.elementsFromPoint(x, y);
+    const beneath = stack.find((element) => !isAsideOwned(element));
+    if (!beneath || railPointIsFree(beneath, conversationContainer)) {
+      return;
+    }
+
+    const candidate = nearestPositionedAncestor(beneath) ?? (beneath as HTMLElement);
+    if (seen.has(candidate) || isAsideOwned(candidate)) {
+      return;
+    }
+
+    const rect = candidate.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return;
+    }
+    if (rect.width * rect.height > viewportArea * MAX_OCCLUDER_VIEWPORT_FRACTION) {
+      return;
+    }
+
+    seen.add(candidate);
+    found.push(candidate);
+  });
+
+  return found;
+}
+
+function scheduleRailConflictRecheck(): void {
+  if (railConflictFrame !== undefined) {
+    return;
+  }
+
+  railConflictFrame = window.requestAnimationFrame(() => {
+    railConflictFrame = undefined;
+    if (!tabBar || tabBar.hidden) {
+      return;
+    }
+
+    const found = findRailConflicts(tabBar);
+    if (!found.length) {
+      return;
+    }
+
+    dodgedRailNodes = rememberConflicts(dodgedRailNodes, found);
+    positionTabBar(true);
+  });
+}
+
+function positionTabBar(isRetry = false): void {
   if (!tabBar || tabBar.hidden) {
     return;
   }
 
   const minimizedCount = sortPanels().filter((runtime) => runtime.state.minimized).length;
-  const reserved = collectReservedRegions(false);
+  const { rects: railDodged, live } = liveRectsFor(dodgedRailNodes);
+  dodgedRailNodes = live;
+
   const slot = findLeftGutterSlot({
     viewport: { width: window.innerWidth, height: window.innerHeight },
     readingColumn: readingColumnRect(),
-    reserved,
+    // Claude's left chrome matches none of the adapter's sidebar selectors on the
+    // live site, so without the measured conflicts the gutter calculation treats
+    // the whole left side as free whitespace and drops the rail onto it.
+    reserved: [...collectReservedRegions(false), ...railDodged],
     size: { width: RAIL_WIDTH_PX, height: window.innerHeight }
   });
 
@@ -2306,6 +2605,10 @@ function positionTabBar(): void {
   tabBar.style.height = `${slot.height}px`;
   tabBar.style.bottom = 'auto';
   tabBar.style.setProperty('--sb-tab-width', `${slot.width}px`);
+
+  if (!isRetry) {
+    scheduleRailConflictRecheck();
+  }
 }
 
 function ensureTabBar(): HTMLDivElement {
@@ -2797,10 +3100,26 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     closePanel(runtime.state.panelId);
   });
   iframeEl.addEventListener('load', () => {
+    const refused = embeddedFrameWasRefused(iframeEl);
     appendPanelLog(runtime, 'Embedded branch frame load event', {
       iframeSrc: iframeEl.src,
-      panelStatus: runtime.state.status
+      panelStatus: runtime.state.status,
+      frameRefused: refused
     });
+
+    if (refused === true && runtime.state.surfaceMode === 'embedded') {
+      // Observed, not assumed. Fall back rather than sitting on an error page
+      // until the handshake watchdog fires.
+      recordEmbeddedObservation('refused', 'frame document was not readable after load');
+      clearPanelWatchdog(runtime);
+      void promotePersistentBranchToNativeWindow(runtime);
+      return;
+    }
+
+    if (refused === false) {
+      recordEmbeddedObservation('worked', 'frame document was readable after load');
+    }
+
     syncPanelUI(runtime);
   });
   formEl.addEventListener('submit', async (event) => {
@@ -4109,8 +4428,11 @@ async function startBranch(panelId: string, question: string): Promise<void> {
   // Some providers refuse to be framed. Where that is the case the branch opens in
   // a window Aside drives instead — a real fallback with the same context and the
   // same state safety, not an embedded pass reported under another name.
-  const canEmbed = surfaceIsAvailable(provider.surfaces.embedded);
-  if (!canEmbed && !surfaceIsAvailable(provider.surfaces.nativeWindow)) {
+  // "May we try?" is a different question from "can we claim it works?". Tying
+  // them together is how Claude ended up opening every branch in its own window
+  // on an unchecked assumption about framing headers.
+  const canEmbed = surfaceMayBeAttempted(provider.surfaces.embedded, embeddedSurfaceObservation);
+  if (!canEmbed && !surfaceMayBeAttempted(provider.surfaces.nativeWindow)) {
     // Neither surface is available: say so rather than opening a window that
     // cannot be driven and timing out on the watchdog.
     runtime.state.initialQuestion = question;

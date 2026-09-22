@@ -357,15 +357,22 @@ export const claudeAdapter: ProviderAdapter = {
   },
 
   surfaces: {
-    // claude.ai sends frame-ancestors headers that block third-party embedding, so
-    // Aside does not attempt an in-page iframe there. The native window path is the
-    // supported surface and is exercised against fixtures.
-    embedded: 'unsupported',
+    // This said 'unsupported', with a comment asserting that claude.ai sends
+    // frame-ancestors headers blocking embedding. That was never checked, and the
+    // evidence available contradicts it: claude.ai sends `X-Frame-Options:
+    // SAMEORIGIN` and no frame-ancestors directive, and Aside's frame is a
+    // same-origin child of the claude.ai page, which SAMEORIGIN permits.
+    //
+    // That evidence is suggestive, not conclusive — it comes from an
+    // unauthenticated response — so this is not flipped to "supported" either.
+    // It is attempted once, the outcome is observed from the rendered frame, and
+    // a refusal falls back to a driven window for the rest of the session.
+    embedded: 'unverified',
     // Implemented and fixture-exercised, never run against a live Claude account.
     // See the SELECTOR PROVENANCE note at the top of this file.
     nativeWindow: 'fixture-only',
     detail:
-      'claude.ai refuses to be embedded in a frame, so Claude branches open in a window Aside controls instead of an in-page panel frame.'
+      'Aside attempts an in-page panel frame on Claude. If claude.ai refuses to be framed, the branch falls back to a window Aside controls and stays there for the rest of the session.'
   },
 
   privacy: {

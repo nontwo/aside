@@ -9,15 +9,44 @@ export type ProviderId = 'chatgpt' | 'claude';
  * - `fixture-only` implemented and exercised against local fixtures, but never
  *                  confirmed against a live logged-in account. Offered, because
  *                  refusing to offer it would be worse, but not claimed as proven
- * - `unverified`   the control exists in provider documentation but Aside could not
- *                  confirm it on this page/account, so the capability is not offered
+ * - `unverified`   Aside has not confirmed this works here. It is attempted once and
+ *                  the outcome recorded; it is never claimed as proven
  * - `unsupported`  the provider does not expose it at all in a way Aside can drive
  */
 export type CapabilitySupport = 'verified' | 'fixture-only' | 'unverified' | 'unsupported';
 
-/** Support levels under which Aside will attempt a surface. */
+/** Support levels Aside is willing to CLAIM. Evidence, not permission to try. */
 export function surfaceIsAvailable(support: CapabilitySupport): boolean {
   return support === 'verified' || support === 'fixture-only';
+}
+
+/** What actually happened the last time a surface was attempted in this session. */
+export type SurfaceObservation = 'unknown' | 'worked' | 'refused';
+
+/**
+ * Whether a surface is worth attempting, which is not the same question as
+ * whether Aside can claim it works.
+ *
+ * Tying the two together is how Claude ended up opening every branch in a separate
+ * window: `embedded` was marked unsupported on an assumption about framing headers
+ * that nobody had checked, and because the same flag gated the attempt, nothing
+ * ever could check it. A surface whose only evidence comes from trying it has to
+ * be allowed to try.
+ *
+ * `unsupported` remains a hard no, so this grants no provider an attempt it was
+ * never meant to have.
+ */
+export function surfaceMayBeAttempted(
+  support: CapabilitySupport,
+  observed: SurfaceObservation = 'unknown'
+): boolean {
+  if (observed === 'refused') {
+    return false;
+  }
+  if (observed === 'worked') {
+    return true;
+  }
+  return support !== 'unsupported';
 }
 
 export type PrivacyMode = 'persistent' | 'private';
