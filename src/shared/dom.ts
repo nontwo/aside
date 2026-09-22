@@ -1,95 +1,47 @@
 import type { ChatRole, RangeQuotes, SelectedBlock, SelectionPayload, TranscriptTurn } from './types';
-import {
-  compactWhitespace,
-  createSyntheticMessageId,
-  getRootConversationId,
-  normalizeChatUrl
-} from './utils';
+import { chatgptAdapter } from './providers/chatgpt';
+import type { TranscriptAdapter } from './providers/types';
+import { compactWhitespace, createSyntheticMessageId, normalizeChatUrl } from './utils';
 
-const MESSAGE_SELECTORS = [
-  'article[data-message-author-role]',
-  '[data-message-author-role]',
-  'main [data-testid^="conversation-turn-"]'
-].join(',');
+/**
+ * Transcript reading is provider-specific, but everything built on top of it —
+ * selection capture, re-anchoring, context assembly — is not. The active adapter is
+ * set once per document by the content script; tests set it explicitly.
+ */
+let activeTranscript: TranscriptAdapter = chatgptAdapter.transcript;
 
-const CONTENT_SELECTORS = [
-  '[data-message-content]',
-  '.markdown',
-  '.prose',
-  '[class*="markdown"]',
-  '[class*="prose"]',
-  '.whitespace-pre-wrap',
-  '[data-testid*="conversation-turn-content"]'
-];
+export function setActiveTranscriptAdapter(adapter: TranscriptAdapter): void {
+  activeTranscript = adapter;
+}
 
-const STRUCTURED_CONTENT_SELECTORS = [
-  '[data-message-content]',
-  '.markdown',
-  '.prose',
-  '[class*="markdown"]',
-  '[class*="prose"]',
-  'p',
-  'li',
-  'pre',
-  'code',
-  'table',
-  'blockquote',
-  'h1',
-  'h2',
-  'h3'
-].join(',');
+export function getActiveTranscriptAdapter(): TranscriptAdapter {
+  return activeTranscript;
+}
 
-const NON_CONTENT_SELECTORS = [
-  'script',
-  'style',
-  'noscript',
-  'button',
-  'textarea',
-  'input',
-  'select',
-  'option',
-  'svg',
-  '[role="menu"]',
-  '[role="tooltip"]',
-  '[data-radix-popper-content-wrapper]',
-  '.katex-mathml',
-  '.MathJax_Assistive_MathML',
-  '.mjx-assistive-mml',
-  'mjx-assistive-mml',
-  'annotation',
-  'annotation-xml',
-  '.sr-only',
-  '.visually-hidden'
-].join(',');
+/**
+ * Scope of the document a selection is captured from. Provider-specific, because a
+ * conversation id means different things on different providers and a page with no
+ * addressable conversation still needs a stable, non-colliding scope.
+ */
+export interface DocumentScope {
+  rootConversationId: string;
+  rootChatUrl: string;
+}
 
-const ASSISTANT_LABEL_PATTERNS = [
-  /^chatgpt\s*(says?|said)?\s*[:：]\s*/i,
-  /^chatgpt\s*说\s*[:：]\s*/i,
-  /^assistant\s*[:：]\s*/i,
-  /^gpt\s*[:：]\s*/i
-];
+let activeScopeResolver: () => DocumentScope = () => {
+  const rootChatUrl = normalizeChatUrl(window.location.href);
+  return {
+    rootConversationId: chatgptAdapter.identify(rootChatUrl, 'default').scopeKey,
+    rootChatUrl
+  };
+};
 
-const ASSISTANT_STATUS_PATTERNS = [
-  /^已思考\s*\d+\s*[秒s]?(?:\s*已思考\s*\d+\s*[秒s]?)*$/i,
-  /^思考\s*\d+\s*[秒s]?(?:\s*思考\s*\d+\s*[秒s]?)*$/i,
-  /^已思考中?(?:\s*\d+\s*[秒s]?)?(?:\s*已思考中?(?:\s*\d+\s*[秒s]?)?)*$/i,
-  /^思考中(?:\s*\d+\s*[秒s]?)?(?:\s*思考中(?:\s*\d+\s*[秒s]?)?)*$/i,
-  /^thought for\s*\d+\s*s(?:\s*thought for\s*\d+\s*s)*$/i,
-  /^reasoned for\s*\d+\s*s(?:\s*reasoned for\s*\d+\s*s)*$/i,
-  /^thinking(?:\.\.\.)?$/i,
-  /^思考中(?:\.\.\.)?$/i,
-  /^analyzing(?:\.\.\.)?$/i,
-  /^分析中(?:\.\.\.)?$/i,
-  /^searching the web(?:\.\.\.)?$/i,
-  /^正在搜索(?:网络|网页)(?:\.\.\.)?$/i
-];
+export function setActiveScopeResolver(resolver: () => DocumentScope): void {
+  activeScopeResolver = resolver;
+}
 
 export function stripAssistantLabel(text: string): string {
-  let next = compactWhitespace(text);
-  for (const pattern of ASSISTANT_LABEL_PATTERNS) {
-    next = next.replace(pattern, '').trim();
-  }
-  return next;
+  return activeTranscript.stripAssistantLabel(text);
 }
 
 const BLOCK_LEVEL_SELECTORS = [
@@ -134,7 +86,7 @@ export function extractCleanNodeText(node: Node): string {
   const container = document.createElement('div');
   container.append(node.cloneNode(true));
 
-  container.querySelectorAll<HTMLElement>(NON_CONTENT_SELECTORS).forEach((element) => {
+  container.querySelectorAll<HTMLElement>(activeTranscript.nonContentSelector).forEach((element) => {
     element.remove();
   });
 
@@ -163,42 +115,16 @@ export function extractCleanRangeText(range: Range): string {
 }
 
 export function isLikelyAssistantStatusText(text: string): boolean {
-  const normalized = compactWhitespace(stripAssistantLabel(text));
-  if (!normalized) {
-    return true;
-  }
-
-  if (
-    normalized.length <= 64 &&
-    /(已思考|思考中|分析中|正在搜索|thinking|thought for|reasoned for|searching the web)/i.test(
-      normalized
-    ) &&
-    !/[。.!?]/.test(normalized)
-  ) {
-    return true;
-  }
-
-  return ASSISTANT_STATUS_PATTERNS.some((pattern) => pattern.test(normalized));
+  return activeTranscript.isStatusText(text);
 }
 
 function inferRole(element: HTMLElement): ChatRole | null {
-  const directRole = element.dataset.messageAuthorRole as ChatRole | undefined;
-  if (directRole === 'assistant' || directRole === 'user' || directRole === 'system') {
-    return directRole;
-  }
-
-  const nestedRole = element.querySelector<HTMLElement>('[data-message-author-role]')?.dataset
-    .messageAuthorRole as ChatRole | undefined;
-  if (nestedRole === 'assistant' || nestedRole === 'user' || nestedRole === 'system') {
-    return nestedRole;
-  }
-
-  return null;
+  return activeTranscript.inferRole(element);
 }
 
 function getMessageText(element: HTMLElement, role: ChatRole): string {
   const candidates = [
-    ...CONTENT_SELECTORS.flatMap((selector) =>
+    ...activeTranscript.contentSelectors.flatMap((selector) =>
       Array.from(element.querySelectorAll<HTMLElement>(selector))
     ),
     element
@@ -210,8 +136,8 @@ function getMessageText(element: HTMLElement, role: ChatRole): string {
       isRoot: candidate === element,
       isStructured:
         candidate !== element &&
-        (candidate.matches(STRUCTURED_CONTENT_SELECTORS) ||
-          Boolean(candidate.querySelector(STRUCTURED_CONTENT_SELECTORS)))
+        (candidate.matches(activeTranscript.structuredContentSelector) ||
+          Boolean(candidate.querySelector(activeTranscript.structuredContentSelector)))
     }))
     .filter((candidate) => Boolean(candidate.text))
     .sort((left, right) => {
@@ -233,7 +159,7 @@ function getMessageText(element: HTMLElement, role: ChatRole): string {
 }
 
 function uniqueMessageElements(root: ParentNode = document): HTMLElement[] {
-  const nodes = Array.from(root.querySelectorAll<HTMLElement>(MESSAGE_SELECTORS));
+  const nodes = Array.from(root.querySelectorAll<HTMLElement>(activeTranscript.messageSelector));
 
   // inferRole walks the subtree, and this runs inside polling loops on conversations
   // with hundreds of turns, so resolve each role once and compare against ancestors
@@ -250,7 +176,7 @@ function uniqueMessageElements(root: ParentNode = document): HTMLElement[] {
     }
 
     // Some ChatGPT layouts wrap a message element in an outer element that also
-    // matches MESSAGE_SELECTORS; keep only the innermost one for a given role.
+    // matches the message selector; keep only the innermost one for a given role.
     let ancestor = candidate.parentElement;
     while (ancestor) {
       if (roles.has(ancestor) && roles.get(ancestor) === role) {
@@ -271,7 +197,7 @@ export function rangeTouchesAssistantMessage(range: Range): boolean {
 
   const boundaryHit = boundaries.some((node) => {
     const element = node instanceof Element ? node : node.parentElement;
-    const turn = element?.closest<HTMLElement>(MESSAGE_SELECTORS);
+    const turn = element?.closest<HTMLElement>(activeTranscript.messageSelector);
     return Boolean(turn && inferRole(turn) === 'assistant');
   });
 
@@ -288,7 +214,7 @@ export function rangeTouchesAssistantMessage(range: Range): boolean {
     return false;
   }
 
-  return Array.from(scope.querySelectorAll<HTMLElement>(MESSAGE_SELECTORS)).some((element) => {
+  return Array.from(scope.querySelectorAll<HTMLElement>(activeTranscript.messageSelector)).some((element) => {
     if (inferRole(element) !== 'assistant') {
       return false;
     }
@@ -361,7 +287,7 @@ const QUOTE_CONTEXT_CHARS = 40;
 
 function getBoundaryScope(container: Node): Element | null {
   const element = container instanceof Element ? container : container.parentElement;
-  return element?.closest(MESSAGE_SELECTORS) ?? element;
+  return element?.closest(activeTranscript.messageSelector) ?? element;
 }
 
 // Range offsets are character offsets only when the boundary container is a text node.
@@ -455,9 +381,9 @@ export function captureSelectionDraftFromRange(range: Range): SelectionDraft | n
   }
 
   const selectionRect = getRangeRect(range);
-  const rootChatUrl = normalizeChatUrl(window.location.href);
+  const { rootConversationId, rootChatUrl } = activeScopeResolver();
   return {
-    rootConversationId: getRootConversationId(rootChatUrl),
+    rootConversationId,
     rootChatUrl,
     selectedText,
     rangeQuotes: getQuoteContext(range),
@@ -550,7 +476,7 @@ function shouldIgnoreTextNode(node: Text): boolean {
     return true;
   }
 
-  if (parent.closest(NON_CONTENT_SELECTORS)) {
+  if (parent.closest(activeTranscript.nonContentSelector)) {
     return true;
   }
 
@@ -563,10 +489,12 @@ function shouldIgnoreTextNode(node: Text): boolean {
 
 // extractCleanNodeText deletes these subtrees before it injects separators, so nothing
 // inside one may contribute a boundary to the index either.
-const STRIPPED_SUBTREE_SELECTORS = `${NON_CONTENT_SELECTORS},[hidden],[aria-busy="true"]`;
+function strippedSubtreeSelector(): string {
+  return `${activeTranscript.nonContentSelector},[hidden],[aria-busy="true"]`;
+}
 
 function isStrippedElement(node: Node): node is Element {
-  return node instanceof Element && node.matches(STRIPPED_SUBTREE_SELECTORS);
+  return node instanceof Element && node.matches(strippedSubtreeSelector());
 }
 
 function isTextSeparatingElement(node: Node): boolean {

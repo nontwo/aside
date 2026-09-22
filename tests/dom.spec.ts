@@ -66,7 +66,9 @@ describe('DOM transcript helpers', () => {
     const draft = captureSelectionDraftFromRange(range);
     expect(draft).not.toBeNull();
     expect(draft?.selectedText).toBe('Second assistant e');
-    expect(draft?.rootConversationId).toBe('chat-home');
+    // Scope is provider-qualified now: a page with no addressable conversation gets a
+    // session-scoped key rather than one global catch-all shared with every other page.
+    expect(draft?.rootConversationId).toBe('chatgpt:session:default');
     expect(draft?.rangeQuotes.exact).toBe('Second assistant e');
   });
 

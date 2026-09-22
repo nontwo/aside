@@ -11,6 +11,7 @@ import type {
   RunBranchPromptInTabMessage,
   RunBranchPromptInTabResponse
 } from '../shared/types';
+import { providerHostnames } from '../shared/providers/origins';
 
 interface BranchWindowSession {
   panelId: string;
@@ -74,7 +75,9 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
 }
 
-const BRANCH_HOSTS = new Set(['chatgpt.com', 'chat.openai.com']);
+// Derived from the provider registry so a new adapter cannot be reachable in the
+// content script while the worker still refuses to focus its tabs.
+const BRANCH_HOSTS = providerHostnames();
 
 function isBranchTabUrl(url: string | undefined, expectedUrl?: string): boolean {
   if (!url) {

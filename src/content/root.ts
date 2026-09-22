@@ -26,7 +26,9 @@ import {
   findQuotedTextRangeInElement,
   findTurnElementByAnchor,
   getRecentAssistantTexts,
-  rangeTouchesAssistantMessage
+  rangeTouchesAssistantMessage,
+  setActiveScopeResolver,
+  setActiveTranscriptAdapter
 } from '../shared/dom';
 import type { SelectionDraft } from '../shared/dom';
 import {
@@ -40,7 +42,8 @@ import {
   getSendCandidateProfile,
   inferTemporaryChatState,
   isAcceptableSendControl,
-  isTemporaryChatControl
+  isTemporaryChatControl,
+  setActiveComposerAdapter
 } from '../shared/send-controls';
 import type {
   BranchCreationMode,
@@ -58,13 +61,12 @@ import type {
 import {
   clipText,
   compactWhitespace,
-  getBranchLaunchUrl,
-  getChatContainerBaseUrl,
-  getRootConversationId,
   normalizeChatUrl,
   randomId,
   sleep
 } from '../shared/utils';
+import { findChatAdapterForUrl, getAdapter } from '../shared/providers';
+import type { ConversationIdentity, ProviderAdapter, ProviderId } from '../shared/providers';
 
 interface PanelRuntime {
   state: BranchPanelState;
@@ -186,6 +188,25 @@ const suppressedSelectionActions = new Set<HTMLElement>();
 // Panels the user closed on purpose. Everything else found in storage belongs to another
 // conversation (or another tab) and has to survive a write from this page.
 const closedPanelIds = new Set<string>();
+
+/**
+ * The provider that owns this document. Resolved once at init and never changed:
+ * a selection made on ChatGPT runs its branch on ChatGPT, and a Claude selection
+ * runs on Claude. There is no cross-provider transfer.
+ */
+let provider: ProviderAdapter = getAdapter('chatgpt');
+
+/**
+ * Discriminator that keeps pages without an addressable conversation — a new chat,
+ * a project home, a shared link — from sharing one storage bucket. It is scoped to
+ * this document, so a reload deliberately starts a new scope rather than adopting
+ * somebody else's panels.
+ */
+const sessionDiscriminator = randomId('doc').slice(4);
+
+function currentIdentity(url = lastKnownUrl): ConversationIdentity {
+  return provider.identify(url, sessionDiscriminator);
+}
 let persistTimer: number | undefined;
 let persistQueue: Promise<void> = Promise.resolve();
 let toolbarSyncFrame: number | undefined;
@@ -209,7 +230,7 @@ function isTopFrame(): boolean {
 }
 
 function getConversationStorageKey(url = lastKnownUrl): string {
-  return getPanelStorageKeyForConversationId(getRootConversationId(url));
+  return getPanelStorageKeyForConversationId(currentIdentity(url).scopeKey);
 }
 
 function formatDebugLogEntry(message: string, details?: unknown): string {
@@ -1610,13 +1631,7 @@ function minimizeOtherPanels(exceptPanelId: string): void {
 }
 
 function getNonRootContainerUrl(url: string): string | undefined {
-  const containerUrl = getChatContainerBaseUrl(url);
-
-  try {
-    return new URL(containerUrl).pathname === '/' ? undefined : containerUrl;
-  } catch {
-    return undefined;
-  }
+  return currentIdentity(url).containerUrl ?? undefined;
 }
 
 interface CreateDraftOptions {
@@ -1631,7 +1646,7 @@ function createDraftState(selection: SelectionPayload, options: CreateDraftOptio
   const hostChatUrl = normalizeChatUrl(options.hostChatUrl ?? selection.rootChatUrl);
   return {
     panelId: randomId('panel'),
-    rootConversationId: getRootConversationId(hostChatUrl),
+    rootConversationId: currentIdentity(hostChatUrl).scopeKey,
     rootChatUrl: hostChatUrl,
     rootProjectUrl: getNonRootContainerUrl(hostChatUrl),
     selection,
@@ -2435,7 +2450,7 @@ async function openSelectionInNewTab(
   selection: SelectionPayload,
   branchKind: BranchKind
 ): Promise<void> {
-  const launchUrl = normalizeChatUrl(getBranchLaunchUrl(selection.rootChatUrl));
+  const launchUrl = provider.normalizeUrl(currentIdentity(selection.rootChatUrl).launchUrl);
   const prompt = buildNativeBootstrapPrompt(selection).prompt;
   const panelId = randomId('native');
   persistLastUsedBranchKind(branchKind);
@@ -2880,7 +2895,7 @@ async function startBranch(panelId: string, question: string): Promise<void> {
   }
 
   const prompt = buildLocalInitialPrompt(runtime.state.selection, question).prompt;
-  const launchUrl = normalizeChatUrl(getBranchLaunchUrl(runtime.state.rootChatUrl));
+  const launchUrl = provider.normalizeUrl(currentIdentity(runtime.state.rootChatUrl).launchUrl);
 
   if (!launchUrl) {
     runtime.state.initialQuestion = question;
@@ -3191,8 +3206,8 @@ async function handleUrlChange(): Promise<void> {
   const token = ++pendingUrlChangeToken;
   const isStale = () => token !== pendingUrlChangeToken;
 
-  const currentConversationId = getRootConversationId(lastKnownUrl);
-  const nextConversationId = getRootConversationId(nextUrl);
+  const currentConversationId = currentIdentity(lastKnownUrl).scopeKey;
+  const nextConversationId = currentIdentity(nextUrl).scopeKey;
 
   if (nextConversationId === currentConversationId) {
     lastKnownUrl = nextUrl;
@@ -3465,15 +3480,7 @@ function queryMany<T extends Element = HTMLElement>(selectors: string[], root: P
 }
 
 function getComposerCandidates(): Array<HTMLElement | HTMLTextAreaElement> {
-  const selectors = [
-    '#prompt-textarea',
-    'textarea#prompt-textarea',
-    'textarea[placeholder]',
-    'textarea',
-    'div[contenteditable="true"][role="textbox"]',
-    'div[contenteditable="true"][data-testid]',
-    'div[role="textbox"][contenteditable="true"]'
-  ];
+  const selectors = provider.composer.composerSelectors;
   const seen = new Set<Element>();
   const candidates: Array<HTMLElement | HTMLTextAreaElement> = [];
 
@@ -3774,16 +3781,7 @@ async function fillComposerWithStrategies(
 }
 
 function getSendButtonCandidates(scope: ParentNode): HTMLElement[] {
-  return queryMany<HTMLElement>(
-    [
-      'button',
-      '[role="button"]',
-      'input[type="submit"]',
-      'input[type="image"]',
-      '[data-testid="send-button"]'
-    ],
-    scope
-  );
+  return queryMany<HTMLElement>(provider.composer.sendButtonSelectors, scope);
 }
 
 function describeSendButtonCandidate(
@@ -3818,16 +3816,7 @@ function describeSendButtonCandidate(
 }
 
 function getTemporaryChatControlCandidates(scope: ParentNode): HTMLElement[] {
-  const selectors = [
-    'button[aria-label*="临时聊天"]',
-    'button[title*="临时聊天"]',
-    '[role="button"][aria-label*="临时聊天"]',
-    '[role="button"][title*="临时聊天"]',
-    'button[aria-label*="temporary" i]',
-    'button[title*="temporary" i]',
-    '[role="button"][aria-label*="temporary" i]',
-    '[role="button"][title*="temporary" i]'
-  ];
+  const selectors = provider.composer.privacyControlSelectors;
   const seen = new Set<HTMLElement>();
   const matches = queryMany<HTMLElement>(selectors, scope);
   const buttons = getSendButtonCandidates(scope).filter((candidate) => isTemporaryChatControl(candidate));
@@ -3857,26 +3846,13 @@ function findDirectTemporaryChatControl(
   composer?: HTMLElement | HTMLTextAreaElement | null,
   targetState: 'active' | 'any' = 'any'
 ): HTMLElement | null {
-  const activeSelectors = [
-    'button[aria-label*="临时聊天"][aria-pressed="true"]',
-    'button[aria-label*="临时聊天"][aria-checked="true"]',
-    '[role="button"][aria-label*="临时聊天"][aria-pressed="true"]',
-    '[role="button"][aria-label*="临时聊天"][aria-checked="true"]',
-    'button[aria-label*="temporary" i][aria-pressed="true"]',
-    'button[aria-label*="temporary" i][aria-checked="true"]',
-    '[role="button"][aria-label*="temporary" i][aria-pressed="true"]',
-    '[role="button"][aria-label*="temporary" i][aria-checked="true"]'
-  ];
-  const anySelectors = [
-    'button[aria-label*="临时聊天"]',
-    'button[title*="临时聊天"]',
-    '[role="button"][aria-label*="临时聊天"]',
-    '[role="button"][title*="临时聊天"]',
-    'button[aria-label*="temporary" i]',
-    'button[title*="temporary" i]',
-    '[role="button"][aria-label*="temporary" i]',
-    '[role="button"][title*="temporary" i]'
-  ];
+  const anySelectors = provider.composer.privacyControlSelectors;
+  // An explicitly pressed/checked control is the strongest signal available, so look
+  // for that form of each selector first.
+  const activeSelectors = anySelectors.flatMap((selector) => [
+    `${selector}[aria-pressed="true"]`,
+    `${selector}[aria-checked="true"]`
+  ]);
 
   for (const scope of getComposerSearchScopes(composer)) {
     const direct =
@@ -4250,19 +4226,11 @@ async function waitForAcceptedGenerationSignalOrNull(
 }
 
 function findStopButton(): HTMLButtonElement | null {
-  return queryOne<HTMLButtonElement>([
-    'button[aria-label*="Stop"]',
-    'button[aria-label*="stop"]',
-    'button[aria-label*="停止"]'
-  ]);
+  return queryOne<HTMLButtonElement>(provider.composer.stopButtonSelectors);
 }
 
 function isPersistentConversationUrl(url: string): boolean {
-  try {
-    return /\/c\/[^/?#]+/.test(new URL(url).pathname);
-  } catch {
-    return false;
-  }
+  return provider.isConversationUrl(url);
 }
 
 async function waitForAcceptedGenerationSignal(
@@ -4969,9 +4937,38 @@ function initEmbeddedFrame(): void {
   postReady();
 }
 
+/**
+ * Bind every provider-specific module to the adapter that owns this document.
+ * Returns false when Aside must not run here at all — a marketing page, the auth
+ * flow, or settings — so no UI is mounted and no listeners are installed.
+ */
+function bindProviderForDocument(): boolean {
+  const adapter = findChatAdapterForUrl(window.location.href);
+  if (!adapter) {
+    return false;
+  }
+
+  provider = adapter;
+  setActiveTranscriptAdapter(adapter.transcript);
+  setActiveComposerAdapter(adapter.composer);
+  setActiveScopeResolver(() => {
+    const url = adapter.normalizeUrl(window.location.href);
+    return {
+      rootConversationId: adapter.identify(url, sessionDiscriminator).scopeKey,
+      rootChatUrl: url
+    };
+  });
+
+  return true;
+}
+
 function init(): void {
   window.__asideCleanup?.();
   window.__asideCleanup = cleanup;
+
+  if (!bindProviderForDocument()) {
+    return;
+  }
 
   if (isTopFrame()) {
     initTopFrame();

@@ -1,4 +1,16 @@
+import { chatgptAdapter } from './providers/chatgpt';
+import type { ComposerAdapter } from './providers/types';
 import { compactWhitespace } from './utils';
+
+/**
+ * Privacy-control vocabulary is provider-specific ("Temporary Chat" vs "Incognito
+ * chat"), so it comes from the active adapter rather than a shared word list.
+ */
+let activeComposerAdapter: ComposerAdapter = chatgptAdapter.composer;
+
+export function setActiveComposerAdapter(adapter: ComposerAdapter): void {
+  activeComposerAdapter = adapter;
+}
 
 export type TemporaryChatState = 'active' | 'inactive' | 'unknown';
 
@@ -35,13 +47,16 @@ export function hasExplicitSendSemantics(candidate: HTMLElement): boolean {
 
 export function hasNegativeSendSemantics(candidate: HTMLElement): boolean {
   const label = getActionLabel(candidate).toLowerCase();
-  return /group|voice|audio|upload|attach|search|share|sidebar|project|model|temporary\s*chat|群聊|语音|听写|上传|附件|搜索|分享|边栏|项目|模型|临时聊天/.test(
+  if (activeComposerAdapter.privacyControlLabelPattern.test(label)) {
+    return true;
+  }
+  return /group|voice|audio|upload|attach|search|share|sidebar|project|model|群聊|语音|听写|上传|附件|搜索|分享|边栏|项目|模型/.test(
     label
   );
 }
 
 export function isTemporaryChatControl(candidate: HTMLElement): boolean {
-  return /temporary\s*chat|临时聊天/.test(getActionLabel(candidate).toLowerCase());
+  return activeComposerAdapter.privacyControlLabelPattern.test(getActionLabel(candidate));
 }
 
 export function isSubmitLikeControl(candidate: HTMLElement): boolean {
@@ -71,11 +86,6 @@ const INACTIVE_STATE_VALUES = new Set([
   'off'
 ]);
 
-const TEMPORARY_CHAT_INACTIVE_LABELS =
-  /开启临时聊天|启用临时聊天|开始临时聊天|temporary chat off|turn on temporary chat|start temporary chat|enable temporary chat/;
-const TEMPORARY_CHAT_ACTIVE_LABELS =
-  /关闭临时聊天|退出临时聊天|结束临时聊天|停止临时聊天|temporary chat on|turn off temporary chat|disable temporary chat|exit temporary chat|leave temporary chat/;
-
 /**
  * This decides whether a branch is about to be written into the user's permanent chat
  * history, so it only trusts signals that actually mean "this toggle is on".
@@ -97,12 +107,12 @@ export function inferTemporaryChatState(candidate: HTMLElement): TemporaryChatSt
     return 'inactive';
   }
 
-  const label = getActionLabel(candidate).toLowerCase();
-  if (TEMPORARY_CHAT_INACTIVE_LABELS.test(label)) {
+  const label = getActionLabel(candidate);
+  if (activeComposerAdapter.privacyInactiveLabelPattern.test(label)) {
     return 'inactive';
   }
 
-  if (TEMPORARY_CHAT_ACTIVE_LABELS.test(label)) {
+  if (activeComposerAdapter.privacyActiveLabelPattern.test(label)) {
     return 'active';
   }
 
