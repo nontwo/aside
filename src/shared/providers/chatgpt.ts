@@ -309,8 +309,11 @@ export const chatgptAdapter: ProviderAdapter = {
   },
 
   surfaces: {
-    embedded: 'verified',
-    nativeWindow: 'verified',
+    // Both paths shipped and are exercised against fixtures on every run. They
+    // were not re-confirmed against a live ChatGPT account in this work, so they
+    // are not labelled `verified`: that level means observed in the live DOM.
+    embedded: 'fixture-only',
+    nativeWindow: 'fixture-only',
     detail: 'ChatGPT can be driven in an embedded frame and in a window Aside opens.'
   },
 

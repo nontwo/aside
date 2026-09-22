@@ -8,7 +8,7 @@ import {
   readSnapshot,
   tombstoneKey
 } from '../shared/panel-store';
-import type { PanelStorageArea, StoreSnapshot } from '../shared/panel-store';
+import type { PanelRecord, PanelStorageArea, StoreSnapshot } from '../shared/panel-store';
 import { ALL_PROVIDER_ORIGINS } from '../shared/providers/origins';
 import type {
   PanelChangedMessage,
@@ -47,26 +47,71 @@ function areaApi(area: PanelStorageArea): chrome.storage.StorageArea | null {
   return chrome.storage.local;
 }
 
-async function readArea(area: PanelStorageArea): Promise<StoreSnapshot> {
+const EMPTY_SNAPSHOT: StoreSnapshot = { records: {}, tombstones: {} };
+
+/**
+ * Read one storage area, or null if the read failed.
+ *
+ * Null is not the same as empty. The whole conflict model is decided against
+ * what is already stored: if the read failed and we treated it as an empty
+ * store, a stale write would be applied over a newer record (a silent lost
+ * update) and a tombstone would be missed, resurrecting a panel the user
+ * closed. A failed read must fail the write instead.
+ */
+async function readArea(area: PanelStorageArea): Promise<StoreSnapshot | null> {
   const api = areaApi(area);
   if (!api) {
-    return { records: {}, tombstones: {} };
+    // Session storage genuinely absent is a known, reported condition rather
+    // than a read failure; there is nothing stored to lose.
+    return area === 'session' ? EMPTY_SNAPSHOT : null;
   }
 
   try {
     return readSnapshot((await api.get(null)) as Record<string, unknown>);
   } catch {
-    return { records: {}, tombstones: {} };
+    return null;
   }
 }
 
-/**
- * Tombstones live in local storage even for session-area panels, so closing a
- * private branch in one tab is still honoured by a tab that has it mounted.
- */
-async function readTombstones(): Promise<StoreSnapshot['tombstones']> {
+interface AreaSnapshots {
+  local: StoreSnapshot;
+  session: StoreSnapshot;
+  /**
+   * Tombstones live in local storage even for session-area panels, so closing a
+   * private branch in one tab is still honoured by a tab that has it mounted.
+   */
+  tombstones: StoreSnapshot['tombstones'];
+}
+
+async function readBothAreas(): Promise<AreaSnapshots | null> {
   const [local, session] = await Promise.all([readArea('local'), readArea('session')]);
-  return { ...session.tombstones, ...local.tombstones };
+  if (!local || !session) {
+    return null;
+  }
+  return { local, session, tombstones: { ...session.tombstones, ...local.tombstones } };
+}
+
+const STORAGE_READ_FAILED = {
+  ok: false,
+  status: 'error' as const,
+  unsaved: true,
+  reason: 'Could not read extension storage, so this write was not attempted.'
+};
+
+/**
+ * The record for a panel, wherever it currently lives.
+ *
+ * A panel switched between Persistent and Private changes storage area. Its
+ * identity and revision line must not: if each area kept its own counter, the
+ * same panel would exist twice, restore would pick one arbitrarily (reverting
+ * the user's privacy choice and leaving the content on disk), and the stale-write
+ * check would stop working because the two counters disagree.
+ */
+function currentRecord(areas: AreaSnapshots, panelId: string) {
+  const candidates = [areas.local.records[panelId], areas.session.records[panelId]].filter(
+    (record): record is NonNullable<typeof record> => Boolean(record)
+  );
+  return candidates.sort((left, right) => right.rev - left.rev)[0];
 }
 
 async function broadcastPanelChange(message: PanelChangedMessage): Promise<void> {
@@ -104,10 +149,20 @@ export async function handlePanelUpsert(message: PanelUpsertMessage): Promise<Pa
       };
     }
 
-    const areaSnapshot = await readArea(message.area);
+    const areas = await readBothAreas();
+    if (!areas) {
+      return STORAGE_READ_FAILED;
+    }
+
+    const otherArea: PanelStorageArea = message.area === 'local' ? 'session' : 'local';
+    const existing = currentRecord(areas, message.panelId);
+    const movingArea = Boolean(existing) && existing.area !== message.area;
+
     const snapshot: StoreSnapshot = {
-      records: areaSnapshot.records,
-      tombstones: await readTombstones()
+      records: existing
+        ? { ...areas[message.area].records, [message.panelId]: existing }
+        : areas[message.area].records,
+      tombstones: areas.tombstones
     };
 
     const now = Date.now();
@@ -183,6 +238,20 @@ export async function handlePanelUpsert(message: PanelUpsertMessage): Promise<Pa
       }
     }
 
+    // The panel moved between durable and session storage: remove the copy it
+    // left behind, so a restore cannot resurrect the previous privacy choice.
+    if (movingArea) {
+      const previous = areaApi(otherArea);
+      if (previous) {
+        try {
+          await previous.remove(panelRecordKey(record.panelId));
+        } catch {
+          // Leaving a duplicate is bad but not worth failing a saved write over;
+          // handlePanelList prefers the newest revision, which is this one.
+        }
+      }
+    }
+
     // Housekeeping: drop expired tombstones so the store stays bounded.
     const expired = expiredTombstoneKeys(snapshot, now);
     if (expired.length) {
@@ -208,10 +277,13 @@ export async function handlePanelUpsert(message: PanelUpsertMessage): Promise<Pa
 
 export async function handlePanelDelete(message: PanelDeleteMessage): Promise<PanelWriteResponse> {
   return serialize(async () => {
-    const [local, session] = await Promise.all([readArea('local'), readArea('session')]);
+    const areas = await readBothAreas();
+    if (!areas) {
+      return STORAGE_READ_FAILED;
+    }
     const combined: StoreSnapshot = {
-      records: { ...session.records, ...local.records },
-      tombstones: { ...session.tombstones, ...local.tombstones }
+      records: { ...areas.session.records, ...areas.local.records },
+      tombstones: areas.tombstones
     };
 
     const outcome = applyDelete(combined, {
@@ -259,11 +331,26 @@ export async function handlePanelDelete(message: PanelDeleteMessage): Promise<Pa
 }
 
 export async function handlePanelList(): Promise<PanelListResponse> {
-  const [local, session] = await Promise.all([readArea('local'), readArea('session')]);
-  const tombstones = { ...session.tombstones, ...local.tombstones };
+  const areas = await readBothAreas();
+  if (!areas) {
+    return { ok: false, records: [], sessionUnavailable: areaApi('session') === null };
+  }
+  const tombstones = areas.tombstones;
   const sessionUnavailable = areaApi('session') === null;
 
-  const records = [...Object.values(local.records), ...Object.values(session.records)]
+  // One entry per panel even if a stale duplicate survives in the other area:
+  // the newest revision is the one the user last chose.
+  const byPanelId = new Map<string, PanelRecord>();
+  [...Object.values(areas.local.records), ...Object.values(areas.session.records)].forEach(
+    (record) => {
+      const seen = byPanelId.get(record.panelId);
+      if (!seen || record.rev > seen.rev) {
+        byPanelId.set(record.panelId, record);
+      }
+    }
+  );
+
+  const records = [...byPanelId.values()]
     .filter((record) => !tombstones[record.panelId])
     .sort((left, right) => (left.state.createdAt ?? 0) - (right.state.createdAt ?? 0))
     .map((record) => ({
@@ -279,5 +366,5 @@ export async function handlePanelList(): Promise<PanelListResponse> {
 
 /** Diagnostic used by tests and the migration path. */
 export async function storeByteSize(): Promise<number> {
-  return approximateByteSize(await readArea('local'));
+  return approximateByteSize((await readArea('local')) ?? EMPTY_SNAPSHOT);
 }

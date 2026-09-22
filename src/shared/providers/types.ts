@@ -5,12 +5,20 @@ export type ProviderId = 'chatgpt' | 'claude';
 /**
  * How confident Aside is that a capability works on a provider.
  *
- * - `verified`   the adapter can positively observe the capability in the live DOM
- * - `unverified` the control exists in provider documentation but Aside could not
- *                confirm it on this page/account, so the capability is not offered
- * - `unsupported` the provider does not expose it at all in a way Aside can drive
+ * - `verified`     the adapter can positively observe the capability in the live DOM
+ * - `fixture-only` implemented and exercised against local fixtures, but never
+ *                  confirmed against a live logged-in account. Offered, because
+ *                  refusing to offer it would be worse, but not claimed as proven
+ * - `unverified`   the control exists in provider documentation but Aside could not
+ *                  confirm it on this page/account, so the capability is not offered
+ * - `unsupported`  the provider does not expose it at all in a way Aside can drive
  */
-export type CapabilitySupport = 'verified' | 'unverified' | 'unsupported';
+export type CapabilitySupport = 'verified' | 'fixture-only' | 'unverified' | 'unsupported';
+
+/** Support levels under which Aside will attempt a surface. */
+export function surfaceIsAvailable(support: CapabilitySupport): boolean {
+  return support === 'verified' || support === 'fixture-only';
+}
 
 export type PrivacyMode = 'persistent' | 'private';
 

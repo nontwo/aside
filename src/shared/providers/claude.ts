@@ -361,7 +361,9 @@ export const claudeAdapter: ProviderAdapter = {
     // Aside does not attempt an in-page iframe there. The native window path is the
     // supported surface and is exercised against fixtures.
     embedded: 'unsupported',
-    nativeWindow: 'verified',
+    // Implemented and fixture-exercised, never run against a live Claude account.
+    // See the SELECTOR PROVENANCE note at the top of this file.
+    nativeWindow: 'fixture-only',
     detail:
       'claude.ai refuses to be embedded in a frame, so Claude branches open in a window Aside controls instead of an in-page panel frame.'
   },

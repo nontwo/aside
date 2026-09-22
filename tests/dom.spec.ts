@@ -591,6 +591,37 @@ describe('structured extraction for the model', () => {
     expect(text).not.toContain('beta hat equals');
   });
 
+  it('reads the TeX source out of KaTeX markup that carries no data-latex', () => {
+    // The regression: every adapter lists `annotation`/`.katex-mathml` as
+    // non-content, correctly, but that subtree is also the only place the source
+    // lives. Stripping non-content first left the flattened glyph run, which is
+    // exactly what the extraction exists to avoid.
+    document.body.innerHTML =
+      '<div class="markdown"><p>Given <span class="katex">' +
+      '<span class="katex-mathml"><math><semantics>' +
+      '<annotation encoding="application/x-tex">\\frac{\\partial L}{\\partial \\theta}</annotation>' +
+      '</semantics></math></span>' +
+      '<span class="katex-html" aria-hidden="true">∂L∂θ</span>' +
+      '</span> is the gradient.</p></div>';
+    const text = extractStructuredNodeText(document.querySelector('.markdown') as HTMLElement);
+
+    expect(text).toContain('$\\frac{\\partial L}{\\partial \\theta}$');
+    expect(text).not.toContain('∂L∂θ');
+    expect(text).toContain('is the gradient.');
+  });
+
+  it('leaves no Aside attributes on the provider-s own message elements', () => {
+    // Nothing writes to a provider-owned element. Reading the transcript used to
+    // stamp two dataset attributes on every message node, re-written on every
+    // poll and never removed.
+    extractTranscript(document);
+
+    document.querySelectorAll<HTMLElement>('article, .markdown').forEach((element) => {
+      const attributes = Array.from(element.attributes).map((attribute) => attribute.name);
+      expect(attributes.filter((name) => name.includes('aside'))).toEqual([]);
+    });
+  });
+
   it('drops provider controls from the model text', () => {
     document.body.innerHTML =
       '<div class="markdown"><p>Answer text.</p><button>Copy</button></div>';

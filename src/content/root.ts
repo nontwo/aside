@@ -11,6 +11,7 @@ import {
   ROOT_STYLE_ID,
   LAST_BRANCH_KIND_STORAGE_KEY
 } from '../shared/constants';
+import { mergePanelStateOnConflict, resolveWriteConflict } from '../shared/panel-store';
 import {
   getPanelStorageKeyForConversationId,
   getPanelStorageKeyForState,
@@ -38,7 +39,7 @@ import {
 import type { SelectionDraft } from '../shared/dom';
 import {
   buildBranchPrompt,
-  buildNativeBootstrapPrompt,
+  buildNativeBootstrapPromptFromContext,
   stripHiddenTitle
 } from '../shared/prompts';
 import {
@@ -47,12 +48,14 @@ import {
   freezeContext,
   measureContext,
   renderContextText,
+  sanitizeStoredContext,
   withBlockIncluded,
   withUserBackground
 } from '../shared/context';
 import type { BranchContext, ContextBlock } from '../shared/context';
 import { attachElementToHost, ensureExtensionHostElement } from './ui-host';
 import { findFreeCorner, findLeftGutterSlot, findSafePlacement } from '../shared/placement';
+import { surfaceIsAvailable } from '../shared/providers/types';
 import type { Rect } from '../shared/placement';
 import {
   getActionLabel,
@@ -80,6 +83,7 @@ import {
   createAttemptId,
   isBranchAttemptRef,
   isBranchPanelEvent,
+  isRunBranchPromptRequest,
   ownsAttempt
 } from '../shared/branch-attempt';
 import {
@@ -101,6 +105,8 @@ interface PanelRuntime {
   focusTextEl: HTMLElement;
   formEl: HTMLFormElement;
   branchKindField: HTMLDivElement;
+  privacyNoteEl: HTMLDetailsElement;
+  privacyStorageWarning: HTMLParagraphElement;
   persistentKindButton: HTMLButtonElement;
   temporaryKindButton: HTMLButtonElement;
   questionInput: HTMLTextAreaElement;
@@ -123,6 +129,19 @@ interface PanelRuntime {
   frameReady: boolean;
   frameStartSent: boolean;
   watchdogId?: number;
+}
+
+/**
+ * Attempts this tab started. Both tabs holding the same panel see the same
+ * `attemptId` once the record syncs, so the state alone cannot say which tab is
+ * driving the branch; only the tab that minted the attempt knows.
+ */
+const startedAttemptIds = new Set<string>();
+
+/** True when this tab is the one actually running the panel's branch. */
+function tabDrivesBranch(runtime: PanelRuntime): boolean {
+  const attemptId = runtime.state.attemptId;
+  return Boolean(attemptId && startedAttemptIds.has(attemptId));
 }
 
 /** The attempt a panel is currently running, if any. */
@@ -337,6 +356,22 @@ function markPanelDirty(panelId: string): void {
   dirtyPanelIds.add(panelId);
 }
 
+/** The last state successfully written for a panel, so unchanged panels are skipped. */
+const lastWrittenSignatures = new Map<string, string>();
+
+/**
+ * What is actually worth writing.
+ *
+ * `updatedAt` is excluded deliberately: several call sites stamp it without
+ * changing anything the user would notice, and writing for that alone bumps the
+ * record's revision, which is what makes another tab's in-progress draft flip to
+ * unsaved on unrelated activity here.
+ */
+function panelWriteSignature(state: BranchPanelState): string {
+  const { updatedAt: _updatedAt, ...rest } = state;
+  return JSON.stringify(rest);
+}
+
 function markAllPanelsDirty(): void {
   panelRuntimes.forEach((runtime) => dirtyPanelIds.add(runtime.state.panelId));
 }
@@ -369,9 +404,15 @@ function adoptAuthoritativeState(panelId: string, state: BranchPanelState, rev: 
   const editing = document.activeElement === runtime.questionInput;
   const localQuestion = runtime.questionInput.value;
 
-  runtime.state = editing ? { ...state, initialQuestion: localQuestion } : state;
+  runtime.state = mergePanelStateOnConflict({
+    local: runtime.state,
+    theirs: state,
+    localQuestion: editing ? localQuestion : state.initialQuestion ?? '',
+    localDrivesBranch: tabDrivesBranch(runtime)
+  });
+  lastWrittenSignatures.set(panelId, panelWriteSignature(runtime.state));
   if (!editing) {
-    runtime.questionInput.value = state.initialQuestion ?? '';
+    runtime.questionInput.value = runtime.state.initialQuestion ?? '';
     unsavedPanelIds.delete(panelId);
   } else {
     // The user is typing here. Keep their text, but do NOT immediately write it
@@ -384,11 +425,18 @@ function adoptAuthoritativeState(panelId: string, state: BranchPanelState, rev: 
   renderTabs();
 }
 
-/** Optimistic concurrency needs a few goes: another tab saving is routine. */
-const MAX_WRITE_REBASES = 3;
-
 async function writePanelRecord(runtime: PanelRuntime, attempt = 0): Promise<void> {
   const panelId = runtime.state.panelId;
+
+  // Taken before the round trip, and recorded only on success. Reading it back
+  // afterwards would mark as written whatever the user typed while the write was
+  // in flight, and the next write would then skip it: the last few characters of
+  // a draft would silently never be saved.
+  const signature = panelWriteSignature(runtime.state);
+  if (attempt === 0 && !unsavedPanelIds.has(panelId) && lastWrittenSignatures.get(panelId) === signature) {
+    return;
+  }
+
   const response = await sendStoreMessage<PanelWriteResponse>({
     type: 'PANEL_UPSERT',
     panelId,
@@ -411,7 +459,14 @@ async function writePanelRecord(runtime: PanelRuntime, attempt = 0): Promise<voi
 
   if (response.status === 'applied' && typeof response.rev === 'number') {
     panelRevisions.set(panelId, response.rev);
+    lastWrittenSignatures.set(panelId, signature);
     unsavedPanelIds.delete(panelId);
+
+    // Anything typed while that write was in flight is still unwritten.
+    if (panelWriteSignature(runtime.state) !== signature) {
+      markPanelDirty(panelId);
+      persistPanelsSoon(panelId);
+    }
     return;
   }
 
@@ -420,23 +475,42 @@ async function writePanelRecord(runtime: PanelRuntime, attempt = 0): Promise<voi
     panelRevisions.set(panelId, theirs.rev);
 
     const localQuestion = runtime.questionInput.value;
-    const questionDiverged = (theirs.state.initialQuestion ?? '') !== localQuestion;
+    const decision = resolveWriteConflict({
+      localQuestion,
+      theirQuestion: theirs.state.initialQuestion,
+      attempt
+    });
 
-    // Re-base onto their record and try again, keeping the one field the user edits
-    // directly. Adopting outright is how a draft typed in this tab disappears
-    // because another tab happened to save first, and a single retry is not enough:
-    // a tab that is actively being used writes more than once.
-    if (attempt < MAX_WRITE_REBASES && questionDiverged) {
+    if (decision.action === 'rebase') {
       appendPanelLog(runtime, 'Another tab wrote first; re-basing this draft onto it', {
         theirRev: theirs.rev,
         attempt: attempt + 1
       });
       runtime.state = {
-        ...theirs.state,
-        initialQuestion: localQuestion,
+        ...mergePanelStateOnConflict({
+          local: runtime.state,
+          theirs: theirs.state,
+          localQuestion: decision.question,
+          localDrivesBranch: tabDrivesBranch(runtime)
+        }),
         updatedAt: Date.now()
       };
       await writePanelRecord(runtime, attempt + 1);
+      return;
+    }
+
+    if (decision.action === 'keep-local-unsaved') {
+      appendPanelLog(runtime, 'Could not save this draft; another tab keeps writing first', {
+        theirRev: theirs.rev
+      });
+      runtime.state = mergePanelStateOnConflict({
+        local: runtime.state,
+        theirs: theirs.state,
+        localQuestion: decision.question,
+        localDrivesBranch: tabDrivesBranch(runtime)
+      });
+      unsavedPanelIds.add(panelId);
+      syncPanelUI(runtime);
       return;
     }
 
@@ -542,15 +616,26 @@ async function flushPersistedPanels(): Promise<void> {
   await queuePersistWrite();
 }
 
-async function deletePanelRecord(panelId: string): Promise<void> {
-  await sendStoreMessage<PanelWriteResponse>({
+/** True when the deletion was recorded, so the panel will stay closed. */
+async function deletePanelRecord(panelId: string): Promise<boolean> {
+  const response = await sendStoreMessage<PanelWriteResponse>({
     type: 'PANEL_DELETE',
     panelId,
     baseRev: panelRevisions.get(panelId) ?? 0
   });
+
+  // No tombstone means no deletion: the record is still in storage, and the next
+  // reload — or any other tab, right now — will bring this panel back. Closing it
+  // in the DOM here would only hide that until it reappeared.
+  if (!response?.ok) {
+    return false;
+  }
+
   panelRevisions.delete(panelId);
   unsavedPanelIds.delete(panelId);
   dirtyPanelIds.delete(panelId);
+  lastWrittenSignatures.delete(panelId);
+  return true;
 }
 
 async function listPanelRecords(): Promise<PanelListedRecord[]> {
@@ -814,13 +899,7 @@ function installThemeObserver(): void {
 }
 
 function ensureStyles(): void {
-  if (document.getElementById(ROOT_STYLE_ID)) {
-    return;
-  }
-
-  const style = document.createElement('style');
-  style.id = ROOT_STYLE_ID;
-  style.textContent = `
+  const css = `
     html[data-aside-theme="light"] {
       --sb-color-scheme: light;
       --sb-text: #111827;
@@ -935,6 +1014,26 @@ function ensureStyles(): void {
       user-select: none;
     }
 
+    .aside-privacy-note {
+      font-size: 11px;
+      line-height: 1.45;
+      color: var(--sb-muted, #6b7280);
+      margin: 6px 0 0;
+    }
+    .aside-privacy-note summary {
+      cursor: pointer;
+    }
+    .aside-privacy-warning {
+      margin: 6px 0 0;
+      color: var(--sb-text, #111827);
+      font-weight: 600;
+    }
+    .aside-privacy-note ul {
+      margin: 6px 0 0;
+      padding-left: 16px;
+      display: grid;
+      gap: 4px;
+    }
     .aside-kind-toggle {
       display: inline-flex;
       align-items: center;
@@ -1432,10 +1531,12 @@ function ensureStyles(): void {
       flex-wrap: wrap;
     }
 
-    .aside-origin-flash {
+    .aside-origin-outline {
+      position: absolute;
+      pointer-events: none;
+      border-radius: 10px;
       outline: 3px solid rgba(16, 185, 129, 0.6);
       outline-offset: 6px;
-      transition: outline-color 180ms ease;
     }
 
     #${HIGHLIGHT_OVERLAY_ID} {
@@ -1452,7 +1553,23 @@ function ensureStyles(): void {
       box-shadow: 0 0 0 2px rgba(5, 150, 105, 0.22);
     }
   `;
+
+  const existing = document.getElementById(ROOT_STYLE_ID);
+  if (existing instanceof HTMLStyleElement && existing.textContent === css) {
+    return;
+  }
+
+  // A stylesheet left behind by a previous build of the extension, which an
+  // in-place update does not remove: without this, the new content script finds
+  // the old id, returns early, and runs against the old build's CSS for the life
+  // of the tab.
+  existing?.remove();
+
+  const style = document.createElement('style');
+  style.id = ROOT_STYLE_ID;
+  style.textContent = css;
   document.head.append(style);
+  cleanupFns.push(() => style.remove());
 }
 
 /**
@@ -2314,9 +2431,40 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   const persistentKindButton = document.createElement('button');
   persistentKindButton.type = 'button';
   persistentKindButton.textContent = 'Persistent';
+  // Stable hook: the visible label is the provider's own word for the mode and
+  // therefore differs per provider.
+  persistentKindButton.dataset.asideRole = 'branch-kind-persistent';
   const temporaryKindButton = document.createElement('button');
   temporaryKindButton.type = 'button';
-  temporaryKindButton.textContent = 'Temporary';
+  // The provider's own name for the mode, not a word Aside invented: the user has
+  // to recognise it in the provider's own interface to check it.
+  temporaryKindButton.textContent = provider.privacy.label;
+  temporaryKindButton.dataset.asideRole = 'branch-kind-temporary';
+  temporaryKindButton.title = `Run this branch in ${provider.label}'s ${provider.privacy.label} mode`;
+
+  // What the provider documents about its private mode, shown before a private
+  // branch runs rather than described only in the README. Collapsed by default so
+  // it does not shout, but present at the moment the choice is made.
+  const privacyNoteEl = document.createElement('details');
+  privacyNoteEl.className = 'aside-privacy-note';
+  const privacyNoteSummary = document.createElement('summary');
+  privacyNoteSummary.textContent = `What ${provider.privacy.label} does and does not do`;
+  // Shown only when session storage is unavailable: a private branch still runs,
+  // but Aside will not fall back to writing its content to disk, so the panel
+  // cannot be kept. The user should hear that before choosing the mode, not after
+  // the branch disappears.
+  const privacyStorageWarning = document.createElement('p');
+  privacyStorageWarning.className = 'aside-privacy-warning';
+  privacyStorageWarning.textContent =
+    'This browser did not make session storage available to Aside. A private branch will still run, but it cannot be kept when you leave the page: Aside will not write private branch content to disk instead.';
+  privacyStorageWarning.hidden = true;
+  const privacyNoteList = document.createElement('ul');
+  provider.privacy.constraints.forEach((constraint) => {
+    const item = document.createElement('li');
+    item.textContent = constraint;
+    privacyNoteList.append(item);
+  });
+  privacyNoteEl.append(privacyNoteSummary, privacyStorageWarning, privacyNoteList);
   const questionInput = document.createElement('textarea');
   // Stable hook: the panel has more than one textarea, and selectors that rely on
   // document order break the moment a section is added above this one.
@@ -2333,14 +2481,14 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   submitButton.textContent = 'Start branch';
   branchKindField.append(persistentKindButton, temporaryKindButton);
   launcherActions.append(submitButton);
-  formEl.append(branchKindField, questionInput, launcherActions);
+  formEl.append(branchKindField, privacyNoteEl, questionInput, launcherActions);
 
   const iframeShell = document.createElement('div');
   iframeShell.className = 'aside-frame-shell';
   iframeShell.hidden = true;
   const iframeEl = document.createElement('iframe');
   iframeEl.className = 'aside-frame';
-  iframeEl.title = 'ChatGPT embedded branch';
+  iframeEl.title = `${provider.label} embedded branch`;
   iframeEl.setAttribute('loading', 'eager');
   iframeEl.referrerPolicy = 'strict-origin-when-cross-origin';
   iframeEl.src = 'about:blank';
@@ -2428,6 +2576,8 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     focusTextEl,
     formEl,
     branchKindField,
+    privacyNoteEl,
+    privacyStorageWarning,
     persistentKindButton,
     temporaryKindButton,
     questionInput,
@@ -2684,6 +2834,13 @@ function syncPanelUI(runtime: PanelRuntime): void {
 
   runtime.formEl.style.display = showForm ? 'flex' : 'none';
   runtime.branchKindField.style.display = canShowBranchKindToggle(state) ? 'inline-flex' : 'none';
+  const privacyNoteVisible = showForm && state.branchKind === 'temporary';
+  runtime.privacyNoteEl.hidden = !privacyNoteVisible;
+  runtime.privacyStorageWarning.hidden = sessionStorageUsable;
+  if (privacyNoteVisible && !sessionStorageUsable) {
+    // A limitation the user needs before choosing, not one they have to open.
+    runtime.privacyNoteEl.open = true;
+  }
   runtime.persistentKindButton.dataset.selected = String(state.branchKind === 'persistent');
   runtime.temporaryKindButton.dataset.selected = String(state.branchKind === 'temporary');
   runtime.questionInput.disabled = !showForm;
@@ -2859,6 +3016,10 @@ function createStateFromRestore(raw: BranchPanelState): BranchPanelState | null 
     rootChatUrl: normalizedRootChatUrl,
     rootProjectUrl: raw.rootProjectUrl ?? getNonRootContainerUrl(normalizedRootChatUrl),
     selection: raw.selection,
+    // The context is a persisted field: without it the Context section is hidden
+    // after a reload and the prompt is silently rebuilt from defaults, putting
+    // back every block the user unticked.
+    context: sanitizeStoredContext(raw.context),
     focusPreview: raw.focusPreview || clipText(raw.selection.selectedText, 280),
     branchKind,
     entryAction,
@@ -2925,6 +3086,7 @@ async function restorePanels(): Promise<void> {
     });
 
   syncMountedUi();
+  drainPendingPanelChanges();
 }
 
 function minimizePanel(panelId: string): void {
@@ -2967,9 +3129,28 @@ function closePanel(panelId: string): void {
   runtime.element.remove();
   panelRuntimes.delete(panelId);
   renderTabs();
+
   // A close is a deletion with a tombstone, not the absence of a write: another
-  // tab that still has this panel mounted must not write it back.
-  void deletePanelRecord(panelId);
+  // tab that still has this panel mounted must not write it back. If the tombstone
+  // cannot be written, the branch is not closed — say so instead of letting it
+  // reappear later with no explanation.
+  void deletePanelRecord(panelId).then((deleted) => {
+    if (deleted) {
+      return;
+    }
+
+    closedPanelIds.delete(panelId);
+    runtime.state.status = 'failed';
+    runtime.state.creationMode = 'failed';
+    runtime.state.statusLabel = 'This branch could not be closed.';
+    runtime.state.errorMessage =
+      'Aside could not record the deletion, so this branch would come back on the next reload. Try Close again.';
+    runtime.state.updatedAt = Date.now();
+    panelRuntimes.set(panelId, runtime);
+    mountInExtensionHost(runtime.element);
+    syncPanelUI(runtime);
+    renderTabs();
+  });
 }
 
 // Navigating away is not the same as closing: these panels stay in storage so the user
@@ -3028,10 +3209,10 @@ async function promotePersistentBranchToNativeWindow(runtime: PanelRuntime): Pro
   runtime.pendingFramePrompt = undefined;
   runtime.state.surfaceMode = 'native_window';
   runtime.state.status = 'opening_branch';
-  runtime.state.statusLabel = 'Continuing this branch in a native ChatGPT window...';
+  runtime.state.statusLabel = `Continuing this branch in a native ${provider.label} window...`;
   runtime.state.errorMessage = undefined;
   runtime.state.updatedAt = Date.now();
-  appendPanelLog(runtime, 'Promoting persistent branch to a native ChatGPT window', {
+  appendPanelLog(runtime, 'Promoting persistent branch to a native provider window', {
     launchUrl: runtime.state.launchUrl
   });
   syncPanelUI(runtime);
@@ -3061,7 +3242,8 @@ async function promotePersistentBranchToNativeWindow(runtime: PanelRuntime): Pro
     runtime.state.status = 'failed';
     runtime.state.creationMode = 'failed';
     runtime.state.statusLabel = 'Native branch recovery failed.';
-    runtime.state.errorMessage = response.reason ?? 'The native ChatGPT recovery window could not be opened.';
+    runtime.state.errorMessage =
+      response.reason ?? `The native ${provider.label} recovery window could not be opened.`;
     runtime.state.updatedAt = Date.now();
     syncPanelUI(runtime);
     persistPanels();
@@ -3074,7 +3256,7 @@ async function promotePersistentBranchToNativeWindow(runtime: PanelRuntime): Pro
   startPanelWatchdog(
     runtime,
     BRANCH_RESPONSE_TIMEOUT_MS,
-    'The native ChatGPT branch window stopped reporting back. Use Open branch to check it directly, or try again.'
+    `The native ${provider.label} branch window stopped reporting back. Use Open branch to check it directly, or try again.`
   );
   appendPanelLog(runtime, 'Native branch recovery window created', {
     launchTabId: response.tabId,
@@ -3089,11 +3271,38 @@ async function openSelectionInNewTab(
   branchKind: BranchKind
 ): Promise<void> {
   const launchUrl = provider.normalizeUrl(currentIdentity(selection.rootChatUrl).launchUrl);
-  const prompt = buildNativeBootstrapPrompt(selection).prompt;
+
+  // New-tab assembles its prompt exactly as Ask and Why do, from the structured
+  // context rather than the normalized anchor text.
+  const frozen = freezeContext(createContextForSelection(selection));
+  if (frozen.limits.overBudget) {
+    // Nothing is shown before a New-tab branch opens, so there is no preview in
+    // which to trim. Fall back to an in-page draft, where the Context section is.
+    const runtime = createBranchDraft(selection, { entryAction: 'ask', branchKind });
+    runtime.state.status = 'failed';
+    runtime.state.creationMode = 'failed';
+    runtime.state.statusLabel = 'This branch was not sent.';
+    runtime.state.errorMessage = `The context is ${describeContextSize(
+      frozen.limits
+    )}. Open Context, remove some material, then start the branch here.`;
+    runtime.state.updatedAt = Date.now();
+    syncPanelUI(runtime);
+    renderTabs();
+    persistPanels();
+    return;
+  }
+
+  const prompt = buildNativeBootstrapPromptFromContext(frozen.text).prompt;
   const panelId = randomId('native');
+  const newTabAttempt = {
+    providerId: provider.id,
+    panelId,
+    attemptId: createAttemptId()
+  };
+  startedAttemptIds.add(newTabAttempt.attemptId);
   persistLastUsedBranchKind(branchKind);
   const response = await createNativeBranchWindow({
-    attempt: { providerId: provider.id, panelId, attemptId: createAttemptId() },
+    attempt: newTabAttempt,
     prompt,
     launchUrl,
     branchKind,
@@ -3111,7 +3320,7 @@ async function openSelectionInNewTab(
     });
     runtime.state.status = 'failed';
     runtime.state.creationMode = 'failed';
-    runtime.state.statusLabel = 'New-tab could not open a ChatGPT window.';
+    runtime.state.statusLabel = `New-tab could not open a ${provider.label} window.`;
     runtime.state.errorMessage = `${
       response.reason ?? 'The branch window could not be opened.'
     } Ask here instead, or try New-tab again.`;
@@ -3281,7 +3490,7 @@ function loadEmbeddedBranchFrame(runtime: PanelRuntime, launchUrl: string): void
   startPanelWatchdog(
     runtime,
     FRAME_HANDSHAKE_TIMEOUT_MS,
-    'The embedded ChatGPT branch window did not finish loading. ChatGPT may be refusing to be embedded here — try again, or use New-tab to run this branch in its own window.'
+    `The embedded ${provider.label} branch window did not finish loading. ${provider.label} may be refusing to be embedded here — try again, or use New-tab to run this branch in its own window.`
   );
   const iframeUrl = buildEmbeddedFrameUrl(launchUrl);
   const previousSrc = runtime.iframeEl.src;
@@ -3369,7 +3578,7 @@ function tryDispatchPendingFrameStart(runtime: PanelRuntime): void {
   startPanelWatchdog(
     runtime,
     BRANCH_RESPONSE_TIMEOUT_MS,
-    'The branch window stopped responding before the answer was ready. Try again, or use Open branch to continue it directly in ChatGPT.'
+    `The branch window stopped responding before the answer was ready. Try again, or use Open branch to continue it directly in ${provider.label}.`
   );
   syncPanelUI(runtime);
   persistPanels();
@@ -3495,6 +3704,14 @@ function handleEmbeddedFrameMessage(event: MessageEvent<FrameIncomingMessage>): 
  * A write accepted by the authority, made anywhere. Keeps every open tab in step
  * instead of each one discovering the change on its next navigation.
  */
+/**
+ * Broadcasts that arrived before this page finished restoring its panels.
+ *
+ * A tab opened while another tab is writing is the ordinary case, not an edge
+ * one: the two operations are concurrent by nature.
+ */
+const pendingPanelChanges = new Map<string, PanelChangedMessage>();
+
 function handlePanelChanged(message: PanelChangedMessage): void {
   if (!message.panelId) {
     return;
@@ -3524,7 +3741,56 @@ function handlePanelChanged(message: PanelChangedMessage): void {
     return;
   }
 
-  panelRevisions.set(message.panelId, message.rev);
+  // Not mounted yet. Recording the revision and dropping the state loses the
+  // change for good: a restore already in flight lists an older snapshot, mounts
+  // it, and the panel then sits at a revision it never actually holds. Hold the
+  // change instead and apply it once this page knows its own panels.
+  pendingPanelChanges.set(message.panelId, message);
+}
+
+function drainPendingPanelChanges(): void {
+  if (!pendingPanelChanges.size) {
+    return;
+  }
+
+  const changes = [...pendingPanelChanges.values()];
+  pendingPanelChanges.clear();
+
+  const currentScopeKey = currentIdentity(lastKnownUrl).scopeKey;
+
+  changes.forEach((change) => {
+    if (change.deleted) {
+      handlePanelChanged(change);
+      return;
+    }
+
+    if (panelRuntimes.has(change.panelId)) {
+      handlePanelChanged(change);
+      return;
+    }
+
+    if (!change.state || closedPanelIds.has(change.panelId)) {
+      return;
+    }
+
+    // A panel created in another tab for this same conversation: mount it here
+    // rather than waiting for a reload to notice it.
+    const restoredState = createStateFromRestore(change.state);
+    if (!restoredState) {
+      return;
+    }
+    if (change.scopeKey !== currentScopeKey) {
+      if (!restoredState.minimized) {
+        return;
+      }
+      restoredState.minimized = true;
+    }
+
+    panelRevisions.set(change.panelId, change.rev);
+    createPanelRuntime(restoredState);
+  });
+
+  syncMountedUi();
 }
 
 function handleForwardedBranchPanelEvent(message: ForwardBranchPanelEventMessage): void {
@@ -3588,10 +3854,18 @@ function installRuntimeMessageListener(): void {
     }
 
     if (message.type === 'RUN_BRANCH_PROMPT_IN_TAB') {
+      if (!isRunBranchPromptRequest(message)) {
+        sendResponse({
+          ok: false,
+          reason: 'The branch run request was malformed and was not started.'
+        });
+        return false;
+      }
+
       if (automationTaskRunning) {
         sendResponse({
           ok: false,
-          reason: 'Another branch automation is already running in this ChatGPT window.'
+          reason: `Another branch automation is already running in this ${provider.label} window.`
         });
         return false;
       }
@@ -3618,7 +3892,10 @@ async function startBranch(panelId: string, question: string): Promise<void> {
 
   // Freeze the context now: a later edit, or the source answer still streaming,
   // must not change a prompt that is already in flight.
+  // A context rebuilt here must be kept, or the preview the user is told to open
+  // stays empty and the same error repeats with nothing they can do about it.
   const context = runtime.state.context ?? createContextForSelection(runtime.state.selection);
+  runtime.state.context = context;
   const limits = measureContext(context);
   if (limits.overBudget) {
     runtime.state.status = 'failed';
@@ -3640,7 +3917,7 @@ async function startBranch(panelId: string, question: string): Promise<void> {
     runtime.state.status = 'failed';
     runtime.state.creationMode = 'failed';
     runtime.state.statusLabel = 'Local branch creation failed.';
-    runtime.state.errorMessage = 'Could not determine a launch URL for this ChatGPT branch.';
+    runtime.state.errorMessage = `Could not determine a launch URL for this ${provider.label} branch.`;
     runtime.state.updatedAt = Date.now();
     syncPanelUI(runtime);
     persistPanels();
@@ -3671,10 +3948,24 @@ async function startBranch(panelId: string, question: string): Promise<void> {
   // an orphaned native window, a frame that has not been torn down yet — is
   // identified by the old id and can no longer touch this panel.
   runtime.state.attemptId = createAttemptId();
+  startedAttemptIds.add(runtime.state.attemptId);
   // Some providers refuse to be framed. Where that is the case the branch opens in
   // a window Aside drives instead — a real fallback with the same context and the
   // same state safety, not an embedded pass reported under another name.
-  const canEmbed = provider.surfaces.embedded === 'verified';
+  const canEmbed = surfaceIsAvailable(provider.surfaces.embedded);
+  if (!canEmbed && !surfaceIsAvailable(provider.surfaces.nativeWindow)) {
+    // Neither surface is available: say so rather than opening a window that
+    // cannot be driven and timing out on the watchdog.
+    runtime.state.initialQuestion = question;
+    runtime.state.status = 'failed';
+    runtime.state.creationMode = 'failed';
+    runtime.state.statusLabel = 'This branch was not started.';
+    runtime.state.errorMessage = provider.surfaces.detail;
+    runtime.state.updatedAt = Date.now();
+    syncPanelUI(runtime);
+    persistPanels(runtime.state.panelId);
+    return;
+  }
   runtime.state.initialQuestion = question;
   runtime.state.initialPrompt = prompt;
   runtime.state.surfaceMode = canEmbed ? 'embedded' : 'native_window';
@@ -3877,7 +4168,15 @@ function clearHighlightOverlay(): void {
   highlightOverlayTimer = undefined;
 }
 
-function renderHighlightRects(rects: DOMRect[]): void {
+/**
+ * Draw the origin highlight in Aside's own overlay.
+ *
+ * `outlineRect` used to be a class added to the provider's own message element —
+ * a write to a provider-owned node, on an attribute the layout observer watches,
+ * undone by a bare timer that a cleanup within the next 2.2s would leave behind
+ * on the page permanently.
+ */
+function renderHighlightRects(rects: DOMRect[], outlineRect?: DOMRect): void {
   clearHighlightOverlay();
   highlightOverlay = document.createElement('div');
   highlightOverlay.id = HIGHLIGHT_OVERLAY_ID;
@@ -3890,6 +4189,17 @@ function renderHighlightRects(rects: DOMRect[]): void {
     highlight.style.height = `${rect.height}px`;
     highlightOverlay?.append(highlight);
   });
+
+  if (outlineRect) {
+    const outline = document.createElement('div');
+    outline.className = 'aside-origin-outline';
+    outline.style.top = `${outlineRect.top}px`;
+    outline.style.left = `${outlineRect.left}px`;
+    outline.style.width = `${outlineRect.width}px`;
+    outline.style.height = `${outlineRect.height}px`;
+    highlightOverlay.append(outline);
+  }
+
   mountInExtensionHost(highlightOverlay);
   highlightOverlayTimer = window.setTimeout(clearHighlightOverlay, 2200);
 }
@@ -3982,19 +4292,18 @@ function scrollToOrigin(selection: SelectionPayload): void {
   if (exactRange) {
     const firstRect = getFirstRangeRect(exactRange);
     if (firstRect) {
-      target.classList.add('aside-origin-flash');
-      window.setTimeout(() => target.classList.remove('aside-origin-flash'), 2200);
       scrollRectIntoView(firstRect, target);
       afterScrollSettles(() => {
-        renderHighlightRects(Array.from(exactRange.getClientRects()).map((rect) => rect as DOMRect));
+        renderHighlightRects(
+          Array.from(exactRange.getClientRects()).map((rect) => rect as DOMRect),
+          target.getBoundingClientRect()
+        );
       });
       return;
     }
   }
 
   target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  target.classList.add('aside-origin-flash');
-  window.setTimeout(() => target.classList.remove('aside-origin-flash'), 2200);
   afterScrollSettles(() => {
     renderHighlightRects([target.getBoundingClientRect()]);
   });
@@ -4420,7 +4729,7 @@ async function waitForComposer(timeoutMs = 20_000): Promise<HTMLElement | HTMLTe
     await sleep(250);
   }
 
-  throw new Error('ChatGPT composer did not appear in time.');
+  throw new Error(`The ${provider.label} composer did not appear in time.`);
 }
 
 function getComposerValueLength(composer: HTMLElement | HTMLTextAreaElement): number {
@@ -4858,7 +5167,7 @@ async function ensurePersistentChatMode(
   }
 
   throw new Error(
-    'ChatGPT is in temporary-chat mode; persistent branch creation cannot continue.'
+    `${provider.label} is in ${provider.privacy.label} mode; persistent branch creation cannot continue.`
   );
 }
 
@@ -4943,7 +5252,8 @@ async function ensureTemporaryChatMode(
  */
 async function assertPrivateModeStillActive(
   composer: HTMLElement | HTMLTextAreaElement,
-  prompt: string
+  prompt: string,
+  options: { clearComposer?: boolean } = {}
 ): Promise<void> {
   const control =
     findDirectTemporaryChatControl(composer, 'active') ??
@@ -4960,6 +5270,13 @@ async function assertPrivateModeStillActive(
     state,
     control: control ? describeTemporaryChatCandidate(control, composer) : null
   });
+  if (options.clearComposer === false) {
+    // Nothing has been typed yet, so there is nothing to take back.
+    throw new PrivacyNotVerifiedError(
+      `${provider.label} stopped reporting ${provider.privacy.label} while the branch was being prepared, so nothing was typed or sent.`
+    );
+  }
+
   clearComposerAfterFailure(prompt);
   throw new PrivacyNotVerifiedError(
     `${provider.label} stopped reporting ${provider.privacy.label} while the branch was being prepared, so it was not sent. The text was removed from the composer.`
@@ -5104,7 +5421,7 @@ async function waitForAcceptedGenerationSignal(
   }
 
   throw new Error(
-    'ChatGPT did not start generating the branch question. No persistent chat URL, stop button, or new transcript turn appeared.'
+    `${provider.label} did not start generating the branch question. No persistent chat URL, stop button, or new transcript turn appeared.`
   );
 }
 
@@ -5133,6 +5450,15 @@ async function submitComposer(
   // The mode toggle can navigate and remount the composer, so acquire it again
   // rather than typing into a detached node.
   composer = await waitForComposer();
+
+  // That re-acquire can take up to 20 s, during which the verification above goes
+  // stale. Re-check against the composer that is actually about to be typed into,
+  // so private text is never typed on the strength of a check made before a
+  // navigation.
+  if (branchKind === 'temporary') {
+    await assertPrivateModeStillActive(composer, prompt, { clearComposer: false });
+  }
+
   let composerSnapshot = describeComposerCandidate(composer);
   let form = composer.closest('form');
   recordAutomationLog('Composer acquired after the chat mode was verified', {
@@ -5157,6 +5483,21 @@ async function submitComposer(
   if (branchKind === 'temporary') {
     await assertPrivateModeStillActive(composer, prompt);
   }
+
+  /**
+   * Every submit attempt is guarded, not just the first.
+   *
+   * The fallback chain below spans roughly thirteen seconds of further attempts.
+   * A single check before the first click would let a mode change part-way
+   * through that window produce a persistent send, which is detectable only
+   * afterwards.
+   */
+  const assertStillPrivateBeforeSend = async (): Promise<void> => {
+    if (branchKind !== 'temporary') {
+      return;
+    }
+    await assertPrivateModeStillActive(refreshComposerReference(composer), prompt);
+  };
 
   const logVisibleButtonContext = (label: string) => {
     const currentComposer = refreshComposerReference(composer);
@@ -5207,7 +5548,7 @@ async function submitComposer(
 
     recordAutomationLog(
       stage === 'primary'
-        ? 'Clicking ChatGPT send button for first branch prompt'
+        ? 'Clicking the provider send button for the first branch prompt'
         : 'Clicking send button after fallback re-scan',
       {
         sendButtonLabel: getActionLabel(sendButton),
@@ -5223,7 +5564,7 @@ async function submitComposer(
       timeoutMs
     );
     if (signal) {
-      recordAutomationLog('ChatGPT accepted the prompt after send button click', {
+      recordAutomationLog('Provider accepted the prompt after send button click', {
         stage,
         acceptedSignal: signal,
         currentUrl: normalizeChatUrl(window.location.href)
@@ -5270,6 +5611,7 @@ async function submitComposer(
   }
 
   logVisibleButtonContext('No enabled send button produced a generation signal near the composer');
+  await assertStillPrivateBeforeSend();
   recordAutomationLog('Dispatching Enter key fallback for first branch prompt', {
     hasForm: form instanceof HTMLFormElement
   });
@@ -5294,7 +5636,7 @@ async function submitComposer(
     2_500
   );
   if (enterSignal) {
-    recordAutomationLog('ChatGPT accepted the prompt after Enter fallback', {
+    recordAutomationLog('Provider accepted the prompt after Enter fallback', {
       acceptedSignal: enterSignal,
       currentUrl: normalizeChatUrl(window.location.href)
     });
@@ -5310,6 +5652,7 @@ async function submitComposer(
   }
 
   if (form instanceof HTMLFormElement) {
+    await assertStillPrivateBeforeSend();
     recordAutomationLog('Attempting guarded synthetic submit fallback for first branch prompt', {
       action: 'dispatch-submit-event'
     });
@@ -5321,7 +5664,7 @@ async function submitComposer(
       2_500
     );
     if (syntheticSignal) {
-      recordAutomationLog('ChatGPT accepted the prompt after guarded synthetic submit', {
+      recordAutomationLog('Provider accepted the prompt after guarded synthetic submit', {
         acceptedSignal: syntheticSignal,
         currentUrl: normalizeChatUrl(window.location.href)
       });
@@ -5337,6 +5680,7 @@ async function submitComposer(
     return waitOutAcceptedPrompt('after_synthetic_submit');
   }
 
+  await assertStillPrivateBeforeSend();
   const rescannedSignal = await attemptClickSendButton('final_rescan', 4_500);
   if (rescannedSignal) {
     return { acceptedSignal: rescannedSignal };
@@ -5345,7 +5689,7 @@ async function submitComposer(
   logVisibleButtonContext('All embedded submit strategies were attempted without a generation signal');
 
   const acceptedSignal = await waitForAcceptedGenerationSignal(baselineTurnCount, initialUrl);
-  recordAutomationLog('ChatGPT accepted first branch prompt', {
+  recordAutomationLog('Provider accepted first branch prompt', {
     baselineTurnCount,
     currentTurnCount: countTranscriptTurns(document),
     acceptedSignal,
@@ -5387,7 +5731,7 @@ async function waitForConversationUrlAfterSubmit(launchUrl: string, timeoutMs = 
     currentUrl
   });
   throw new Error(
-    `ChatGPT started responding, but the branch never became a persistent chat URL. It stayed at ${currentUrl}.`
+    `${provider.label} started responding, but the branch never became a persistent chat URL. It stayed at ${currentUrl}.`
   );
 }
 
@@ -5603,12 +5947,12 @@ async function runBranchPromptAutomation(
       status: 'opening_branch',
       statusLabel:
         transport === 'background'
-          ? 'Sending the local branch question in a native ChatGPT window...'
+          ? `Sending the local branch question in a native ${provider.label} window...`
           : 'Sending the local branch question in this branch window...'
     });
 
     if (transport === 'background') {
-      recordAutomationLog('Allowing the native ChatGPT window to settle before submit', {
+      recordAutomationLog('Allowing the native provider window to settle before submit', {
         delayMs: 1200,
         currentUrl: normalizeChatUrl(window.location.href)
       });
@@ -5660,7 +6004,7 @@ async function runBranchPromptAutomation(
     await sendAutomationEvent({
       kind: 'status',
       status: 'opening_branch',
-      statusLabel: 'Waiting for ChatGPT to create a persistent branch URL...'
+      statusLabel: `Waiting for ${provider.label} to create a persistent branch URL...`
     });
     recordAutomationLog('Waiting for persistent branch URL after accepted generation signal', {
       acceptedSignal,
@@ -5708,6 +6052,19 @@ function cleanup(): void {
   cleanupFns.forEach((fn) => fn());
   cleanupFns = [];
   stopTitleWatcher();
+
+  // Everything Aside put on the page goes, including the iframes inside the host:
+  // an in-place extension update runs this and then a new content script, and a
+  // surviving host would leave dead panels the new one does not own.
+  panelRuntimes.forEach((runtime) => {
+    clearPanelWatchdog(runtime);
+    runtime.iframeEl.src = 'about:blank';
+  });
+  panelRuntimes.clear();
+  extensionHost?.remove();
+  document.getElementById(EXTENSION_HOST_ID)?.remove();
+  extensionHost = null;
+  delete document.documentElement.dataset.asideTheme;
 }
 
 function initEmbeddedFrame(): void {

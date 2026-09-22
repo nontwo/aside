@@ -157,3 +157,56 @@ export function freezeContext(
     limits: measureContext(context, maxChars)
   };
 }
+
+/**
+ * Rebuild a stored context, or return undefined if it is not one.
+ *
+ * Restored state is data read back from storage, not a value this code produced
+ * in this session, so every field is checked. A context that cannot be rebuilt is
+ * dropped rather than half-trusted: the caller then reassembles one from the
+ * page, which is recoverable, whereas a malformed block reaching a prompt is not.
+ */
+export function sanitizeStoredContext(raw: unknown): BranchContext | undefined {
+  if (!raw || typeof raw !== 'object') {
+    return undefined;
+  }
+
+  const candidate = raw as Partial<BranchContext>;
+  if (
+    typeof candidate.selectedPassage !== 'string' ||
+    typeof candidate.anchorText !== 'string' ||
+    !Array.isArray(candidate.blocks)
+  ) {
+    return undefined;
+  }
+
+  const blocks: ContextBlock[] = candidate.blocks
+    .filter(
+      (block): block is ContextBlock =>
+        Boolean(block) &&
+        typeof (block as ContextBlock).id === 'string' &&
+        typeof (block as ContextBlock).text === 'string'
+    )
+    .map((block) => ({
+      id: block.id,
+      role: block.role === 'user' ? 'user' : 'assistant',
+      text: block.text,
+      excerpt: typeof block.excerpt === 'string' ? block.excerpt : block.text.slice(0, 120),
+      included: block.included === true,
+      origin:
+        block.origin === 'preceding-question' || block.origin === 'user-added'
+          ? block.origin
+          : 'touched',
+      limitation: typeof block.limitation === 'string' ? block.limitation : undefined
+    }));
+
+  return {
+    revision: typeof candidate.revision === 'number' ? candidate.revision : 1,
+    providerId: typeof candidate.providerId === 'string' ? candidate.providerId : '',
+    selectedPassage: candidate.selectedPassage,
+    anchorText: candidate.anchorText,
+    sourceLabel: typeof candidate.sourceLabel === 'string' ? candidate.sourceLabel : '',
+    blocks,
+    userBackground: typeof candidate.userBackground === 'string' ? candidate.userBackground : ''
+  };
+}

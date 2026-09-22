@@ -11,6 +11,7 @@ import {
   findChatAdapterForUrl,
   getAdapter
 } from '../src/shared/providers';
+import { surfaceIsAvailable } from '../src/shared/providers/types';
 
 describe('provider routing', () => {
   it('routes each chat origin to its own adapter', () => {
@@ -148,8 +149,25 @@ describe('scope keys never collide across providers', () => {
 describe('declared capabilities are explicit, not optimistic', () => {
   it('states Claude cannot be embedded and says why', () => {
     expect(claudeAdapter.surfaces.embedded).toBe('unsupported');
-    expect(claudeAdapter.surfaces.nativeWindow).toBe('verified');
     expect(claudeAdapter.surfaces.detail).toMatch(/frame/i);
+  });
+
+  it('claims no surface as live-verified, because none has been run against a live account', () => {
+    // `verified` is defined as "observed in the live DOM". Nothing in this build
+    // observes a surface — the values are static — so claiming it would be an
+    // unearned confidence level, which is the failure mode this test exists for.
+    [chatgptAdapter, claudeAdapter].forEach((adapter) => {
+      expect(adapter.surfaces.embedded).not.toBe('verified');
+      expect(adapter.surfaces.nativeWindow).not.toBe('verified');
+    });
+  });
+
+  it('still offers the surfaces it has fixture evidence for', () => {
+    // Honesty about evidence must not turn into refusing to run: `fixture-only`
+    // is offered, `unsupported` is not.
+    expect(surfaceIsAvailable(claudeAdapter.surfaces.nativeWindow)).toBe(true);
+    expect(surfaceIsAvailable(claudeAdapter.surfaces.embedded)).toBe(false);
+    expect(surfaceIsAvailable(chatgptAdapter.surfaces.embedded)).toBe(true);
   });
 
   it('records that Claude Incognito leaves a project but ChatGPT Temporary Chat does not', () => {

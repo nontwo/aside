@@ -4,6 +4,7 @@ import {
   createAttemptId,
   isBranchAttemptRef,
   isBranchPanelEvent,
+  isRunBranchPromptRequest,
   ownsAttempt
 } from '../src/shared/branch-attempt';
 
@@ -68,5 +69,43 @@ describe('attempt ids', () => {
     const ids = new Set(Array.from({ length: 500 }, () => createAttemptId()));
     expect(ids.size).toBe(500);
     ids.forEach((id) => expect(id).toMatch(/^[0-9a-f]{24}$/));
+  });
+});
+
+describe('a run request is validated as data on arrival', () => {
+  const valid = {
+    type: 'RUN_BRANCH_PROMPT_IN_TAB',
+    providerId: 'claude',
+    panelId: 'panel-1',
+    attemptId: 'a1b2c3',
+    prompt: 'the branch prompt',
+    launchUrl: 'https://claude.ai/new',
+    branchKind: 'temporary'
+  };
+
+  it('accepts a well-formed request', () => {
+    expect(isRunBranchPromptRequest(valid)).toBe(true);
+  });
+
+  it('rejects a request with no usable attempt identity', () => {
+    // Without this, the branch is typed and sent while every event it emits is
+    // rejected by ownsAttempt, so the panel just times out on the watchdog.
+    expect(isRunBranchPromptRequest({ ...valid, attemptId: '' })).toBe(false);
+    expect(isRunBranchPromptRequest({ ...valid, attemptId: undefined })).toBe(false);
+    expect(isRunBranchPromptRequest({ ...valid, panelId: 42 })).toBe(false);
+  });
+
+  it('refuses to guess a branch kind', () => {
+    // An unrecognised value used to mean "persistent", which is the wrong
+    // direction to guess in: it would run a branch meant to be private without
+    // the privacy sequence.
+    expect(isRunBranchPromptRequest({ ...valid, branchKind: 'Temporary' })).toBe(false);
+    expect(isRunBranchPromptRequest({ ...valid, branchKind: undefined })).toBe(false);
+  });
+
+  it('rejects an empty prompt and a non-object', () => {
+    expect(isRunBranchPromptRequest({ ...valid, prompt: '' })).toBe(false);
+    expect(isRunBranchPromptRequest(null)).toBe(false);
+    expect(isRunBranchPromptRequest('RUN_BRANCH_PROMPT_IN_TAB')).toBe(false);
   });
 });

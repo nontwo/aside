@@ -8,6 +8,7 @@ import {
   includedBlocks,
   measureContext,
   renderContextText,
+  sanitizeStoredContext,
   withBlockIncluded,
   withUserBackground
 } from '../src/shared/context';
@@ -131,5 +132,68 @@ describe('context size', () => {
 
   it('is under budget for an ordinary selection', () => {
     expect(measureContext(makeContext()).overBudget).toBe(false);
+  });
+});
+
+describe('rebuilding a context read back from storage', () => {
+  const stored = createContext({
+    providerId: 'claude',
+    selectedPassage: 'the passage',
+    anchorText: 'the passage',
+    sourceLabel: 'claude:chat:abc',
+    blocks: [
+      {
+        id: 'assistant:1',
+        role: 'assistant',
+        text: 'answer text',
+        excerpt: 'answer',
+        included: true,
+        origin: 'touched'
+      },
+      {
+        id: 'user:0',
+        role: 'user',
+        text: 'question text',
+        excerpt: 'question',
+        included: false,
+        origin: 'preceding-question'
+      }
+    ]
+  });
+
+  it('round-trips what the user curated', () => {
+    // The regression: the context was persisted but never read back, so after a
+    // reload the Context section was hidden, the prompt was silently rebuilt with
+    // every block re-included, and the over-budget error pointed at a section that
+    // could never be populated.
+    const restored = sanitizeStoredContext(JSON.parse(JSON.stringify(stored)));
+
+    expect(restored).toEqual(stored);
+    expect(restored?.blocks[1].included).toBe(false);
+  });
+
+  it('keeps an explicitly unticked block unticked', () => {
+    const edited = withBlockIncluded(stored, 'assistant:1', false);
+    const restored = sanitizeStoredContext(JSON.parse(JSON.stringify(edited)));
+
+    expect(restored?.blocks.find((block) => block.id === 'assistant:1')?.included).toBe(false);
+  });
+
+  it('drops a context it cannot rebuild rather than half-trusting it', () => {
+    expect(sanitizeStoredContext(undefined)).toBeUndefined();
+    expect(sanitizeStoredContext({ selectedPassage: 'x' })).toBeUndefined();
+    expect(sanitizeStoredContext({ selectedPassage: 'x', anchorText: 'x', blocks: 'no' })).toBeUndefined();
+  });
+
+  it('never restores a block as included by accident', () => {
+    // `included` decides what reaches the model, so anything other than an
+    // explicit true is false.
+    const restored = sanitizeStoredContext({
+      selectedPassage: 'x',
+      anchorText: 'x',
+      blocks: [{ id: 'a', text: 'a', included: 'yes' }]
+    });
+
+    expect(restored?.blocks[0].included).toBe(false);
   });
 });

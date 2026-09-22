@@ -126,22 +126,37 @@ export function extractStructuredNodeText(node: Node): string {
   const container = document.createElement('div');
   container.append(node.cloneNode(true));
 
+  // Promote the equation source BEFORE stripping non-content. Every adapter lists
+  // `annotation`/`.katex-mathml` as non-content — correctly, because it is the
+  // assistive duplicate of the visual glyphs — but that subtree is also the only
+  // place the TeX source lives. Stripping first would leave the flattened glyph
+  // run, which is what the previous order did.
+  container
+    .querySelectorAll<HTMLElement>('[data-latex], annotation[encoding*="tex" i]')
+    .forEach((element) => {
+      const latex = element.getAttribute('data-latex') ?? element.textContent ?? '';
+      if (!latex.trim()) {
+        return;
+      }
+      // Replace the OUTERMOST equation wrapper, not the annotation and not the
+      // nearest ancestor. The source usually sits inside `.katex-mathml`, which is
+      // itself non-content: replacing only the inner `<math>` would leave the
+      // substituted text inside a subtree that is stripped a moment later, and the
+      // visible glyph run beside it would survive as the only remaining text.
+      const equation =
+        element.closest<HTMLElement>('.katex') ??
+        element.closest<HTMLElement>('[data-latex]') ??
+        element.closest<HTMLElement>('math') ??
+        element;
+      equation.replaceWith(document.createTextNode(` $${latex.trim()}$ `));
+    });
+
   container.querySelectorAll<HTMLElement>(activeTranscript.nonContentSelector).forEach((element) => {
     element.remove();
   });
   container.querySelectorAll<HTMLElement>('[hidden],[aria-busy="true"]').forEach((element) => {
     element.remove();
   });
-
-  // Prefer a trusted source form of an equation over its rendered glyphs.
-  container.querySelectorAll<HTMLElement>('[data-latex], annotation[encoding*="tex" i]').forEach(
-    (element) => {
-      const latex = element.getAttribute('data-latex') ?? element.textContent ?? '';
-      if (latex.trim()) {
-        element.replaceWith(document.createTextNode(` $${latex.trim()}$ `));
-      }
-    }
-  );
 
   return renderStructured(container).replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }
@@ -393,9 +408,9 @@ export function extractTranscript(root: ParentNode = document): DomTranscriptTur
         return null;
       }
 
+      // Nothing writes to a provider-owned element: the id is derived from the
+      // element's own content and kept here, not stamped onto the page's DOM.
       const id = createSyntheticMessageId(role, turnIndex, text);
-      element.dataset.asideMessageId = id;
-      element.dataset.asideTurnIndex = String(turnIndex);
 
       return {
         id,

@@ -1,14 +1,17 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  MAX_WRITE_REBASES,
   TOMBSTONE_TTL_MS,
   applyDelete,
   applyUpsert,
   approximateByteSize,
   expiredTombstoneKeys,
+  mergePanelStateOnConflict,
   planTrim,
   readSnapshot,
   recordsForScope,
+  resolveWriteConflict,
   tombstoneKey
 } from '../src/shared/panel-store';
 import type { PanelRecord, StoreSnapshot } from '../src/shared/panel-store';
@@ -225,5 +228,154 @@ describe('byte budget', () => {
   it('does nothing when already under budget', () => {
     const store = snapshot([makeRecord()]);
     expect(planTrim(store, 10_000_000)).toEqual({ trimLogsFor: [], stillOverBudget: false });
+  });
+});
+
+describe('write conflict policy', () => {
+  // The browser-level outcome depends on how two tabs interleave, which a test
+  // should not have to win. The invariant is decided here: text the user typed is
+  // never discarded without them seeing it.
+  it('re-bases while attempts remain', () => {
+    expect(
+      resolveWriteConflict({
+        localQuestion: 'edited here',
+        theirQuestion: 'edited elsewhere',
+        attempt: 0
+      })
+    ).toEqual({ action: 'rebase', question: 'edited here' });
+  });
+
+  it('keeps the local text and flags unsaved once re-bases run out', () => {
+    expect(
+      resolveWriteConflict({
+        localQuestion: 'edited here',
+        theirQuestion: 'edited elsewhere',
+        attempt: MAX_WRITE_REBASES
+      })
+    ).toEqual({ action: 'keep-local-unsaved', question: 'edited here' });
+  });
+
+  it('never adopts over a divergent local edit, at any attempt count', () => {
+    for (let attempt = 0; attempt <= MAX_WRITE_REBASES + 5; attempt += 1) {
+      const decision = resolveWriteConflict({
+        localQuestion: 'mine',
+        theirQuestion: 'theirs',
+        attempt
+      });
+      expect(decision.action).not.toBe('adopt');
+      expect('question' in decision && decision.question).toBe('mine');
+    }
+  });
+
+  it('adopts when nothing of the user-s is at stake', () => {
+    expect(
+      resolveWriteConflict({ localQuestion: 'same', theirQuestion: 'same', attempt: 0 }).action
+    ).toBe('adopt');
+    expect(
+      resolveWriteConflict({ localQuestion: '', theirQuestion: undefined, attempt: 9 }).action
+    ).toBe('adopt');
+  });
+});
+
+describe('merging a panel this tab lost a write for', () => {
+  const theirs = makeState({
+    branchKind: 'persistent',
+    status: 'draft',
+    statusLabel: 'Ask a focused follow-up.',
+    initialQuestion: 'from the other tab'
+  });
+
+  it('never demotes a private branch to persistent', () => {
+    // The regression: clicking Private, losing the write to an unrelated save in
+    // another tab, and having the toggle silently flip back — with the selected
+    // passage still sitting in local storage.
+    const merged = mergePanelStateOnConflict({
+      local: makeState({ branchKind: 'temporary' }),
+      theirs,
+      localQuestion: 'from the other tab',
+      localDrivesBranch: false
+    });
+
+    expect(merged.branchKind).toBe('temporary');
+  });
+
+  it('takes a private marking from the other tab too', () => {
+    const merged = mergePanelStateOnConflict({
+      local: makeState({ branchKind: 'persistent' }),
+      theirs: makeState({ branchKind: 'temporary' }),
+      localQuestion: '',
+      localDrivesBranch: false
+    });
+
+    expect(merged.branchKind).toBe('temporary');
+  });
+
+  it('keeps the live branch details when this tab is the one running it', () => {
+    // Without this, a rebase onto the other tab's older snapshot drops the
+    // branchChatUrl — the only route back to a conversation the user may want to
+    // delete — while the panel still reads as live.
+    const local = makeState({
+      status: 'live',
+      statusLabel: 'Branch answer is ready.',
+      branchChatUrl: 'https://chatgpt.com/c/branch-1',
+      attemptId: 'attempt-1',
+      surfaceMode: 'native_window',
+      launchTabId: 42
+    });
+
+    const merged = mergePanelStateOnConflict({
+      local,
+      theirs,
+      localQuestion: 'q',
+      localDrivesBranch: true
+    });
+
+    expect(merged.status).toBe('live');
+    expect(merged.branchChatUrl).toBe('https://chatgpt.com/c/branch-1');
+    expect(merged.attemptId).toBe('attempt-1');
+    expect(merged.launchTabId).toBe(42);
+  });
+
+  it('defers to the authority when this tab is not running the branch', () => {
+    const merged = mergePanelStateOnConflict({
+      local: makeState({ status: 'live', branchChatUrl: 'https://chatgpt.com/c/stale' }),
+      theirs: makeState({ status: 'failed', statusLabel: 'Branch creation failed.' }),
+      localQuestion: 'q',
+      localDrivesBranch: false
+    });
+
+    expect(merged.status).toBe('failed');
+  });
+
+  it('keeps a curated context rather than replacing it with nothing', () => {
+    const context = {
+      revision: 3,
+      providerId: 'chatgpt',
+      selectedPassage: 'passage',
+      anchorText: 'passage',
+      sourceLabel: 'conv-1',
+      blocks: [],
+      userBackground: 'my notes'
+    };
+
+    const merged = mergePanelStateOnConflict({
+      local: makeState({ context }),
+      theirs,
+      localQuestion: 'q',
+      localDrivesBranch: false
+    });
+
+    expect(merged.context).toEqual(context);
+  });
+
+  it('always keeps the text in this tab-s box', () => {
+    const merged = mergePanelStateOnConflict({
+      local: makeState({ initialQuestion: 'half a sentence' }),
+      theirs,
+      localQuestion: 'half a sentence',
+      localDrivesBranch: false
+    });
+
+    expect(merged.initialQuestion).toBe('half a sentence');
   });
 });

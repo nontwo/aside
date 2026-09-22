@@ -238,7 +238,7 @@ async function waitForTabComplete(tabId: number, timeoutMs = 20_000): Promise<vo
     await sleep(250);
   }
 
-  throw new Error('The ChatGPT branch tab did not finish loading in time.');
+  throw new Error('The branch tab did not finish loading in time.');
 }
 
 async function sendRunMessageToTab(
@@ -310,7 +310,7 @@ async function handleCreateBranchWindow(
   if (typeof sourceTabId !== 'number') {
     return {
       ok: false,
-      reason: 'The source ChatGPT tab could not be identified.'
+      reason: 'The source tab could not be identified.'
     };
   }
 
@@ -366,7 +366,7 @@ async function handleCreateBranchWindow(
     });
 
     if (!response.ok) {
-      throw new Error(response.reason || 'The created ChatGPT tab rejected the branch automation.');
+      throw new Error(response.reason || 'The created tab rejected the branch automation.');
     }
 
     return {
@@ -590,7 +590,7 @@ async function handleBranchTabRemoved(tabId: number): Promise<void> {
     if (!session.live) {
       await forwardPanelEvent(panelId, {
         kind: 'failed',
-        reason: 'The background ChatGPT branch tab was closed before the branch finished creating.',
+        reason: 'The branch tab was closed before the branch finished creating.',
         launchTabId: tabId
       });
       knownSessions.delete(panelId);

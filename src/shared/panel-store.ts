@@ -237,3 +237,105 @@ export function planTrim(snapshot: StoreSnapshot, budgetBytes: number): TrimPlan
 
   return { trimLogsFor, stillOverBudget: projected > budgetBytes };
 }
+
+/** Optimistic concurrency needs a few goes: another tab saving is routine. */
+export const MAX_WRITE_REBASES = 3;
+
+export type ConflictAction =
+  /** Re-base onto their record, keeping the field the user edits, and write again. */
+  | { action: 'rebase'; question: string }
+  /** Out of attempts with unsaved text: keep it locally and show the panel unsaved. */
+  | { action: 'keep-local-unsaved'; question: string }
+  /** Nothing of the user's is at stake; take their version. */
+  | { action: 'adopt' };
+
+/**
+ * What a tab should do when the authority rejects its write as stale.
+ *
+ * Pure so the policy can be tested directly: the browser-level behaviour depends
+ * on how two tabs interleave, which is exactly what a test should not have to win.
+ *
+ * The invariant: text the user typed is never discarded without them seeing it.
+ * Either it is written, or it stays in the box and the panel reads as unsaved.
+ */
+export function resolveWriteConflict(input: {
+  localQuestion: string;
+  theirQuestion: string | undefined;
+  attempt: number;
+  maxRebases?: number;
+}): ConflictAction {
+  const maxRebases = input.maxRebases ?? MAX_WRITE_REBASES;
+  const diverged = (input.theirQuestion ?? '') !== input.localQuestion;
+
+  if (!diverged) {
+    return { action: 'adopt' };
+  }
+
+  if (input.attempt < maxRebases) {
+    return { action: 'rebase', question: input.localQuestion };
+  }
+
+  return { action: 'keep-local-unsaved', question: input.localQuestion };
+}
+
+/**
+ * Merge this tab's panel state with the authoritative record it lost to.
+ *
+ * Taking the other tab's record wholesale is lossy in three ways that the user
+ * notices: a branch marked Private silently reverts to Persistent (and its
+ * content stays on disk), a live branch loses the `branchChatUrl` that is the
+ * only way back to the conversation it opened, and a curated context is replaced
+ * by whatever the other tab happened to have.
+ *
+ * So: the authority decides the record, this tab keeps the parts only it knows.
+ */
+export function mergePanelStateOnConflict(input: {
+  local: BranchPanelState;
+  theirs: BranchPanelState;
+  localQuestion: string;
+  /** True when this tab is the one actually running the branch. */
+  localDrivesBranch: boolean;
+}): BranchPanelState {
+  const { local, theirs, localDrivesBranch } = input;
+
+  const merged: BranchPanelState = {
+    ...theirs,
+    // The text in this tab's box is what its user is looking at.
+    initialQuestion: input.localQuestion,
+    // Privacy never resolves downwards. Re-marking a branch private costs a
+    // click; a branch silently demoted to persistent has already written to disk.
+    branchKind:
+      local.branchKind === 'temporary' || theirs.branchKind === 'temporary'
+        ? 'temporary'
+        : theirs.branchKind
+  };
+
+  // The assembled context belongs to the tab that assembled it, and a record
+  // without one would hide the preview the user is about to submit from.
+  if (local.context && (localDrivesBranch || !theirs.context)) {
+    merged.context = local.context;
+  }
+
+  if (!localDrivesBranch) {
+    return merged;
+  }
+
+  // This tab is running the branch, so it — not the other tab's older snapshot —
+  // knows where that branch is and how far it has got.
+  return {
+    ...merged,
+    status: local.status,
+    statusLabel: local.statusLabel,
+    errorMessage: local.errorMessage,
+    attemptId: local.attemptId,
+    surfaceMode: local.surfaceMode,
+    creationMode: local.creationMode,
+    launchUrl: local.launchUrl,
+    branchChatUrl: local.branchChatUrl,
+    launchTabId: local.launchTabId,
+    launchWindowId: local.launchWindowId,
+    initialPrompt: local.initialPrompt,
+    title: local.titleStatus === 'ready' ? local.title : merged.title,
+    titleStatus: local.titleStatus === 'ready' ? 'ready' : merged.titleStatus
+  };
+}

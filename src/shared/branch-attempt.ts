@@ -59,3 +59,27 @@ export function createAttemptId(): string {
   globalThis.crypto.getRandomValues(bytes);
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
+
+/**
+ * A run request carrying everything the branch tab needs, validated as data.
+ *
+ * Every other edge in this system validates on arrival; this one used to take the
+ * message's word for it. A malformed `attemptId` here produces a branch that is
+ * typed and sent while every event it emits is rejected by `ownsAttempt`, leaving
+ * the panel to time out with no explanation — and an unrecognised `branchKind`
+ * silently means "persistent", which is the wrong direction to guess in.
+ */
+export function isRunBranchPromptRequest(
+  value: unknown
+): value is { prompt: string; launchUrl: string; branchKind: 'persistent' | 'temporary' } {
+  if (!isBranchAttemptRef(value)) {
+    return false;
+  }
+  const candidate = value as unknown as Record<string, unknown>;
+  return (
+    typeof candidate.prompt === 'string' &&
+    candidate.prompt.length > 0 &&
+    typeof candidate.launchUrl === 'string' &&
+    (candidate.branchKind === 'persistent' || candidate.branchKind === 'temporary')
+  );
+}

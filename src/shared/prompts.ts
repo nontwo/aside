@@ -123,7 +123,17 @@ export function buildLocalInitialPrompt(
   });
 }
 
-export function buildNativeBootstrapPrompt(selection: SelectionPayload): PromptBuildResult {
+/**
+ * The New-tab bootstrap, built from the same frozen context as Ask and Why.
+ *
+ * It takes `contextText` rather than a `SelectionPayload` for one reason: the
+ * payload carries the *normalized* anchor strings, which exist to find the
+ * passage again, not to be read by a model. Building the prompt from them
+ * flattens code blocks onto one line and silently includes every answer the
+ * selection happened to touch — material the user would have unticked in the
+ * Context section for the other two entry points.
+ */
+export function buildNativeBootstrapPromptFromContext(contextText: string): PromptBuildResult {
   return {
     prompt: [
       'Before your answer, output exactly one line in this format:',
@@ -135,12 +145,17 @@ export function buildNativeBootstrapPrompt(selection: SelectionPayload): PromptB
       '',
       buildReadingInstructions(),
       '',
-      buildLocalContextSection(selection),
+      contextText,
       '',
       'BRANCH TASK',
       'Create a local branch context and wait for the user to ask the real follow-up question.'
     ].join('\n')
   };
+}
+
+/** @deprecated Kept for the legacy migration path only; builds from anchor text. */
+export function buildNativeBootstrapPrompt(selection: SelectionPayload): PromptBuildResult {
+  return buildNativeBootstrapPromptFromContext(buildLocalContextSection(selection));
 }
 
 export function buildFollowUpPrompt(
