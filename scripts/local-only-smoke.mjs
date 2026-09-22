@@ -471,12 +471,22 @@ async function injectNativeAskButton(page, options = {}) {
       pill.style.boxShadow = '0 8px 24px rgba(0,0,0,0.18)';
       pill.style.zIndex = '2147483646';
 
+      // Clamped into the viewport, as a real popup is. Without this the 'right'
+      // placement pushes a 430px pill off the edge at 768px — and how far off
+      // depends on where the selection's first line happens to end, which differs
+      // between a mac and a Linux CI runner because the fonts differ. That made a
+      // fixture artifact look like a product failure.
+      const clampLeft = (value) =>
+        Math.max(8, Math.min(value, window.innerWidth - POPUP_WIDTH - 8));
+      const clampTop = (value) =>
+        Math.max(8, Math.min(value, window.innerHeight - POPUP_HEIGHT - 8));
+
       if (placementMode === 'above') {
-        pill.style.top = `${Math.max(8, rect.top - POPUP_HEIGHT - 8)}px`;
-        pill.style.left = `${Math.max(8, rect.left + rect.width / 2 - POPUP_WIDTH / 2)}px`;
+        pill.style.top = `${clampTop(rect.top - POPUP_HEIGHT - 8)}px`;
+        pill.style.left = `${clampLeft(rect.left + rect.width / 2 - POPUP_WIDTH / 2)}px`;
       } else {
-        pill.style.top = `${Math.max(16, rect.top - 40)}px`;
-        pill.style.left = `${Math.max(16, rect.right + 16)}px`;
+        pill.style.top = `${clampTop(rect.top - 40)}px`;
+        pill.style.left = `${clampLeft(rect.right + 16)}px`;
       }
 
       ['Ask ChatGPT', 'Share highlighted'].forEach((label, index) => {
