@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_GAP,
   VIEWPORT_MARGIN,
+  findFreeCorner,
   findLeftGutterSlot,
   findSafePlacement,
   isWithinViewport,
@@ -222,5 +223,36 @@ describe('left gutter rail placement', () => {
 
     expect(slot).not.toBeNull();
     expect(slot!.left + slot!.width).toBeLessThanOrEqual(DESKTOP.width / 2);
+  });
+});
+
+describe('compact launcher fallback', () => {
+  const size = { width: 84, height: 28 };
+
+  it('picks a corner that overlaps nothing the provider owns', () => {
+    const sidebar = box(0, 0, 300, 768);
+    const composer = box(660, 320, 380, 90);
+
+    const corner = findFreeCorner({ viewport: LAPTOP, size, reserved: [sidebar, composer] })!;
+
+    expect(corner).not.toBeNull();
+    [sidebar, composer].forEach((reserved) => {
+      expect(rectsOverlap(corner, reserved)).toBe(false);
+    });
+    expect(isWithinViewport(corner, LAPTOP)).toBe(true);
+  });
+
+  it('avoids the sidebar at narrow widths instead of sitting on it', () => {
+    // The regression: the last-resort position was a hard-coded left: 12px, which
+    // at 768px with the sidebar open lands directly on the provider's navigation.
+    const sidebar = box(0, 0, 260, 800);
+
+    const corner = findFreeCorner({ viewport: NARROW, size, reserved: [sidebar] })!;
+    expect(rectsOverlap(corner, sidebar)).toBe(false);
+  });
+
+  it('returns null when no corner is free, so the caller can hide it', () => {
+    const wall = box(0, 0, NARROW.width, NARROW.height);
+    expect(findFreeCorner({ viewport: NARROW, size, reserved: [wall] })).toBeNull();
   });
 });

@@ -12,6 +12,7 @@ const copyEntries = [
   'LICENSE',
   'README.md',
   'course-submission',
+  'docs',
   'package.json',
   'package-lock.json',
   'tsconfig.json',

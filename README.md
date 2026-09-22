@@ -1,28 +1,69 @@
 # Aside
 
-Aside is a Chromium extension for asking focused follow-up questions from long ChatGPT answers without losing your place in the main conversation.
+Aside is a Chromium extension for asking focused follow-up questions from long ChatGPT and Claude answers without losing your place in the main conversation.
 
 It keeps the reading flow centered on the selected passage:
-- select text inside a ChatGPT assistant answer
-- open an in-page branch with `Ask` or `Why`
+- select text inside an assistant answer on ChatGPT or Claude
+- open a branch with `Ask` or `Why`, or `New-tab` for its own window
+- review the Context section to see exactly what will be sent, then adjust it
 - type the question and press `Enter` to send it (`Shift+Enter` for a new line)
 - keep reading while branches run in parallel
 - press `Escape` to tuck the open branch back into the rail
 - restore minimized branches later and jump back to the original selected text
 
+A branch always runs on the provider you selected in. Aside never moves a
+selection from one provider to the other, and copying context into a new
+conversation is not a server-side fork: it does not carry attachments, project
+knowledge, memory, hidden reasoning or model state.
+
 ## What Aside does
 
-- Opens an embedded branch workspace beside the main conversation instead of forcing you to scroll the original chat.
-- Sends only local context for the first branch prompt:
-  - the selected passage
-  - the touched assistant answer block(s)
-  - your branch question
-- Supports both:
-  - `persistent` branches that must resolve to a real ChatGPT conversation URL
-  - `temporary` branches that may stay ephemeral
-- Supports `New-tab`, which opens a second ChatGPT window for a separate branch flow.
-- Preserves minimized branches so you can keep multiple questions running without interrupting each other. Branches stay saved per conversation, so leaving a chat and coming back does not discard them.
-- Falls back with a real error instead of an endless spinner when ChatGPT refuses to be embedded or a branch window stops responding.
+- Opens a branch workspace beside the main conversation instead of making you scroll the original chat.
+- Shows the exact context it will submit before it submits it — the selected passage, the answer blocks it touched, an optional preceding question, and anything you add — and lets you remove any of it.
+- Runs the branch on the same provider, in an embedded panel where the provider allows it and in a window Aside drives where it does not.
+- Preserves minimized branches so several questions can run at once, saved per conversation so leaving a chat and coming back does not discard them.
+- Fails with a real error and a way to retry instead of an endless spinner.
+
+### Coexisting with the provider's own interface
+
+Aside does not hide, disable, restyle or reparent anything the provider renders.
+Its own controls are labelled `Aside`, measured against the provider's selection
+toolbar, sidebar, header, composer and tool panes, and placed where they do not
+overlap. When there is no safe position the toolbar collapses to a compact `Aside`
+entry rather than covering a native control.
+
+Minimized branches live in free whitespace in the **left gutter** — between the
+provider's own navigation and the reading column. Where the gutter is too narrow
+to be readable, the rail is replaced by the compact entry in verified free space.
+
+### Provider support
+
+| | ChatGPT | Claude |
+| --- | --- | --- |
+| Origins | `chatgpt.com`, `chat.openai.com` | `claude.ai` |
+| Branch surface | embedded panel | window Aside drives (claude.ai refuses framing) |
+| Private mode | Temporary Chat | Incognito chat |
+| Private mode caveats | controls history, not personalization; can later be saved to history from ChatGPT | unavailable inside projects, so starting one leaves the project; a closed Incognito chat cannot be reopened |
+| Verified against | offline fixtures and the live site's DOM conventions | offline fixtures only — **not live-verified** |
+
+Claude's selectors are candidates ordered semantic-first and are re-detected after
+navigation. Claude's interface is mid-migration between the current and previous
+experiences, so a rollout may change them; Aside reports a capability as
+unavailable rather than guessing.
+
+### Private branches
+
+A private branch is only sent once Aside can positively see that the provider's
+private mode is on. Missing, disabled, unreadable, unchanged or unconfirmed — all
+of them stop the branch **before anything is typed**, with the question preserved
+so you can retry or switch to a persistent branch. Nothing is ever downgraded from
+private to persistent automatically, and a selection made inside a private chat
+defaults to a private branch.
+
+Private branch text, prompts, answers and logs are kept in session storage, which
+the browser clears when the session ends. They never reach durable storage. That
+is a statement about this extension only: Aside can observe the page, and cannot
+make any claim about what a provider retains on its servers.
 
 ## Local development
 
@@ -40,7 +81,13 @@ npm run build
 
 3. Open `chrome://extensions/`, enable Developer Mode, and load the `dist/` directory as an unpacked extension.
 
-4. Reload `chatgpt.com`, select assistant text, and try `Ask`, `Why`, or `New-tab`.
+4. If you are upgrading an already-loaded copy, press **Reload** on the Aside card.
+   The manifest now requests `https://claude.ai/*`, and Chrome will not grant a new
+   host permission to an extension that is only refreshed in the page — check the
+   card shows claude.ai under "Site access" and approve it if prompted.
+
+5. Reload `chatgpt.com` **and** `claude.ai` (the content script is only injected on
+   a fresh load), select assistant text, and try `Ask`, `Why`, or `New-tab`.
 
 ## Course submission package
 
@@ -69,7 +116,15 @@ npm run build
 npm run smoke:local
 ```
 
-`npm run smoke:local` uses a fake `chatgpt.com` harness to verify the selection toolbar, branch creation flow, and embedded/native branch behaviors without relying on live production markup. The harness intercepts requests at the browser level, so windows the extension opens itself are covered too.
+`npm run smoke:local` runs the extension against fake `chatgpt.com` and `claude.ai`
+fixtures in a disposable Chrome profile: selection toolbar, context preview, branch
+creation, privacy verification, the cross-tab panel protocol, and the layout matrix
+across widths, themes and sidebar states. Requests are intercepted at the browser
+level, so windows the extension opens itself are covered too, and any request to a
+host the harness does not serve **fails the run** — the default smoke can never
+reach a real ChatGPT or Claude account.
+
+Set `CAPTURE_SCREENSHOTS=<dir>` to write the layout-matrix screenshots to disk.
 
 The native-window scenarios (`Why` recovery and `New-tab`) run as part of that command. To skip them for a faster loop:
 

@@ -213,3 +213,52 @@ export function findLeftGutterSlot(request: GutterRequest): GutterSlot | null {
 
   return { top, left: gutterLeft, width, height };
 }
+
+export type Corner = 'bottom-left' | 'top-left' | 'bottom-right' | 'top-right';
+
+export interface CornerRequest {
+  viewport: Viewport;
+  size: { width: number; height: number };
+  reserved: Rect[];
+  /** Order to try. Defaults to bottom-left first, which is closest to the rail. */
+  order?: Corner[];
+  margin?: number;
+}
+
+/**
+ * Last-resort placement for the compact launcher: a corner that overlaps nothing
+ * the provider owns.
+ *
+ * Returns null when no corner is free, so the caller hides the on-page entry
+ * rather than dropping it on top of native chrome. The extension action remains
+ * the guaranteed way in.
+ */
+export function findFreeCorner(request: CornerRequest): Rect | null {
+  const margin = request.margin ?? VIEWPORT_MARGIN;
+  const order = request.order ?? ['bottom-left', 'top-left', 'bottom-right', 'top-right'];
+  const { width, height } = request.size;
+
+  const positions: Record<Corner, Rect> = {
+    'bottom-left': { left: margin, top: request.viewport.height - height - margin, width, height },
+    'top-left': { left: margin, top: margin, width, height },
+    'bottom-right': {
+      left: request.viewport.width - width - margin,
+      top: request.viewport.height - height - margin,
+      width,
+      height
+    },
+    'top-right': { left: request.viewport.width - width - margin, top: margin, width, height }
+  };
+
+  for (const corner of order) {
+    const candidate = positions[corner];
+    if (
+      isWithinViewport(candidate, request.viewport, margin) &&
+      !request.reserved.some((reserved) => rectsOverlap(candidate, reserved))
+    ) {
+      return candidate;
+    }
+  }
+
+  return null;
+}

@@ -1300,7 +1300,15 @@ async function runCrossTabScenario(browser) {
     // would route this panel to session storage and make the assertions ambiguous.
     await setPanelBranchKind(tabA, 'Persistent');
     await tabA.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'question from tab A');
-    await sleep(700);
+    // Finish editing in tab A before handing over, as a user would. Without this
+    // both tabs keep saving and the test measures a race between two live editors
+    // rather than the protocol.
+    await tabA.evaluate(() => {
+      document
+        .querySelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]')
+        ?.blur();
+    });
+    await sleep(900);
 
     // The panel under test, named explicitly: the shared profile also holds
     // minimized panels from earlier scenarios.
@@ -1312,8 +1320,15 @@ async function runCrossTabScenario(browser) {
     }
 
     tabB = await createSourcePage(browser, '/c/source-cross-tab');
+    // Wait until tab B has actually caught up with tab A's draft. Editing before
+    // both tabs agree on a revision tests the race, not the protocol.
     await tabB.waitForFunction(
-      (id) => Boolean(document.querySelector(`.aside-panel[data-panel-id="${id}"]`)),
+      (id) => {
+        const textarea = document.querySelector(
+          `.aside-panel[data-panel-id="${id}"] textarea[data-aside-role="question"]`
+        );
+        return textarea instanceof HTMLTextAreaElement && textarea.value === 'question from tab A';
+      },
       { timeout: 15_000 },
       panelId
     );
@@ -1636,6 +1651,112 @@ async function runClaudeScenario(browser, { variant = 'current' } = {}) {
   }
 }
 
+
+const SCREENSHOT_DIR = process.env.CAPTURE_SCREENSHOTS ?? null;
+
+async function capture(page, name) {
+  if (!SCREENSHOT_DIR) {
+    return;
+  }
+  await fs.mkdir(SCREENSHOT_DIR, { recursive: true });
+  await page.screenshot({ path: path.join(SCREENSHOT_DIR, `${name}.png`) });
+}
+
+/**
+ * Acceptance case 2: at representative widths, themes and sidebar states, the
+ * minimized rail uses safe left space (or its documented fallback) and the native
+ * selection action stays usable. Assertions are on measured geometry and real hit
+ * targets, not on screenshots — screenshots are only captured as evidence.
+ */
+async function runLayoutMatrixScenario(browser) {
+  const viewports = [
+    { name: '1440', width: 1440, height: 900 },
+    { name: '1024', width: 1024, height: 768 },
+    { name: '768', width: 768, height: 800 }
+  ];
+  const results = [];
+
+  for (const viewport of viewports) {
+    for (const sidebar of ['open', 'collapsed']) {
+      for (const dark of [false, true]) {
+        const label = `${viewport.name}-${sidebar}-${dark ? 'dark' : 'light'}`;
+        routeMap = {
+          [`/c/layout-${label}`]: buildSourceHtml({ dark, sidebar }),
+          '/': buildSuccessComposerHtml({ conversationPath: `/c/generated-${label}`, dark })
+        };
+
+        const page = await createSourcePage(browser, `/c/layout-${label}`);
+        try {
+          await page.setViewport({ width: viewport.width, height: viewport.height });
+          await selectAssistantText(page);
+          await injectNativeAskButton(page);
+          // Re-evaluate after the native action appears, as it would on a real page.
+          await selectAssistantText(page);
+          await page.waitForFunction(() => {
+            const toolbar = document.querySelector('#aside-selection-toolbar');
+            return toolbar instanceof HTMLElement && !toolbar.hidden;
+          }, { timeout: 10_000 });
+
+          await capture(page, `toolbar-${label}`);
+
+          await openDraft(page);
+          await page.type(
+            '.aside-panel:not([hidden]) textarea[data-aside-role="question"]',
+            'Why this assumption?'
+          );
+          await clickPanelAction(page, 'Minimize');
+          await sleep(400);
+          await capture(page, `rail-${label}`);
+
+          const measured = await page.evaluate(() => {
+            const rail = document.querySelector('#aside-tabbar');
+            const launcher = document.querySelector('#aside-launcher');
+            const toolbar = document.querySelector('#aside-selection-toolbar');
+            const sidebarEl = document.querySelector('nav[aria-label]');
+            const column = document.querySelector('main article, main #turns, main #composer-form');
+            const nativeAsk = document.querySelector('button[aria-label="Ask ChatGPT"]');
+            const rect = (el) => (el ? el.getBoundingClientRect() : null);
+            const overlaps = (a, b) =>
+              Boolean(a && b) && a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+
+            const railRect = rail && !rail.hidden ? rect(rail) : null;
+            const launcherRect = launcher && !launcher.hidden ? rect(launcher) : null;
+            const shown = railRect ?? launcherRect;
+            const nativeRect = rect(nativeAsk);
+            const hit =
+              nativeRect && nativeRect.width > 0
+                ? document.elementFromPoint(
+                    nativeRect.left + nativeRect.width / 2,
+                    nativeRect.top + nativeRect.height / 2
+                  )
+                : null;
+
+            return {
+              placement: rail?.getAttribute('data-placement') ?? null,
+              railShown: Boolean(railRect),
+              launcherShown: Boolean(launcherRect),
+              anythingShown: Boolean(shown),
+              onLeftHalf: shown ? shown.left < window.innerWidth / 2 : null,
+              overlapsSidebar: overlaps(shown, rect(sidebarEl)),
+              overlapsColumn: overlaps(shown, rect(column)),
+              overlapsNativeAsk: overlaps(shown, nativeRect) || overlaps(rect(toolbar), nativeRect),
+              nativeAskHitTargetIsNative:
+                hit === nativeAsk || Boolean(nativeAsk && nativeAsk.contains(hit)),
+              theme: document.documentElement.getAttribute('data-aside-theme')
+            };
+          });
+
+          results.push({ label, ...measured });
+        } finally {
+          await page.close();
+        }
+      }
+    }
+  }
+
+  return results;
+}
+
 async function runFailureScenario(browser) {
   routeMap = {
     '/c/source-failure': buildSourceHtml(),
@@ -1713,6 +1834,7 @@ try {
   const temporaryChatBlocked = await runTemporaryChatBlockedScenario(browser);
   const claudeCurrent = await runClaudeScenario(browser, { variant: 'current' });
   const claudeLegacy = await runClaudeScenario(browser, { variant: 'legacy' });
+  const layoutMatrix = await runLayoutMatrixScenario(browser);
   const crossTab = await runCrossTabScenario(browser);
   const failure = await runFailureScenario(browser);
 
@@ -1725,6 +1847,7 @@ try {
     temporaryChatUnconfirmed,
     temporaryChatVerified,
     temporaryChatBlocked,
+    layoutMatrix,
     claudeCurrent,
     claudeLegacy,
     crossTab,
@@ -1732,6 +1855,26 @@ try {
   };
 
   console.log(JSON.stringify(result, null, 2));
+
+  layoutMatrix.forEach((entry) => {
+    if (
+      // Aside must always offer a way in.
+      entry.anythingShown !== true ||
+      // The RAIL belongs in left-side whitespace. The compact launcher is the
+      // documented fallback when no gutter exists and only has to be in verified
+      // free space, which at 768px with the sidebar open is not the left.
+      (entry.railShown && entry.onLeftHalf !== true) ||
+      entry.overlapsSidebar !== false ||
+      entry.overlapsColumn !== false ||
+      entry.overlapsNativeAsk !== false ||
+      entry.nativeAskHitTargetIsNative !== true ||
+      // The rail is either placed in the gutter or replaced by the compact launcher.
+      !(entry.placement === 'left-gutter' || entry.launcherShown) ||
+      entry.theme !== (entry.label.endsWith('dark') ? 'dark' : 'light')
+    ) {
+      throw new Error(`Layout matrix failed at ${entry.label}: ${JSON.stringify(entry)}`);
+    }
+  });
 
   [claudeCurrent, claudeLegacy].forEach((claude) => {
     if (

@@ -52,7 +52,7 @@ import {
 } from '../shared/context';
 import type { BranchContext, ContextBlock } from '../shared/context';
 import { attachElementToHost, ensureExtensionHostElement } from './ui-host';
-import { VIEWPORT_MARGIN, findLeftGutterSlot, findSafePlacement } from '../shared/placement';
+import { findFreeCorner, findLeftGutterSlot, findSafePlacement } from '../shared/placement';
 import type { Rect } from '../shared/placement';
 import {
   getActionLabel,
@@ -384,7 +384,10 @@ function adoptAuthoritativeState(panelId: string, state: BranchPanelState, rev: 
   renderTabs();
 }
 
-async function writePanelRecord(runtime: PanelRuntime, isRetry = false): Promise<void> {
+/** Optimistic concurrency needs a few goes: another tab saving is routine. */
+const MAX_WRITE_REBASES = 3;
+
+async function writePanelRecord(runtime: PanelRuntime, attempt = 0): Promise<void> {
   const panelId = runtime.state.panelId;
   const response = await sendStoreMessage<PanelWriteResponse>({
     type: 'PANEL_UPSERT',
@@ -419,19 +422,21 @@ async function writePanelRecord(runtime: PanelRuntime, isRetry = false): Promise
     const localQuestion = runtime.questionInput.value;
     const questionDiverged = (theirs.state.initialQuestion ?? '') !== localQuestion;
 
-    // Re-base onto their record and try once more, keeping the one field the user
-    // edits directly. Adopting outright here is how a draft typed in this tab
-    // disappears because another tab happened to write first.
-    if (!isRetry && questionDiverged) {
+    // Re-base onto their record and try again, keeping the one field the user edits
+    // directly. Adopting outright is how a draft typed in this tab disappears
+    // because another tab happened to save first, and a single retry is not enough:
+    // a tab that is actively being used writes more than once.
+    if (attempt < MAX_WRITE_REBASES && questionDiverged) {
       appendPanelLog(runtime, 'Another tab wrote first; re-basing this draft onto it', {
-        theirRev: theirs.rev
+        theirRev: theirs.rev,
+        attempt: attempt + 1
       });
       runtime.state = {
         ...theirs.state,
         initialQuestion: localQuestion,
         updatedAt: Date.now()
       };
-      await writePanelRecord(runtime, true);
+      await writePanelRecord(runtime, attempt + 1);
       return;
     }
 
@@ -491,23 +496,36 @@ function cancelPendingPersist(): void {
  * Structural changes (create, minimize, close, status transitions) are written
  * straight away, because the user may navigate immediately afterwards.
  */
-function persistPanels(): void {
+function persistPanels(panelId?: string): void {
   if (!hasRuntimeAccess()) {
     return;
   }
 
-  markAllPanelsDirty();
+  // Only the panel that changed is written. Marking every mounted panel dirty
+  // meant a page with a full rail issued a write per panel on every interaction,
+  // which is both wasteful and a reliable way to lose a race with another tab.
+  if (panelId) {
+    markPanelDirty(panelId);
+  } else {
+    markAllPanelsDirty();
+  }
+
   cancelPendingPersist();
   void queuePersistWrite();
 }
 
 /** Typing and streaming diagnostics coalesce instead of writing per keystroke. */
-function persistPanelsSoon(): void {
+function persistPanelsSoon(panelId?: string): void {
   if (!hasRuntimeAccess()) {
     return;
   }
 
-  markAllPanelsDirty();
+  if (panelId) {
+    markPanelDirty(panelId);
+  } else {
+    markAllPanelsDirty();
+  }
+
   if (persistTimer !== undefined) {
     return;
   }
@@ -1955,11 +1973,22 @@ function setCompactLauncherVisible(visible: boolean): void {
     return;
   }
 
-  // Nothing safe on the page at all. Keep it out of the way at the bottom-left
-  // rather than covering provider chrome; the extension action remains the
-  // guaranteed entry point.
-  launcher.style.left = `${VIEWPORT_MARGIN}px`;
-  launcher.style.top = `${Math.max(VIEWPORT_MARGIN, window.innerHeight - size.height - VIEWPORT_MARGIN)}px`;
+  // No gutter. Try the corners, still refusing to overlap anything the provider
+  // owns; if none is free, hide the on-page entry rather than dropping it on top
+  // of native chrome. The extension action remains the guaranteed way in.
+  const corner = findFreeCorner({
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+    size: { width: Math.max(size.width, 72), height: Math.max(size.height, 28) },
+    reserved: collectReservedRegions(false)
+  });
+
+  if (!corner) {
+    launcher.hidden = true;
+    return;
+  }
+
+  launcher.style.left = `${corner.left}px`;
+  launcher.style.top = `${corner.top}px`;
 }
 
 function readingColumnRect(): Rect | null {
@@ -2493,15 +2522,14 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     runtime.state.initialQuestion = questionInput.value;
     runtime.state.updatedAt = Date.now();
     syncPanelUI(runtime);
-    persistPanelsSoon();
+    persistPanelsSoon(runtime.state.panelId);
   });
   // Leaving the box is a deliberate save point, which is also how a panel that went
   // unsaved because another tab wrote first gets reconciled.
   questionInput.addEventListener('blur', () => {
     runtime.state.initialQuestion = questionInput.value;
     runtime.state.updatedAt = Date.now();
-    markPanelDirty(runtime.state.panelId);
-    persistPanels();
+    persistPanels(runtime.state.panelId);
   });
   // Enter sends, Shift+Enter adds a line, matching the composer the user just came from.
   // isComposing keeps IME candidate selection from submitting a half-typed question.
@@ -2909,7 +2937,7 @@ function minimizePanel(panelId: string): void {
   runtime.state.updatedAt = Date.now();
   syncPanelUI(runtime);
   renderTabs();
-  persistPanels();
+  persistPanels(panelId);
 }
 
 function expandPanel(panelId: string): void {
@@ -2923,7 +2951,7 @@ function expandPanel(panelId: string): void {
   runtime.state.updatedAt = Date.now();
   syncPanelUI(runtime);
   renderTabs();
-  persistPanels();
+  persistPanels(panelId);
   scrollToOrigin(runtime.state.selection);
 }
 
@@ -3750,7 +3778,7 @@ function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): 
     case 'debug-log':
       appendPanelLogEntries(runtime, [event.message]);
       syncPanelUI(runtime);
-      persistPanelsSoon();
+      persistPanelsSoon(runtime.state.panelId);
       return;
 
     case 'title':
