@@ -37,10 +37,20 @@ import {
 } from '../shared/dom';
 import type { SelectionDraft } from '../shared/dom';
 import {
-  buildLocalInitialPrompt,
+  buildBranchPrompt,
   buildNativeBootstrapPrompt,
   stripHiddenTitle
 } from '../shared/prompts';
+import {
+  createContext,
+  describeContextSize,
+  freezeContext,
+  measureContext,
+  renderContextText,
+  withBlockIncluded,
+  withUserBackground
+} from '../shared/context';
+import type { BranchContext, ContextBlock } from '../shared/context';
 import { attachElementToHost, ensureExtensionHostElement } from './ui-host';
 import { VIEWPORT_MARGIN, findLeftGutterSlot, findSafePlacement } from '../shared/placement';
 import type { Rect } from '../shared/placement';
@@ -100,6 +110,11 @@ interface PanelRuntime {
   iframeOverlay: HTMLDivElement;
   iframeOverlayTitle: HTMLParagraphElement;
   iframeOverlayText: HTMLParagraphElement;
+  contextShell: HTMLDetailsElement;
+  contextBlockList: HTMLDivElement;
+  contextBackground: HTMLTextAreaElement;
+  contextSizeEl: HTMLParagraphElement;
+  contextPreview: HTMLPreElement;
   debugLogShell: HTMLDivElement;
   debugLogTextarea: HTMLTextAreaElement;
   copyLogButton: HTMLButtonElement;
@@ -1285,6 +1300,75 @@ function ensureStyles(): void {
       white-space: pre-wrap;
     }
 
+    .aside-context {
+      margin: 8px 0 4px;
+      padding: 8px 10px;
+      border: 1px solid var(--sb-border, rgba(15, 23, 42, 0.1));
+      border-radius: 12px;
+      background: var(--sb-subtle-bg, rgba(15, 23, 42, 0.03));
+      font-size: 12px;
+    }
+
+    .aside-context > summary {
+      cursor: pointer;
+      font-weight: 600;
+      user-select: none;
+    }
+
+    .aside-context-source {
+      margin: 6px 0 4px;
+      opacity: 0.7;
+    }
+
+    .aside-context-block {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      margin: 4px 0;
+      line-height: 1.4;
+    }
+
+    .aside-context-limitation {
+      display: block;
+      width: 100%;
+      opacity: 0.7;
+    }
+
+    .aside-context-background {
+      display: block;
+      margin: 8px 0 4px;
+    }
+
+    .aside-context-background textarea {
+      width: 100%;
+      margin-top: 4px;
+      box-sizing: border-box;
+      font: inherit;
+    }
+
+    .aside-context-size[data-over-budget="true"] {
+      color: var(--sb-danger, #b91c1c);
+      font-weight: 600;
+    }
+
+    .aside-context-preview-label {
+      margin: 8px 0 4px;
+      opacity: 0.7;
+    }
+
+    .aside-context-preview {
+      max-height: 180px;
+      overflow: auto;
+      margin: 0;
+      padding: 8px;
+      border-radius: 8px;
+      background: var(--sb-code-bg, rgba(15, 23, 42, 0.06));
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 11px;
+      line-height: 1.45;
+    }
+
     .aside-debug-log {
       display: flex;
       flex-direction: column;
@@ -1963,6 +2047,49 @@ interface CreateDraftOptions {
   hostChatUrl?: string;
 }
 
+/**
+ * The single place a branch context is assembled, used by Ask, Why and New-tab on
+ * both providers. Assistant answers the selection touched are included by default;
+ * the preceding question is offered but off, because widening history is a choice
+ * the user makes rather than one Aside makes for them.
+ */
+function createContextForSelection(selection: SelectionPayload): BranchContext {
+  const blocks: ContextBlock[] = selection.selectedBlocks
+    .filter((block) => block.role === 'assistant')
+    .map((block) => ({
+      id: block.messageId,
+      role: block.role,
+      text: block.structuredText || block.text,
+      excerpt: block.excerpt,
+      included: true,
+      origin: 'touched' as const,
+      limitation: block.structuredText ? undefined : 'structure could not be read; whitespace was normalized'
+    }));
+
+  if (selection.precedingQuestion) {
+    const question = selection.precedingQuestion;
+    blocks.push({
+      id: question.messageId,
+      role: question.role,
+      text: question.structuredText || question.text,
+      excerpt: question.excerpt,
+      included: false,
+      origin: 'preceding-question'
+    });
+  }
+
+  const identity = currentIdentity(selection.rootChatUrl);
+  return createContext({
+    providerId: provider.id,
+    selectedPassage: selection.structuredSelectedText || selection.selectedText,
+    anchorText: selection.selectedText,
+    sourceLabel: identity.conversationId
+      ? `${provider.label} · conversation ${identity.conversationId}`
+      : `${provider.label} · this page`,
+    blocks
+  });
+}
+
 function createDraftState(selection: SelectionPayload, options: CreateDraftOptions): BranchPanelState {
   const hostChatUrl = normalizeChatUrl(options.hostChatUrl ?? selection.rootChatUrl);
   return {
@@ -1971,6 +2098,7 @@ function createDraftState(selection: SelectionPayload, options: CreateDraftOptio
     rootChatUrl: hostChatUrl,
     rootProjectUrl: getNonRootContainerUrl(hostChatUrl),
     selection,
+    context: createContextForSelection(selection),
     focusPreview: clipText(selection.selectedText, 280),
     branchKind: options.branchKind,
     entryAction: options.entryAction,
@@ -2161,7 +2289,10 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   temporaryKindButton.type = 'button';
   temporaryKindButton.textContent = 'Temporary';
   const questionInput = document.createElement('textarea');
-  questionInput.placeholder = 'Ask a local question about this passage';
+  // Stable hook: the panel has more than one textarea, and selectors that rely on
+  // document order break the moment a section is added above this one.
+  questionInput.dataset.asideRole = 'question';
+  questionInput.placeholder = 'Ask a focused question about this passage';
   questionInput.autocomplete = 'off';
   questionInput.autocapitalize = 'sentences';
   questionInput.autofocus = state.entryAction === 'new_tab' && state.status === 'draft';
@@ -2196,6 +2327,40 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   iframeOverlay.append(iframeOverlayCard);
   iframeShell.append(iframeEl, iframeOverlay);
 
+  // Context: what will actually be submitted, inspectable and editable before it is.
+  const contextShell = document.createElement('details');
+  contextShell.className = 'aside-context';
+  const contextSummary = document.createElement('summary');
+  contextSummary.textContent = 'Context';
+  const contextSource = document.createElement('p');
+  contextSource.className = 'aside-context-source';
+  const contextBlockList = document.createElement('div');
+  contextBlockList.className = 'aside-context-blocks';
+  const contextBackgroundLabel = document.createElement('label');
+  contextBackgroundLabel.className = 'aside-context-background';
+  contextBackgroundLabel.textContent = 'Background to add (optional)';
+  const contextBackground = document.createElement('textarea');
+  contextBackground.dataset.asideRole = 'context-background';
+  contextBackground.rows = 2;
+  contextBackground.placeholder = 'Anything the passage assumes but does not say';
+  contextBackgroundLabel.append(contextBackground);
+  const contextSizeEl = document.createElement('p');
+  contextSizeEl.className = 'aside-context-size';
+  const contextPreviewLabel = document.createElement('p');
+  contextPreviewLabel.className = 'aside-context-preview-label';
+  contextPreviewLabel.textContent = 'Exactly what will be sent:';
+  const contextPreview = document.createElement('pre');
+  contextPreview.className = 'aside-context-preview';
+  contextShell.append(
+    contextSummary,
+    contextSource,
+    contextBlockList,
+    contextBackgroundLabel,
+    contextSizeEl,
+    contextPreviewLabel,
+    contextPreview
+  );
+
   const debugLogShell = document.createElement('div');
   debugLogShell.className = 'aside-debug-log';
   debugLogShell.hidden = true;
@@ -2205,6 +2370,7 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   debugLogHelp.textContent =
     'Clipboard access was blocked, so select this log and paste it where you need it.';
   const debugLogTextarea = document.createElement('textarea');
+  debugLogTextarea.dataset.asideRole = 'debug-log';
   debugLogTextarea.readOnly = true;
   debugLogTextarea.spellcheck = false;
   const debugLogActions = document.createElement('div');
@@ -2220,7 +2386,7 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   debugLogActions.append(selectDebugLogButton, closeDebugLogButton);
   debugLogShell.append(debugLogTitle, debugLogHelp, debugLogTextarea, debugLogActions);
 
-  body.append(focus, formEl, iframeShell, debugLogShell);
+  body.append(focus, contextShell, formEl, iframeShell, debugLogShell);
   element.append(header, body);
   mountInExtensionHost(element);
 
@@ -2242,6 +2408,11 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     iframeOverlay,
     iframeOverlayTitle,
     iframeOverlayText,
+    contextShell,
+    contextBlockList,
+    contextBackground,
+    contextSizeEl,
+    contextPreview,
     debugLogShell,
     debugLogTextarea,
     copyLogButton,
@@ -2251,6 +2422,18 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   };
 
   questionInput.value = state.initialQuestion ?? '';
+  contextSource.textContent = state.context?.sourceLabel ?? '';
+  contextBackground.value = state.context?.userBackground ?? '';
+
+  contextBackground.addEventListener('input', () => {
+    if (!runtime.state.context) {
+      return;
+    }
+    runtime.state.context = withUserBackground(runtime.state.context, contextBackground.value);
+    runtime.state.updatedAt = Date.now();
+    renderContextSection(runtime);
+    persistPanelsSoon();
+  });
 
   jumpButton.addEventListener('click', () => {
     scrollToOrigin(runtime.state.selection);
@@ -2385,6 +2568,66 @@ function canShowFrame(state: BranchPanelState): boolean {
   return state.status !== 'draft' || Boolean(state.branchChatUrl) || Boolean(state.launchUrl);
 }
 
+/**
+ * Render the Context section from the panel's own context value. The preview shows
+ * the exact string the prompt will carry, produced by the same function that builds
+ * it, so the two cannot drift.
+ */
+function renderContextSection(runtime: PanelRuntime): void {
+  const context = runtime.state.context;
+  if (!context) {
+    runtime.contextShell.hidden = true;
+    return;
+  }
+
+  runtime.contextShell.hidden = false;
+  runtime.contextBlockList.replaceChildren();
+
+  context.blocks.forEach((block) => {
+    const row = document.createElement('label');
+    row.className = 'aside-context-block';
+
+    const toggle = document.createElement('input');
+    toggle.type = 'checkbox';
+    toggle.checked = block.included;
+    toggle.addEventListener('change', () => {
+      if (!runtime.state.context) {
+        return;
+      }
+      runtime.state.context = withBlockIncluded(runtime.state.context, block.id, toggle.checked);
+      runtime.state.updatedAt = Date.now();
+      renderContextSection(runtime);
+      syncPanelUI(runtime);
+      persistPanels();
+    });
+
+    const label = document.createElement('span');
+    const origin =
+      block.origin === 'preceding-question'
+        ? 'preceding question'
+        : block.origin === 'user-added'
+          ? 'added by you'
+          : `${block.role} answer you selected in`;
+    label.textContent = `${origin}: ${clipText(block.excerpt, 90)}`;
+
+    row.append(toggle, label);
+
+    if (block.limitation) {
+      const limitation = document.createElement('small');
+      limitation.className = 'aside-context-limitation';
+      limitation.textContent = block.limitation;
+      row.append(limitation);
+    }
+
+    runtime.contextBlockList.append(row);
+  });
+
+  const limits = measureContext(context);
+  runtime.contextSizeEl.textContent = describeContextSize(limits);
+  runtime.contextSizeEl.dataset.overBudget = String(limits.overBudget);
+  runtime.contextPreview.textContent = renderContextText(context);
+}
+
 function syncPanelUI(runtime: PanelRuntime): void {
   const { state } = runtime;
   const showForm = canShowForm(state);
@@ -2404,6 +2647,12 @@ function syncPanelUI(runtime: PanelRuntime): void {
   runtime.errorEl.textContent = state.status === 'failed' ? state.errorMessage ?? '' : '';
   runtime.errorEl.style.display = runtime.errorEl.textContent ? 'block' : 'none';
   runtime.focusTextEl.textContent = state.focusPreview;
+  renderContextSection(runtime);
+
+  // Over budget is a decision for the user, not a silent truncation, so the send
+  // is blocked until they remove something.
+  const contextLimits = state.context ? measureContext(state.context) : null;
+  const contextOverBudget = Boolean(contextLimits?.overBudget);
 
   runtime.formEl.style.display = showForm ? 'flex' : 'none';
   runtime.branchKindField.style.display = canShowBranchKindToggle(state) ? 'inline-flex' : 'none';
@@ -2414,8 +2663,12 @@ function syncPanelUI(runtime: PanelRuntime): void {
   runtime.temporaryKindButton.disabled = !showForm;
   runtime.submitButton.disabled =
     !runtime.questionInput.value.trim() ||
+    contextOverBudget ||
     state.status === 'creating_branch' ||
     state.status === 'opening_branch';
+  runtime.submitButton.title = contextOverBudget
+    ? `The context is ${describeContextSize(contextLimits!)}. Open Context and remove some material.`
+    : '';
   runtime.submitButton.textContent = state.status === 'failed' ? 'Try again' : 'Start branch';
   runtime.iframeShell.hidden = !showFrame;
   runtime.iframeOverlay.hidden = !overlayVisible;
@@ -3335,7 +3588,23 @@ async function startBranch(panelId: string, question: string): Promise<void> {
     return;
   }
 
-  const prompt = buildLocalInitialPrompt(runtime.state.selection, question).prompt;
+  // Freeze the context now: a later edit, or the source answer still streaming,
+  // must not change a prompt that is already in flight.
+  const context = runtime.state.context ?? createContextForSelection(runtime.state.selection);
+  const limits = measureContext(context);
+  if (limits.overBudget) {
+    runtime.state.status = 'failed';
+    runtime.state.creationMode = 'failed';
+    runtime.state.statusLabel = 'This branch was not sent.';
+    runtime.state.errorMessage = `The context is ${describeContextSize(limits)}. Open Context and remove some material, then try again.`;
+    runtime.state.updatedAt = Date.now();
+    syncPanelUI(runtime);
+    persistPanels();
+    return;
+  }
+
+  const frozen = freezeContext(context);
+  const prompt = buildBranchPrompt({ contextText: frozen.text, question }).prompt;
   const launchUrl = provider.normalizeUrl(currentIdentity(runtime.state.rootChatUrl).launchUrl);
 
   if (!launchUrl) {

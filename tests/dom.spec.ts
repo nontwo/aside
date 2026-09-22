@@ -4,6 +4,7 @@ import {
   captureSelectionDraftFromRange,
   countTranscriptTurns,
   extractCleanNodeText,
+  extractStructuredNodeText,
   extractTranscript,
   findQuotedTextRangeInElement,
   findTurnElementByAnchor,
@@ -534,5 +535,68 @@ describe('assistant gating and anchor resolution edge cases', () => {
     });
 
     expect(element).toBe(assistantTurn.element);
+  });
+});
+
+describe('structured extraction for the model', () => {
+  it('keeps code newlines and indentation instead of flattening them', () => {
+    document.body.innerHTML =
+      '<div class="markdown"><p>Try this:</p><pre><code>def f(x):\n    return x + 1</code></pre></div>';
+    const text = extractStructuredNodeText(document.querySelector('.markdown') as HTMLElement);
+
+    expect(text).toContain('def f(x):\n    return x + 1');
+    // The matching form deliberately flattens; the model form must not.
+    expect(extractCleanNodeText(document.querySelector('.markdown') as HTMLElement)).not.toContain(
+      '\n    return'
+    );
+  });
+
+  it('keeps list structure rather than running items together', () => {
+    document.body.innerHTML =
+      '<div class="markdown"><ul><li>first</li><li>second</li></ul></div>';
+    const text = extractStructuredNodeText(document.querySelector('.markdown') as HTMLElement);
+
+    expect(text).toContain('- first');
+    expect(text).toContain('- second');
+  });
+
+  it('numbers ordered list items', () => {
+    document.body.innerHTML =
+      '<div class="markdown"><ol><li>alpha</li><li>beta</li><li>gamma</li></ol></div>';
+    const text = extractStructuredNodeText(document.querySelector('.markdown') as HTMLElement);
+
+    expect(text).toContain('1. alpha');
+    expect(text).toContain('2. beta');
+    expect(text).toContain('3. gamma');
+  });
+
+  it('keeps table rows separable', () => {
+    document.body.innerHTML =
+      '<div class="markdown"><table><tbody><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></tbody></table></div>';
+    const text = extractStructuredNodeText(document.querySelector('.markdown') as HTMLElement);
+
+    expect(text).toContain('| a | b |');
+    expect(text).toContain('| c | d |');
+  });
+
+  it('prefers LaTeX source over duplicated visual and assistive math', () => {
+    document.body.innerHTML =
+      '<div class="markdown"><p>Given <span data-latex="\\hat\\beta = (X^TX)^{-1}X^Ty">' +
+      '<span class="katex-html">β̂ = (XᵀX)⁻¹Xᵀy</span>' +
+      '<span class="katex-mathml">beta hat equals</span></span> we proceed.</p></div>';
+    const text = extractStructuredNodeText(document.querySelector('.markdown') as HTMLElement);
+
+    expect(text).toContain('$\\hat\\beta = (X^TX)^{-1}X^Ty$');
+    // The assistive duplicate must not be included alongside it.
+    expect(text).not.toContain('beta hat equals');
+  });
+
+  it('drops provider controls from the model text', () => {
+    document.body.innerHTML =
+      '<div class="markdown"><p>Answer text.</p><button>Copy</button></div>';
+    const text = extractStructuredNodeText(document.querySelector('.markdown') as HTMLElement);
+
+    expect(text).toContain('Answer text.');
+    expect(text).not.toContain('Copy');
   });
 });

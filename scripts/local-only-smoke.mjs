@@ -428,19 +428,42 @@ async function waitForBranchFrame(page, timeoutMs = 30_000) {
   throw new Error('The embedded ChatGPT branch frame did not appear.');
 }
 
-async function waitForPanelStatus(page, matcher, timeoutMs = 30_000) {
-  await page.waitForFunction(
-    (patternSource) => {
+async function dumpPanelState(page, label) {
+  try {
+    const state = await page.evaluate(() => {
       const panel = document.querySelector('.aside-panel:not([hidden])');
-      const status = panel?.querySelector('.aside-panel-heading p');
-      if (!(status instanceof HTMLElement)) {
-        return false;
-      }
-      return new RegExp(patternSource).test(status.textContent || '');
-    },
-    { timeout: timeoutMs },
-    matcher.source
-  );
+      return {
+        status: panel?.querySelector('.aside-panel-heading p')?.textContent ?? null,
+        error: panel?.querySelector('.aside-error-copy')?.textContent ?? null,
+        submitDisabled: panel?.querySelector('button[type="submit"]')?.disabled ?? null,
+        contextSize: panel?.querySelector('.aside-context-size')?.textContent ?? null,
+        overBudget: panel?.querySelector('.aside-context-size')?.getAttribute('data-over-budget') ?? null
+      };
+    });
+    console.error(`PANEL[${label}]`, JSON.stringify(state));
+  } catch (error) {
+    console.error(`PANEL[${label}] unavailable`, error instanceof Error ? error.message : error);
+  }
+}
+
+async function waitForPanelStatus(page, matcher, timeoutMs = 30_000) {
+  try {
+    await page.waitForFunction(
+      (patternSource) => {
+        const panel = document.querySelector('.aside-panel:not([hidden])');
+        const status = panel?.querySelector('.aside-panel-heading p');
+        if (!(status instanceof HTMLElement)) {
+          return false;
+        }
+        return new RegExp(patternSource).test(status.textContent || '');
+      },
+      { timeout: timeoutMs },
+      matcher.source
+    );
+  } catch (error) {
+    await dumpPanelState(page, 'status-timeout');
+    throw error;
+  }
 }
 
 async function waitForPanelTitle(page, title, timeoutMs = 15_000) {
@@ -491,7 +514,7 @@ async function openDraft(page) {
     }
     button.click();
   });
-  await page.waitForSelector('.aside-panel:not([hidden]) textarea', { timeout: 10_000 });
+  await page.waitForSelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', { timeout: 10_000 });
 }
 
 async function clickSelectionAction(page, selector) {
@@ -506,7 +529,7 @@ async function clickSelectionAction(page, selector) {
 
 async function openDraftAndSubmit(page, question) {
   await openDraft(page);
-  await page.type('.aside-panel:not([hidden]) textarea', question);
+  await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', question);
   const pageCountBefore = (await page.browser().pages()).length;
   await page.evaluate(() => {
     const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
@@ -611,8 +634,48 @@ async function runNonProjectScenario(browser) {
     });
 
     await clickSelectionAction(page, '#aside-ask-button');
-    await page.waitForSelector('.aside-panel:not([hidden]) textarea', { timeout: 10_000 });
-    await page.type('.aside-panel:not([hidden]) textarea', 'Why this assumption?');
+    await page.waitForSelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', { timeout: 10_000 });
+
+    // The Context section must show exactly what will be submitted, and must not
+    // include the preceding question until the user asks for it.
+    const contextBefore = await page.evaluate(() => {
+      const panel = document.querySelector('.aside-panel:not([hidden])');
+      const rows = Array.from(panel?.querySelectorAll('.aside-context-block') ?? []);
+      return {
+        preview: panel?.querySelector('.aside-context-preview')?.textContent ?? '',
+        source: panel?.querySelector('.aside-context-source')?.textContent ?? '',
+        blockLabels: rows.map((row) => row.querySelector('span')?.textContent ?? ''),
+        precedingIncluded: rows
+          .filter((row) => row.textContent?.includes('preceding question'))
+          .map((row) => row.querySelector('input')?.checked ?? null)
+      };
+    });
+
+    // Opt in to the preceding question and confirm it enters the preview.
+    await page.evaluate(() => {
+      const row = Array.from(
+        document.querySelectorAll('.aside-panel:not([hidden]) .aside-context-block')
+      ).find((candidate) => candidate.textContent?.includes('preceding question'));
+      row?.querySelector('input')?.click();
+    });
+    const contextAfterOptIn = await page.evaluate(
+      () =>
+        document.querySelector('.aside-panel:not([hidden]) .aside-context-preview')?.textContent ?? ''
+    );
+    // Put it back: the rest of the scenario asserts the default context.
+    await page.evaluate(() => {
+      const row = Array.from(
+        document.querySelectorAll('.aside-panel:not([hidden]) .aside-context-block')
+      ).find((candidate) => candidate.textContent?.includes('preceding question'));
+      row?.querySelector('input')?.click();
+    });
+
+    const contextPreview = await page.evaluate(
+      () =>
+        document.querySelector('.aside-panel:not([hidden]) .aside-context-preview')?.textContent ?? ''
+    );
+
+    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
 
     const darkThemeState = await page.evaluate(() => ({
       theme: document.documentElement.dataset.asideTheme ?? null,
@@ -658,7 +721,15 @@ async function runNonProjectScenario(browser) {
       ),
       promptContainsLocalSourceAnswer: Boolean(
         branch.prompt?.includes('The convexity assumption guarantees the relaxation stays tight')
-      )
+      ),
+      contextPreviewMatchesPrompt: Boolean(contextPreview && branch.prompt?.includes(contextPreview)),
+      contextSource: contextBefore.source,
+      precedingQuestionOffered: contextBefore.blockLabels.some((label) =>
+        label.includes('preceding question')
+      ),
+      precedingQuestionDefaultOff: contextBefore.precedingIncluded.every((checked) => checked === false),
+      precedingQuestionAbsentByDefault: !contextBefore.preview.includes('Tell me about convexity'),
+      precedingQuestionAppearsWhenOptedIn: contextAfterOptIn.includes('Tell me about convexity')
     }));
 
     await clickPanelAction(page, 'Minimize');
@@ -986,7 +1057,7 @@ async function runTemporaryChatUnconfirmedScenario(browser) {
   try {
     await openDraft(page);
     await setPanelBranchKind(page, 'Temporary');
-    await page.type('.aside-panel:not([hidden]) textarea', 'Why this assumption?');
+    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
     await page.evaluate(() => {
       const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
       if (!(button instanceof HTMLButtonElement)) {
@@ -1007,7 +1078,7 @@ async function runTemporaryChatUnconfirmedScenario(browser) {
           null,
         // The question must survive so the user can retry or switch mode.
         questionPreserved:
-          document.querySelector('.aside-panel:not([hidden]) textarea')?.value ?? null,
+          document.querySelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]')?.value ?? null,
         formVisible:
           getComputedStyle(document.querySelector('.aside-panel:not([hidden]) form')).display !==
           'none'
@@ -1050,7 +1121,7 @@ async function runTemporaryChatVerifiedScenario(browser) {
   try {
     await openDraft(page);
     await setPanelBranchKind(page, 'Temporary');
-    await page.type('.aside-panel:not([hidden]) textarea', PRIVATE_PROBE_QUESTION);
+    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', PRIVATE_PROBE_QUESTION);
     await page.evaluate(() => {
       const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
       if (!(button instanceof HTMLButtonElement)) {
@@ -1108,7 +1179,7 @@ async function runTemporaryChatBlockedScenario(browser) {
   try {
     await openDraft(page);
     await setPanelBranchKind(page, 'Temporary');
-    await page.type('.aside-panel:not([hidden]) textarea', 'Why this assumption?');
+    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
     await page.evaluate(() => {
       const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
       if (!(button instanceof HTMLButtonElement)) {
@@ -1203,7 +1274,7 @@ async function runCrossTabScenario(browser) {
     // Pin the mode: a previous scenario may have left "Temporary" remembered, which
     // would route this panel to session storage and make the assertions ambiguous.
     await setPanelBranchKind(tabA, 'Persistent');
-    await tabA.type('.aside-panel:not([hidden]) textarea', 'question from tab A');
+    await tabA.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'question from tab A');
     await sleep(700);
 
     // The panel under test, named explicitly: the shared profile also holds
@@ -1224,7 +1295,7 @@ async function runCrossTabScenario(browser) {
 
     // Tab B edits the shared panel; the authority accepts it.
     await tabB.evaluate((id) => {
-      const textarea = document.querySelector(`.aside-panel[data-panel-id="${id}"] textarea`);
+      const textarea = document.querySelector(`.aside-panel[data-panel-id="${id}"] textarea[data-aside-role="question"]`);
       textarea.focus();
       textarea.value = 'edited in tab B';
       textarea.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1253,7 +1324,7 @@ async function runCrossTabScenario(browser) {
     // Tab B, which still had it mounted a moment ago, writes again. A stale
     // whole-store write would bring the panel straight back.
     await tabB.evaluate((id) => {
-      const textarea = document.querySelector(`.aside-panel[data-panel-id="${id}"] textarea`);
+      const textarea = document.querySelector(`.aside-panel[data-panel-id="${id}"] textarea[data-aside-role="question"]`);
       if (textarea) {
         textarea.focus();
         textarea.value = 'late write from tab B';
@@ -1301,7 +1372,7 @@ async function runFailureScenario(browser) {
   try {
     await openDraft(page);
     await setPanelBranchKind(page, 'Persistent');
-    await page.type('.aside-panel:not([hidden]) textarea', 'Why this assumption?');
+    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
     const pageCountBefore = (await browser.pages()).length;
     await page.evaluate(() => {
       const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
@@ -1474,7 +1545,9 @@ try {
       why.branchLocation !== 'https://chatgpt.com/c/generated-why' ||
       !why.openBranchVisible ||
       !why.assistantText?.includes('This uses only the selected passage.') ||
-      !why.prompt?.includes('USER QUESTION\nWhy?')
+      !why.prompt?.includes('QUESTION\nWhy?') ||
+      // The excerpt must be framed as fallible, not as truth to defend.
+      !why.prompt?.includes('fallible excerpt')
     )
   ) {
     throw new Error(`Why action scenario failed: ${JSON.stringify(why)}`);
@@ -1508,7 +1581,7 @@ try {
   if (
     enterOnly.status !== 'Branch answer is ready in this window.' ||
     enterOnly.branchLocation !== 'https://chatgpt.com/c/generated-enter-only' ||
-    !enterOnly.prompt?.includes('USER QUESTION')
+    !enterOnly.prompt?.includes('QUESTION')
   ) {
     throw new Error(`Enter-only scenario failed: ${JSON.stringify(enterOnly)}`);
   }

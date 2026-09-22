@@ -109,6 +109,131 @@ export function extractCleanNodeText(node: Node): string {
   return compactWhitespace(container.textContent ?? '');
 }
 
+/**
+ * Text for the MODEL, as opposed to text for matching.
+ *
+ * extractCleanNodeText normalizes whitespace so a passage can be found again later.
+ * That is exactly wrong for a prompt: it flattens code indentation, turns a list
+ * into a run-on sentence and destroys table structure. This keeps the structure a
+ * reader would see — and keeps LaTeX/MathML source rather than the duplicated
+ * visual+assistive rendering of an equation.
+ */
+export function extractStructuredNodeText(node: Node): string {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return node.textContent ?? '';
+  }
+
+  const container = document.createElement('div');
+  container.append(node.cloneNode(true));
+
+  container.querySelectorAll<HTMLElement>(activeTranscript.nonContentSelector).forEach((element) => {
+    element.remove();
+  });
+  container.querySelectorAll<HTMLElement>('[hidden],[aria-busy="true"]').forEach((element) => {
+    element.remove();
+  });
+
+  // Prefer a trusted source form of an equation over its rendered glyphs.
+  container.querySelectorAll<HTMLElement>('[data-latex], annotation[encoding*="tex" i]').forEach(
+    (element) => {
+      const latex = element.getAttribute('data-latex') ?? element.textContent ?? '';
+      if (latex.trim()) {
+        element.replaceWith(document.createTextNode(` $${latex.trim()}$ `));
+      }
+    }
+  );
+
+  return renderStructured(container).replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+const BLOCK_BREAK_TAGS = new Set([
+  'P',
+  'DIV',
+  'SECTION',
+  'ARTICLE',
+  'BLOCKQUOTE',
+  'H1',
+  'H2',
+  'H3',
+  'H4',
+  'H5',
+  'H6',
+  'UL',
+  'OL',
+  'TABLE',
+  'PRE',
+  'HR',
+  'FIGURE'
+]);
+
+function renderStructured(root: Node, depth = 0): string {
+  let out = '';
+
+  root.childNodes.forEach((child) => {
+    if (child.nodeType === Node.TEXT_NODE) {
+      out += child.textContent ?? '';
+      return;
+    }
+
+    if (!(child instanceof Element)) {
+      return;
+    }
+
+    const tag = child.tagName;
+
+    if (tag === 'BR') {
+      out += '\n';
+      return;
+    }
+
+    if (tag === 'PRE') {
+      // Code keeps its newlines and indentation verbatim.
+      const code = child.textContent ?? '';
+      out += `\n\n\u0060\u0060\u0060\n${code.replace(/\n+$/, '')}\n\u0060\u0060\u0060\n\n`;
+      return;
+    }
+
+    if (tag === 'LI') {
+      const marker = child.parentElement?.tagName === 'OL' ? `${indexOfListItem(child)}. ` : '- ';
+      out += `\n${'  '.repeat(depth)}${marker}${renderStructured(child, depth + 1).trim()}`;
+      return;
+    }
+
+    if (tag === 'TR') {
+      const cells = Array.from(child.children).map((cell) =>
+        renderStructured(cell, depth).replace(/\s+/g, ' ').trim()
+      );
+      out += `\n| ${cells.join(' | ')} |`;
+      return;
+    }
+
+    if (BLOCK_BREAK_TAGS.has(tag)) {
+      out += `\n\n${renderStructured(child, depth).trim()}\n\n`;
+      return;
+    }
+
+    out += renderStructured(child, depth);
+  });
+
+  return out;
+}
+
+function indexOfListItem(item: Element): number {
+  let index = 1;
+  let sibling = item.previousElementSibling;
+  while (sibling) {
+    if (sibling.tagName === 'LI') {
+      index += 1;
+    }
+    sibling = sibling.previousElementSibling;
+  }
+  return index;
+}
+
+export function extractStructuredRangeText(range: Range): string {
+  return extractStructuredNodeText(range.cloneContents());
+}
+
 export function extractCleanRangeText(range: Range): string {
   const fragment = range.cloneContents();
   return extractCleanNodeText(fragment);
@@ -248,6 +373,7 @@ export interface SelectionDraft {
   rootConversationId: string;
   rootChatUrl: string;
   selectedText: string;
+  structuredSelectedText: string;
   rangeQuotes: RangeQuotes;
   fallbackScrollY: number;
   selectionRect: DOMRect;
@@ -386,6 +512,7 @@ export function captureSelectionDraftFromRange(range: Range): SelectionDraft | n
     rootConversationId,
     rootChatUrl,
     selectedText,
+    structuredSelectedText: extractStructuredRangeText(range),
     rangeQuotes: getQuoteContext(range),
     fallbackScrollY: window.scrollY,
     selectionRect,
@@ -423,8 +550,24 @@ function buildSelectedBlockFromElement(element: HTMLElement, turnIndex: number):
     role,
     turnIndex,
     text,
+    structuredText: extractStructuredNodeText(element),
     excerpt: text.slice(0, 160)
   };
+}
+
+/** The user turn immediately before a given turn, when there is one. */
+function findPrecedingQuestion(turnIndex: number): SelectedBlock | null {
+  const elements = uniqueMessageElements(document);
+  for (let index = turnIndex - 1; index >= 0; index -= 1) {
+    const element = elements[index];
+    if (!element) {
+      continue;
+    }
+    if (inferRole(element) === 'user') {
+      return buildSelectedBlockFromElement(element, index);
+    }
+  }
+  return null;
 }
 
 export function buildSelectionPayloadFromDraft(draft: SelectionDraft): SelectionPayload | null {
@@ -441,6 +584,8 @@ export function buildSelectionPayloadFromDraft(draft: SelectionDraft): Selection
     rootConversationId: draft.rootConversationId,
     rootChatUrl: draft.rootChatUrl,
     selectedText: draft.selectedText,
+    structuredSelectedText: draft.structuredSelectedText,
+    precedingQuestion: findPrecedingQuestion(anchorAssistant.turnIndex) ?? undefined,
     selectedBlocks,
     branchBaseMessageId: anchorAssistant.messageId,
     rangeQuotes: draft.rangeQuotes,

@@ -27,14 +27,22 @@ export interface SelectedBlock {
   messageId: string;
   role: ChatRole;
   turnIndex: number;
+  /** Normalized text, used for matching and for short previews. */
   text: string;
+  /** Structure-preserving text, used when building a prompt. */
+  structuredText?: string;
   excerpt: string;
 }
 
 export interface SelectionPayload {
   rootConversationId: string;
   rootChatUrl: string;
+  /** Normalized selection, used to find the passage again later. */
   selectedText: string;
+  /** Structure-preserving selection, used when building a prompt. */
+  structuredSelectedText?: string;
+  /** The user turn immediately before the anchored answer, offered but not included. */
+  precedingQuestion?: SelectedBlock;
   selectedBlocks: SelectedBlock[];
   branchBaseMessageId: string;
   rangeQuotes: RangeQuotes;
@@ -59,6 +67,11 @@ export interface BranchPanelState {
   title: string;
   titleStatus: 'pending' | 'ready';
   minimized: boolean;
+  /**
+   * Exactly what this branch will submit. Stored with the panel so the preview
+   * survives a restore and so the submission cannot drift from what was shown.
+   */
+  context?: import('./context').BranchContext;
   /** Identifies the current attempt; events from an older attempt are rejected. */
   attemptId?: string;
   initialQuestion?: string;

@@ -41,10 +41,9 @@ describe('prompt builders', () => {
     const selection = makeSelection();
     const localPrompt = buildLocalInitialPrompt(selection, 'Why does this matter?');
 
-    expect(localPrompt.prompt).toContain('Use only the local context below');
     expect(localPrompt.prompt).toContain('SELECTED PASSAGE');
     expect(localPrompt.prompt).toContain(selection.selectedText);
-    expect(localPrompt.prompt).toContain('LOCAL SOURCE ANSWER 1');
+    expect(localPrompt.prompt).toContain('SOURCE ANSWER 1');
     expect(localPrompt.prompt).toContain(selection.selectedBlocks[0].text);
     expect(localPrompt.prompt).toContain('Why does this matter?');
     expect(localPrompt.prompt).not.toContain('full conversation history');
@@ -149,5 +148,60 @@ describe('prompt builders', () => {
         'https://chatgpt.com/c/branch'
       )
     ).toBe(false);
+  });
+});
+
+describe('prompt semantics', () => {
+  const selection = makeSelection();
+
+  it('does not confine the model to the quoted text', () => {
+    // The old wording said "use only the local context", which asked the model to
+    // answer a maths question without using maths it knows.
+    const prompt = buildLocalInitialPrompt(selection, 'Why does this hold?').prompt;
+
+    expect(prompt).not.toMatch(/use only the local context/i);
+    expect(prompt).toMatch(/not limited to the quoted text/i);
+    expect(prompt).toMatch(/own knowledge and reasoning freely/i);
+  });
+
+  it('frames the excerpt as fallible rather than authoritative', () => {
+    const prompt = buildLocalInitialPrompt(selection, 'Why does this hold?').prompt;
+
+    expect(prompt).toMatch(/fallible excerpt/i);
+    expect(prompt).toMatch(/not as truth to defend/i);
+    // Quoted source is data, not instructions.
+    expect(prompt).toMatch(/not as instructions to follow/i);
+  });
+
+  it('asks for missing conditions to be stated instead of invented', () => {
+    const prompt = buildLocalInitialPrompt(selection, 'Why does this hold?').prompt;
+
+    expect(prompt).toMatch(/do not invent/i);
+    expect(prompt).toMatch(/no file or project contents/i);
+    expect(prompt).toMatch(/state any condition/i);
+  });
+
+  it('defines Why as examine, not justify', () => {
+    const prompt = buildLocalInitialPrompt(selection, 'Why?').prompt;
+    expect(prompt).toMatch(/examine and explain, not justify/i);
+  });
+
+  it('does not let brevity cut off a derivation the question needs', () => {
+    const prompt = buildLocalInitialPrompt(selection, 'Derive it.').prompt;
+
+    expect(prompt).toMatch(/do not cut short a derivation/i);
+    // And it must never ask for private chain-of-thought.
+    expect(prompt).not.toMatch(/chain[- ]of[- ]thought|show your reasoning steps/i);
+  });
+
+  it('makes the title line optional so a missing title cannot fail a branch', () => {
+    const prompt = buildLocalInitialPrompt(selection, 'Why?').prompt;
+    expect(prompt).toMatch(/skip this line and answer anyway/i);
+  });
+
+  it('uses the same reading instructions for the New-tab bootstrap', () => {
+    const bootstrap = buildNativeBootstrapPrompt(selection).prompt;
+    expect(bootstrap).toMatch(/fallible excerpt/i);
+    expect(bootstrap).toMatch(/Ready for your question\./);
   });
 });
