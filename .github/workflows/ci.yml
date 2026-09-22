@@ -1,0 +1,89 @@
+name: CI
+
+# Validation only. This workflow never publishes: deployment lives in pages.yml and
+# is gated to pushes on main.
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Unit and integration tests
+        run: npm test
+
+      - name: Build extension bundle
+        run: npm run build
+
+      # The browser is pinned explicitly rather than assumed to be on the image,
+      # so a runner image change cannot silently skip the smoke.
+      - name: Install Chrome for the offline smoke
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Offline browser smoke (ChatGPT and Claude)
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: npm run smoke:local
+
+      - name: Dependency audit
+        # Reported, not enforced: a devDependency advisory is not an installed
+        # extension exploit. Runtime exposure is assessed in the pull request.
+        run: npm audit --json > npm-audit.json || true
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit
+          path: npm-audit.json
+          if-no-files-found: ignore
+
+  public-export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Catches release blockers (personal paths, .DS_Store, stale branding) on the
+      # tree that would actually be published, not on a developer's working copy.
+      - name: Export and audit the public tree
+        run: |
+          node ./scripts/export-public.mjs "${RUNNER_TEMP}/aside-public"
+          node ./scripts/audit-submission.mjs "${RUNNER_TEMP}/aside-public/course-submission"
