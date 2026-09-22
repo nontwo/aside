@@ -18,6 +18,9 @@ npm run build
 3. Hard-reload `chatgpt.com` and `claude.ai`. The content script is injected on
    page load only.
 
+Reference images captured from the fixtures live in
+[`docs/layout-evidence/`](./layout-evidence/).
+
 ## Checklist
 
 ### 1. Native options still work
