@@ -37,6 +37,8 @@ import {
   stripHiddenTitle
 } from '../shared/prompts';
 import { attachElementToHost, ensureExtensionHostElement } from './ui-host';
+import { VIEWPORT_MARGIN, findLeftGutterSlot, findSafePlacement } from '../shared/placement';
+import type { Rect } from '../shared/placement';
 import {
   getActionLabel,
   getSendCandidateProfile,
@@ -135,6 +137,8 @@ declare global {
 
 const PANEL_CLASS = 'aside-panel';
 const PANEL_TABBAR_ID = 'aside-tabbar';
+const ASIDE_LAUNCHER_ID = 'aside-launcher';
+const RAIL_WIDTH_PX = 96;
 const FRAME_AUTOMATION_STYLE_ID = 'aside-frame-automation-style';
 const EXTENSION_HOST_ID = 'aside-root';
 const TITLE_WATCH_TIMEOUT_MS = 120_000;
@@ -150,15 +154,6 @@ const PERSIST_DEBOUNCE_MS = 300;
 // back to the question form.
 const FRAME_HANDSHAKE_TIMEOUT_MS = 25_000;
 const BRANCH_RESPONSE_TIMEOUT_MS = 180_000;
-const SELECTION_ACTION_PATTERNS = [
-  /ask\s*chatgpt/i,
-  /询问\s*chatgpt/i,
-  /问\s*chatgpt/i,
-  /向\s*chatgpt\s*提问/i,
-  /chat\s+with\s+chatgpt/i,
-  /与\s*chatgpt\s*聊天/i
-];
-
 let currentSelectionPayload: SelectionPayload | null = null;
 let currentSelectionDraft: SelectionDraft | null = null;
 let currentSelectionRect: DOMRect | null = null;
@@ -171,20 +166,18 @@ let tabBar: HTMLDivElement | null = null;
 let highlightOverlay: HTMLDivElement | null = null;
 let highlightOverlayTimer: number | undefined;
 let selectionTimer: number | undefined;
-let askTriggerTimer: number | undefined;
 let lastKnownUrl = normalizeChatUrl(window.location.href);
 let cleanupFns: Array<() => void> = [];
 const panelRuntimes = new Map<string, PanelRuntime>();
-let selectionActionObserver: MutationObserver | null = null;
+let nativeLayoutObserver: MutationObserver | null = null;
+let layoutSyncFrame: number | undefined;
+let asideLauncher: HTMLButtonElement | null = null;
 let themeObserver: MutationObserver | null = null;
 let activeTheme: ThemeMode | null = null;
 let pendingUrlChangeToken = 0;
 let lastUsedBranchKind: BranchKind = 'persistent';
-let selectionActionMutationMuted = false;
-let selectionActionRefreshTimer: number | undefined;
 let isEvaluatingSelection = false;
 let pendingDraftFocusPanelId: string | null = null;
-const suppressedSelectionActions = new Set<HTMLElement>();
 // Panels the user closed on purpose. Everything else found in storage belongs to another
 // conversation (or another tab) and has to survive a write from this page.
 const closedPanelIds = new Set<string>();
@@ -705,10 +698,15 @@ function ensureStyles(): void {
       transform: translateY(-1px);
     }
 
-    .aside-selection-suppressed {
-      display: none !important;
-      visibility: hidden !important;
-      pointer-events: none !important;
+    .aside-toolbar-brand {
+      display: inline-flex;
+      align-items: center;
+      padding-right: 2px;
+      font: 600 11px/1 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      opacity: 0.62;
+      user-select: none;
     }
 
     .aside-kind-toggle {
@@ -739,8 +737,6 @@ function ensureStyles(): void {
     #${PANEL_TABBAR_ID} {
       --sb-tab-width: 96px;
       position: fixed;
-      top: 96px;
-      bottom: 20px;
       z-index: 2147483645;
       display: flex;
       flex-direction: column;
@@ -755,8 +751,33 @@ function ensureStyles(): void {
       scrollbar-width: none;
     }
 
-    #${PANEL_TABBAR_ID}[data-placement="edge"] {
-      right: 8px;
+    /* Geometry comes from findLeftGutterSlot; these are only the fallbacks used
+       before the first measurement. */
+    #${PANEL_TABBAR_ID}[data-placement="left-gutter"] {
+      top: 96px;
+      bottom: 20px;
+      left: 12px;
+    }
+
+    #${ASIDE_LAUNCHER_ID} {
+      position: fixed;
+      z-index: 2147483645;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--sb-border-strong, rgba(15, 23, 42, 0.14));
+      background: var(--sb-chip-bg, rgba(255, 255, 255, 0.98));
+      color: var(--sb-text, #111827);
+      font: 500 12px/1.2 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      cursor: pointer;
+      pointer-events: auto;
+      box-shadow: 0 6px 18px rgba(15, 23, 42, 0.12);
+    }
+
+    #${ASIDE_LAUNCHER_ID}[hidden] {
+      display: none;
     }
 
     #${PANEL_TABBAR_ID}[hidden] {
@@ -1139,6 +1160,13 @@ function ensureStyles(): void {
   document.head.append(style);
 }
 
+/**
+ * Forces provider controls visible and clickable so automation can drive them.
+ *
+ * This is a blunt override of provider rendering, so it is installed ONLY in the
+ * branch surface Aside is driving — never in the page the user is reading. It is
+ * also removed on cleanup rather than left behind.
+ */
 function ensureFrameAutomationStyles(): void {
   if (document.getElementById(FRAME_AUTOMATION_STYLE_ID)) {
     return;
@@ -1166,6 +1194,7 @@ function ensureFrameAutomationStyles(): void {
     }
   `;
   document.head.append(style);
+  cleanupFns.push(() => style.remove());
 }
 
 function ensureExtensionHost(): HTMLDivElement {
@@ -1197,21 +1226,33 @@ function ensureSelectionToolbar(): HTMLDivElement {
     selectionToolbar = document.createElement('div');
     selectionToolbar.id = SELECTION_TOOLBAR_ID;
     selectionToolbar.hidden = true;
+    // The toolbar is Aside's, and says so: it sits next to the provider's own
+    // selection actions rather than replacing them.
+    selectionToolbar.setAttribute('role', 'toolbar');
+    selectionToolbar.setAttribute('aria-label', 'Aside branch actions');
+
+    const brand = document.createElement('span');
+    brand.className = 'aside-toolbar-brand';
+    brand.textContent = 'Aside';
+    brand.setAttribute('aria-hidden', 'true');
 
     askButton = document.createElement('button');
     askButton.id = ASK_BUTTON_ID;
     askButton.type = 'button';
     askButton.textContent = 'Ask';
+    askButton.setAttribute('aria-label', 'Ask in Aside about the selected passage');
 
     whyButton = document.createElement('button');
     whyButton.id = WHY_BUTTON_ID;
     whyButton.type = 'button';
     whyButton.textContent = 'Why';
+    whyButton.setAttribute('aria-label', 'Ask in Aside why the selected passage holds');
 
     newTabButton = document.createElement('button');
     newTabButton.id = NEW_TAB_BUTTON_ID;
     newTabButton.type = 'button';
     newTabButton.textContent = 'New-tab';
+    newTabButton.setAttribute('aria-label', 'Open an Aside branch in a new window');
 
     askButton.addEventListener('click', (event) => {
       event.preventDefault();
@@ -1229,7 +1270,7 @@ function ensureSelectionToolbar(): HTMLDivElement {
       openDraftFromCurrentSelection('new_tab');
     });
 
-    selectionToolbar.append(askButton, whyButton, newTabButton);
+    selectionToolbar.append(brand, askButton, whyButton, newTabButton);
   }
 
   return mountInExtensionHost(selectionToolbar);
@@ -1241,25 +1282,6 @@ function hideSelectionToolbar(): void {
   }
 }
 
-// MutationObserver callbacks run at the microtask checkpoint, long after a synchronous
-// `muted = false` has been reached. Discarding the records we just caused is what
-// actually stops the observer from re-triggering itself in a loop.
-function discardSelfInflictedMutations(): void {
-  selectionActionObserver?.takeRecords();
-  selectionActionMutationMuted = false;
-}
-
-function restoreSuppressedSelectionActions(): void {
-  selectionActionMutationMuted = true;
-  suppressedSelectionActions.forEach((element) => {
-    if (element.isConnected) {
-      element.classList.remove('aside-selection-suppressed');
-    }
-  });
-  suppressedSelectionActions.clear();
-  discardSelfInflictedMutations();
-}
-
 function hideAskButton(clearSelection = true): void {
   if (clearSelection) {
     currentSelectionDraft = null;
@@ -1267,7 +1289,6 @@ function hideAskButton(clearSelection = true): void {
     currentSelectionRect = null;
   }
   hideSelectionToolbar();
-  restoreSuppressedSelectionActions();
 }
 
 function getSelectionDraftFromWindow(): SelectionDraft | null {
@@ -1326,21 +1347,98 @@ function openDraftFromCurrentSelection(entryAction: BranchEntryAction): void {
       branchKind
     });
   }
-  window.getSelection()?.removeAllRanges();
-  hideAskButton();
+  // Deliberately does NOT clear the selection: the provider's native selection
+  // options must remain usable after Aside has been invoked.
+  hideAskButton(false);
+}
+
+function toRect(domRect: DOMRect | { top: number; left: number; width: number; height: number }): Rect {
+  return { top: domRect.top, left: domRect.left, width: domRect.width, height: domRect.height };
+}
+
+/**
+ * Measure — never modify — the provider rectangles Aside must stay clear of.
+ *
+ * Elements are read with getBoundingClientRect only. Nothing here changes styles,
+ * attributes, event handlers or hit targets on provider DOM.
+ */
+function collectReservedRegions(includeSelectionToolbar = true): Rect[] {
+  const selectors = provider.layout.reservedRegionSelectors.map((entry) => entry.selector);
+  if (includeSelectionToolbar) {
+    selectors.push(...provider.layout.nativeSelectionToolbarSelectors);
+  }
+
+  const seen = new Set<Element>();
+  const rects: Rect[] = [];
+
+  selectors.forEach((selector) => {
+    let matches: HTMLElement[];
+    try {
+      matches = Array.from(document.querySelectorAll<HTMLElement>(selector));
+    } catch {
+      return;
+    }
+
+    matches.forEach((element) => {
+      if (seen.has(element) || isAsideOwned(element)) {
+        return;
+      }
+      seen.add(element);
+
+      const rect = element.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        rects.push(toRect(rect));
+      }
+    });
+  });
+
+  return rects;
+}
+
+/** True for nodes inside Aside's own host, so shared logic never mistakes them for provider UI. */
+function isAsideOwned(node: Node | null): boolean {
+  if (!node) {
+    return false;
+  }
+  const element = node instanceof Element ? node : node.parentElement;
+  return Boolean(element?.closest(`#${EXTENSION_HOST_ID}`));
 }
 
 function positionSelectionToolbar(rect: DOMRect): void {
   const toolbar = ensureSelectionToolbar();
   currentSelectionRect = rect;
+
+  // Make it measurable before deciding where it goes: guessing a width is how the
+  // toolbar used to end up on top of the provider's own selection menu.
   toolbar.hidden = false;
-  const estimatedWidth = 236;
-  const left = Math.max(
-    16,
-    Math.min(window.innerWidth - estimatedWidth - 16, rect.left + rect.width / 2 - estimatedWidth / 2)
-  );
-  toolbar.style.top = `${Math.max(16, rect.top - 56)}px`;
-  toolbar.style.left = `${left}px`;
+  toolbar.style.visibility = 'hidden';
+  const measured = toolbar.getBoundingClientRect();
+  const size = {
+    width: measured.width || 236,
+    height: measured.height || 40
+  };
+
+  const placement = findSafePlacement({
+    anchor: toRect(rect),
+    size,
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+    reserved: collectReservedRegions()
+  });
+
+  if (!placement) {
+    // No safe spot around the selection. Rather than covering a native control or
+    // winning with z-index, collapse to the compact launcher in the left rail.
+    toolbar.hidden = true;
+    toolbar.style.visibility = '';
+    setCompactLauncherVisible(true);
+    return;
+  }
+
+  setCompactLauncherVisible(false);
+  toolbar.style.top = `${placement.top}px`;
+  toolbar.style.left = `${placement.left}px`;
+  toolbar.dataset.side = placement.side;
+  toolbar.style.visibility = '';
 }
 
 // The toolbar is positioned with viewport coordinates, so it has to be re-anchored
@@ -1382,7 +1480,6 @@ function syncSelectionToolbarToViewport(): void {
   const rect = getLiveSelectionRect();
   if (!rect || rect.bottom <= 0 || rect.top >= window.innerHeight) {
     hideSelectionToolbar();
-    restoreSuppressedSelectionActions();
     return;
   }
 
@@ -1400,48 +1497,6 @@ function isElementVisible(element: HTMLElement): boolean {
     style.visibility !== 'hidden' &&
     Number(style.opacity || '1') > 0.01
   );
-}
-
-function isSelectionActionNearRect(element: HTMLElement, rect: DOMRect): boolean {
-  const elementRect = element.getBoundingClientRect();
-  const horizontalGap =
-    elementRect.left > rect.right
-      ? elementRect.left - rect.right
-      : rect.left > elementRect.right
-        ? rect.left - elementRect.right
-        : 0;
-  const verticalGap =
-    elementRect.top > rect.bottom
-      ? elementRect.top - rect.bottom
-      : rect.top > elementRect.bottom
-        ? rect.top - elementRect.bottom
-        : 0;
-
-  return horizontalGap <= 220 && verticalGap <= 140;
-}
-
-function syncAskTriggerVisibility(): void {
-  if (!currentSelectionDraft || !currentSelectionRect) {
-    hideAskButton();
-    return;
-  }
-
-  refreshSelectionActionButtons();
-  positionSelectionToolbar(currentSelectionRect);
-}
-
-function scheduleAskTriggerSync(delayMs = ASK_TRIGGER_SYNC_DELAY_MS): void {
-  window.clearTimeout(askTriggerTimer);
-  askTriggerTimer = window.setTimeout(() => {
-    syncAskTriggerVisibility();
-  }, delayMs);
-}
-
-function scheduleSelectionActionRefresh(delayMs = ASK_TRIGGER_SYNC_DELAY_MS): void {
-  window.clearTimeout(selectionActionRefreshTimer);
-  selectionActionRefreshTimer = window.setTimeout(() => {
-    refreshSelectionActionButtons();
-  }, delayMs);
 }
 
 function evaluateSelection(): void {
@@ -1483,8 +1538,6 @@ function evaluateSelection(): void {
     currentSelectionPayload = null;
     currentSelectionRect = draft.selectionRect;
     positionSelectionToolbar(draft.selectionRect);
-    scheduleSelectionActionRefresh(0);
-    scheduleAskTriggerSync();
   } catch {
     hideAskButton();
   } finally {
@@ -1492,112 +1545,179 @@ function evaluateSelection(): void {
   }
 }
 
-function normalizeButtonLabel(element: Element): string {
-  if (!(element instanceof HTMLElement)) {
-    return '';
-  }
-
-  return compactWhitespace(
-    element.getAttribute('aria-label') || element.innerText || element.textContent || ''
-  ).toLowerCase();
+/**
+ * Aside used to hide the provider's own selection actions to make room for itself.
+ * That behaviour is gone. This only removes the class an older build may still have
+ * left on a provider button, so an upgrade does not leave a native control hidden.
+ * It touches nothing else and runs once per document.
+ */
+function undoLegacySelectionSuppression(): void {
+  document
+    .querySelectorAll<HTMLElement>('.aside-selection-suppressed')
+    .forEach((element) => element.classList.remove('aside-selection-suppressed'));
 }
 
-function isLikelySelectionActionButton(element: Element): boolean {
-  const label = normalizeButtonLabel(element);
-  if (!label) {
-    return false;
-  }
-
-  return SELECTION_ACTION_PATTERNS.some((pattern) => pattern.test(label));
-}
-
-function containsLikelySelectionAction(element: Element): boolean {
-  if (isLikelySelectionActionButton(element)) {
-    return true;
-  }
-
-  return Array.from(element.querySelectorAll('button, [role="button"]')).some((candidate) =>
-    isLikelySelectionActionButton(candidate)
-  );
-}
-
-function refreshSelectionActionButtons(_root: ParentNode = document): void {
-  const candidates = Array.from(document.querySelectorAll<HTMLElement>('button, [role="button"]')).filter(
-    (element, index, elements) => {
-      return elements.indexOf(element) === index && isLikelySelectionActionButton(element);
-    }
-  );
-
-  restoreSuppressedSelectionActions();
-
-  const selectionRect = currentSelectionRect;
-  if (!currentSelectionDraft || !selectionRect) {
-    return;
-  }
-
-  const suppressAllWhileToolbarVisible = Boolean(selectionToolbar && !selectionToolbar.hidden);
-
-  selectionActionMutationMuted = true;
-  candidates.forEach((button) => {
-    if (
-      isElementVisible(button) &&
-      (suppressAllWhileToolbarVisible || isSelectionActionNearRect(button, selectionRect))
-    ) {
-      button.classList.add('aside-selection-suppressed');
-      suppressedSelectionActions.add(button);
-    }
-  });
-  discardSelfInflictedMutations();
-}
-
-function installSelectionActionObserver(): void {
-  selectionActionObserver?.disconnect();
-  selectionActionObserver = new MutationObserver((mutations) => {
-    if (selectionActionMutationMuted || !selectionToolbar || selectionToolbar.hidden || !currentSelectionDraft) {
-      return;
-    }
-
-    const shouldRefresh = mutations.some((mutation) => {
-      if (
-        mutation.target instanceof Element &&
-        mutation.target.closest(`#${SELECTION_TOOLBAR_ID}, .${PANEL_CLASS}, #${PANEL_TABBAR_ID}`)
-      ) {
+/**
+ * Watch for provider layout changes so Aside can re-measure and move itself.
+ *
+ * Deliberately observes only what affects geometry, never mutates what it sees, and
+ * ignores mutations inside Aside's own host so it cannot retrigger itself.
+ */
+function installNativeLayoutObserver(): void {
+  nativeLayoutObserver?.disconnect();
+  nativeLayoutObserver = new MutationObserver((mutations) => {
+    const relevant = mutations.some((mutation) => {
+      if (isAsideOwned(mutation.target)) {
         return false;
       }
-
-      if (mutation.type === 'attributes' && mutation.target instanceof Element) {
-        return isLikelySelectionActionButton(mutation.target);
-      }
-
-      return Array.from(mutation.addedNodes).some((node) => {
-        if (!(node instanceof Element)) {
-          return false;
-        }
-        if (node.closest(`#${SELECTION_TOOLBAR_ID}, .${PANEL_CLASS}, #${PANEL_TABBAR_ID}`)) {
-          return false;
-        }
-        return containsLikelySelectionAction(node);
-      });
+      return (
+        mutation.type === 'attributes' ||
+        mutation.addedNodes.length > 0 ||
+        mutation.removedNodes.length > 0
+      );
     });
 
-    if (shouldRefresh) {
-      scheduleSelectionActionRefresh(0);
+    if (relevant) {
+      scheduleLayoutSync();
     }
   });
 
-  selectionActionObserver.observe(document.body, {
+  nativeLayoutObserver.observe(document.body, {
     attributes: true,
-    attributeFilter: ['class', 'style', 'hidden', 'aria-hidden'],
+    attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'data-state'],
     childList: true,
     subtree: true
   });
 
   cleanupFns.push(() => {
-    selectionActionObserver?.disconnect();
-    selectionActionObserver = null;
-    window.clearTimeout(askTriggerTimer);
-    window.clearTimeout(selectionActionRefreshTimer);
+    nativeLayoutObserver?.disconnect();
+    nativeLayoutObserver = null;
+    if (layoutSyncFrame !== undefined) {
+      window.cancelAnimationFrame(layoutSyncFrame);
+      layoutSyncFrame = undefined;
+    }
   });
+}
+
+/** One measurement per frame, however many mutations arrive. */
+function scheduleLayoutSync(): void {
+  if (layoutSyncFrame !== undefined) {
+    return;
+  }
+
+  layoutSyncFrame = window.requestAnimationFrame(() => {
+    layoutSyncFrame = undefined;
+    positionTabBar();
+    syncSelectionToolbarToViewport();
+  });
+}
+
+function ensureCompactLauncher(): HTMLButtonElement {
+  if (!asideLauncher) {
+    document.getElementById(ASIDE_LAUNCHER_ID)?.remove();
+    asideLauncher = document.createElement('button');
+    asideLauncher.id = ASIDE_LAUNCHER_ID;
+    asideLauncher.type = 'button';
+    asideLauncher.hidden = true;
+    asideLauncher.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (currentSelectionDraft && currentSelectionRect) {
+        openDraftFromCurrentSelection('ask');
+        return;
+      }
+      const firstMinimized = sortPanels().find((runtime) => runtime.state.minimized);
+      if (firstMinimized) {
+        expandPanel(firstMinimized.state.panelId);
+      }
+    });
+  }
+
+  return mountInExtensionHost(asideLauncher);
+}
+
+/**
+ * The compact entry used when there is no safe room for the full toolbar or rail.
+ * It is placed in verified free space; it never covers an interactive native control.
+ */
+function setCompactLauncherVisible(visible: boolean): void {
+  const launcher = ensureCompactLauncher();
+  if (!visible) {
+    launcher.hidden = true;
+    return;
+  }
+
+  const minimizedCount = sortPanels().filter((runtime) => runtime.state.minimized).length;
+  launcher.textContent = minimizedCount ? `Aside (${minimizedCount})` : 'Aside';
+  launcher.setAttribute(
+    'aria-label',
+    minimizedCount ? `Aside: ${minimizedCount} minimized branches` : 'Aside branch actions'
+  );
+  launcher.hidden = false;
+
+  const size = launcher.getBoundingClientRect();
+  const slot = findLeftGutterSlot({
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+    readingColumn: readingColumnRect(),
+    reserved: collectReservedRegions(false),
+    size: { width: Math.max(size.width, 72), height: Math.max(size.height, 28) },
+    minWidth: 64
+  });
+
+  if (slot) {
+    launcher.style.left = `${slot.left}px`;
+    launcher.style.top = `${slot.top}px`;
+    return;
+  }
+
+  // Nothing safe on the page at all. Keep it out of the way at the bottom-left
+  // rather than covering provider chrome; the extension action remains the
+  // guaranteed entry point.
+  launcher.style.left = `${VIEWPORT_MARGIN}px`;
+  launcher.style.top = `${Math.max(VIEWPORT_MARGIN, window.innerHeight - size.height - VIEWPORT_MARGIN)}px`;
+}
+
+function readingColumnRect(): Rect | null {
+  const rect = provider.layout.getReadingColumnRect(document);
+  return rect && rect.width > 0 ? toRect(rect) : null;
+}
+
+/**
+ * Put the minimized rail in free LEFT-side whitespace.
+ *
+ * The provider's left navigation is a reserved rectangle, so the rail starts to the
+ * right of whatever chrome is present and shrinks to the space actually available.
+ * When the gutter is too tight to be readable the rail is replaced by the compact
+ * launcher rather than being forced back to the right edge over native controls.
+ */
+function positionTabBar(): void {
+  if (!tabBar || tabBar.hidden) {
+    return;
+  }
+
+  const minimizedCount = sortPanels().filter((runtime) => runtime.state.minimized).length;
+  const reserved = collectReservedRegions(false);
+  const slot = findLeftGutterSlot({
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+    readingColumn: readingColumnRect(),
+    reserved,
+    size: { width: RAIL_WIDTH_PX, height: window.innerHeight }
+  });
+
+  if (!slot) {
+    tabBar.hidden = true;
+    tabBar.dataset.placement = 'compact';
+    setCompactLauncherVisible(minimizedCount > 0);
+    return;
+  }
+
+  setCompactLauncherVisible(false);
+  tabBar.dataset.placement = 'left-gutter';
+  tabBar.style.left = `${slot.left}px`;
+  tabBar.style.top = `${slot.top}px`;
+  tabBar.style.height = `${slot.height}px`;
+  tabBar.style.bottom = 'auto';
+  tabBar.style.setProperty('--sb-tab-width', `${slot.width}px`);
 }
 
 function ensureTabBar(): HTMLDivElement {
@@ -2098,7 +2218,6 @@ function renderTabs(): void {
 
   const minimized = sortPanels().filter((runtime) => runtime.state.minimized);
   container.hidden = minimized.length === 0;
-  container.dataset.placement = 'edge';
 
   minimized.forEach((runtime) => {
     const tab = document.createElement('div');
@@ -2134,6 +2253,8 @@ function renderTabs(): void {
     tab.append(openButton, badge, closeButton);
     container.append(tab);
   });
+
+  positionTabBar();
 }
 
 function syncMountedUi(): void {
@@ -3311,7 +3432,8 @@ function installUrlObservers(): void {
 function initTopFrame(): void {
   installThemeObserver();
   ensureStyles();
-  ensureFrameAutomationStyles();
+  // Deliberately NOT ensureFrameAutomationStyles(): the page the user is reading
+  // keeps the provider's own rendering exactly as the provider authored it.
   installRuntimeMessageListener();
   syncMountedUi();
   void (async () => {
@@ -3322,8 +3444,8 @@ function initTopFrame(): void {
     scheduleMountedUiSync(350);
     scheduleMountedUiSync(1500);
   })();
-  installSelectionActionObserver();
-  refreshSelectionActionButtons();
+  undoLegacySelectionSuppression();
+  installNativeLayoutObserver();
 
   const selectionListener = () => {
     window.clearTimeout(selectionTimer);
@@ -3339,7 +3461,6 @@ function initTopFrame(): void {
   const resizeListener = () => {
     syncMountedUi();
     syncSelectionToolbarToViewport();
-    scheduleAskTriggerSync(0);
   };
   const pageshowListener = () => {
     syncMountedUi();
@@ -3361,11 +3482,23 @@ function initTopFrame(): void {
     void flushPersistedPanels();
   };
   const keydownListener = (event: KeyboardEvent) => {
-    if (event.key === 'Escape') {
-      const latestVisible = getVisiblePanels().at(-1);
-      if (latestVisible) {
-        minimizePanel(latestVisible.state.panelId);
-      }
+    if (event.key !== 'Escape' || event.defaultPrevented) {
+      return;
+    }
+
+    // Escape belongs to whatever the user is actually in. Only act when focus is
+    // inside Aside's own UI, and never preventDefault: the provider still needs
+    // Escape to dismiss its menus, cancel IME composition and blur its composer.
+    const target = event.target;
+    const insideAside =
+      target instanceof Node && Boolean(extensionHost && extensionHost.contains(target));
+    if (!insideAside) {
+      return;
+    }
+
+    const latestVisible = getVisiblePanels().at(-1);
+    if (latestVisible) {
+      minimizePanel(latestVisible.state.panelId);
     }
   };
 

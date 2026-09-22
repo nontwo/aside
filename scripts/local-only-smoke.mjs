@@ -20,13 +20,40 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function buildSourceHtml({ dark = false } = {}) {
+const LAYOUT_CHROME_CSS = `    <style>
+      :root { color-scheme: light; }
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: system-ui, sans-serif; }
+      nav[aria-label="Chat history"] {
+        position: fixed; top: 0; left: 0; bottom: 0; width: 260px;
+        background: #f6f6f6; border-right: 1px solid #e5e5e5; padding: 12px;
+      }
+      body[data-sidebar="collapsed"] nav[aria-label="Chat history"] { width: 56px; }
+      main {
+        margin-left: 260px; min-height: 100vh; padding: 72px 0 140px;
+        display: flex; flex-direction: column; align-items: center;
+      }
+      body[data-sidebar="collapsed"] main { margin-left: 56px; }
+      main article, main #turns { width: min(760px, 70%); }
+      main header { position: fixed; top: 0; left: 260px; right: 0; height: 56px; background: #fff; }
+      #composer-form, form#composer-form {
+        position: sticky; bottom: 16px; width: min(760px, 70%); margin-top: auto;
+      }
+      #search-form { width: min(760px, 70%); }
+    </style>`;
+
+const SIDEBAR_MARKUP = '<nav aria-label="Chat history"><div>Recent chats</div></nav>';
+
+function buildSourceHtml({ dark = false, sidebar = 'open' } = {}) {
   const htmlClass = dark ? ' class="dark" data-theme="dark"' : '';
   return `<!doctype html>
 <html${htmlClass}>
-  <head><meta charset="utf-8"><title>Fake ChatGPT Source</title></head>
-  <body>
+  <head><meta charset="utf-8"><title>Fake ChatGPT Source</title>
+${LAYOUT_CHROME_CSS}</head>
+  <body data-sidebar="${sidebar}">
+    ${SIDEBAR_MARKUP}
     <main>
+      <header>Fake header</header>
       <article data-message-author-role="user">
         <p>Tell me about convexity.</p>
       </article>
@@ -90,15 +117,17 @@ function buildSuccessComposerHtml({
 
   return `<!doctype html>
 <html${htmlClass}>
-  <head><meta charset="utf-8"><title>Fake ChatGPT Branch</title></head>
-  <body>
-    <main id="turns"></main>
+  <head><meta charset="utf-8"><title>Fake ChatGPT Branch</title>${LAYOUT_CHROME_CSS}</head>
+  <body data-sidebar="open">
+    ${SIDEBAR_MARKUP}
+    <main><header>Fake header</header><div id="turns"></div>
     ${decoyComposerMarkup}
     <form id="composer-form">
       <textarea ${realComposerId ? `id="${realComposerId}"` : ''} placeholder="有问题，尽管问" name="prompt-textarea" aria-label="与 ChatGPT 聊天"></textarea>
       ${temporaryChatMarkup}
       ${sendButtonMarkup}
     </form>
+    </main>
     ${confusingActionMarkup}
     <script>
       const temporaryChatToggle = document.getElementById('temporary-chat-toggle');
@@ -192,9 +221,10 @@ function buildSuccessComposerHtml({
 function buildFalsePositiveComposerHtml() {
   return `<!doctype html>
 <html>
-  <head><meta charset="utf-8"><title>Fake ChatGPT Failure</title></head>
-  <body>
-    <main id="turns"></main>
+  <head><meta charset="utf-8"><title>Fake ChatGPT Failure</title>${LAYOUT_CHROME_CSS}</head>
+  <body data-sidebar="open">
+    ${SIDEBAR_MARKUP}
+    <main><header>Fake header</header><div id="turns"></div></main>
     <form id="composer-form">
       <textarea id="prompt-textarea" placeholder="有问题，尽管问" name="prompt-textarea" aria-label="与 ChatGPT 聊天"></textarea>
     </form>
@@ -499,12 +529,52 @@ async function runNonProjectScenario(browser) {
         );
       });
       const nativeAsk = document.querySelector('button[aria-label="Ask ChatGPT"]');
+      const nativeStyle = nativeAsk instanceof HTMLElement ? getComputedStyle(nativeAsk) : null;
+      const nativeRect = nativeAsk?.getBoundingClientRect();
+      const toolbarRect = document
+        .querySelector('#aside-selection-toolbar')
+        ?.getBoundingClientRect();
+
+      // The provider's own action must stay fully usable, and Aside must sit beside
+      // it rather than on top of it.
+      const nativeAskUsable = Boolean(
+        nativeAsk instanceof HTMLElement &&
+          nativeStyle &&
+          nativeStyle.display !== 'none' &&
+          nativeStyle.visibility !== 'hidden' &&
+          Number(nativeStyle.opacity || '1') > 0.01 &&
+          nativeStyle.pointerEvents !== 'none' &&
+          !nativeAsk.hasAttribute('disabled') &&
+          nativeAsk.getAttribute('aria-hidden') !== 'true' &&
+          (nativeRect?.width ?? 0) > 0 &&
+          (nativeRect?.height ?? 0) > 0
+      );
+
+      // What the user's click would actually reach at the native button's centre.
+      const hitTarget =
+        nativeRect && nativeRect.width > 0
+          ? document.elementFromPoint(
+              nativeRect.left + nativeRect.width / 2,
+              nativeRect.top + nativeRect.height / 2
+            )
+          : null;
+
       return {
         visibleActions: buttons.map((button) => button.textContent?.trim() ?? ''),
-        nativeAskSuppressed:
-          nativeAsk instanceof HTMLElement
-            ? getComputedStyle(nativeAsk).display === 'none' || nativeAsk.classList.contains('aside-selection-suppressed')
-            : null
+        toolbarIsLabelledAside:
+          document.querySelector('#aside-selection-toolbar')?.getAttribute('aria-label') ??
+          null,
+        nativeAskUsable,
+        nativeAskHitTargetIsNative: hitTarget === nativeAsk || Boolean(nativeAsk?.contains(hitTarget)),
+        nativeAskClassList: nativeAsk instanceof HTMLElement ? nativeAsk.className : null,
+        asideOverlapsNativeAsk: Boolean(
+          nativeRect &&
+            toolbarRect &&
+            nativeRect.left < toolbarRect.right &&
+            nativeRect.right > toolbarRect.left &&
+            nativeRect.top < toolbarRect.bottom &&
+            nativeRect.bottom > toolbarRect.top
+        )
       };
     });
 
@@ -571,8 +641,21 @@ async function runNonProjectScenario(browser) {
       const tabBarRect = tabBar?.getBoundingClientRect();
       const tabRect = tab?.getBoundingClientRect();
       const tabBarStyle = tabBar ? getComputedStyle(tabBar) : null;
+      const sidebarRect = document.querySelector('nav[aria-label]')?.getBoundingClientRect();
+      const columnRect = document.querySelector('main article, main #turns')?.getBoundingClientRect();
+      const overlaps = (a, b) =>
+        Boolean(a && b) && a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
       return {
         placement: tabBar?.getAttribute('data-placement'),
+        tabBarLeft: tabBarRect ? Math.round(tabBarRect.left) : null,
+        sidebarRight: sidebarRect ? Math.round(sidebarRect.right) : null,
+        readingColumnLeft: columnRect ? Math.round(columnRect.left) : null,
+        overlapsSidebar: overlaps(tabBarRect, sidebarRect),
+        overlapsReadingColumn: overlaps(tabBarRect, columnRect),
+        // The hit target the user actually clicks must be inside the rail.
+        tabHitInsideRail: Boolean(
+          tabBarRect && tabRect && tabRect.left >= tabBarRect.left - 1 && tabRect.right <= tabBarRect.right + 1
+        ),
         flexDirection: tabBar ? getComputedStyle(tabBar).flexDirection : null,
         tabVisible: Boolean(tab),
         panelHidden: panel instanceof HTMLElement ? panel.hidden : null,
@@ -595,13 +678,22 @@ async function runNonProjectScenario(browser) {
       const panel = document.querySelector('.aside-panel');
       const tabBarRect = tabBar?.getBoundingClientRect();
       const tabRect = tab?.getBoundingClientRect();
+      const sidebarRect = document.querySelector('nav[aria-label]')?.getBoundingClientRect();
+      const columnRect = document
+        .querySelector('main article, main #turns, main #composer-form')
+        ?.getBoundingClientRect();
+      const overlaps = (a, b) =>
+        Boolean(a && b) && a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
       return {
         location: window.location.href,
+        placement: tabBar?.getAttribute('data-placement'),
         tabVisible: Boolean(tab),
         panelHidden: panel instanceof HTMLElement ? panel.hidden : null,
         tabBarWidth: tabBarRect ? Math.round(tabBarRect.width) : null,
         tabWidth: tabRect ? Math.round(tabRect.width) : null,
-        tabBarRight: tabBarRect ? Math.round(tabBarRect.right - window.innerWidth) : null
+        tabBarLeft: tabBarRect ? Math.round(tabBarRect.left) : null,
+        overlapsSidebar: overlaps(tabBarRect, sidebarRect),
+        overlapsReadingColumn: overlaps(tabBarRect, columnRect)
       };
     });
 
@@ -1078,9 +1170,16 @@ try {
 
   if (
     nonProject.askState.visibleActions.join('|') !== 'Ask|Why|New-tab' ||
-    nonProject.askState.nativeAskSuppressed !== true
+    // Aside must coexist with the provider's own selection action, not hide it.
+    nonProject.askState.nativeAskUsable !== true ||
+    nonProject.askState.nativeAskHitTargetIsNative !== true ||
+    nonProject.askState.asideOverlapsNativeAsk !== false ||
+    nonProject.askState.nativeAskClassList !== '' ||
+    nonProject.askState.toolbarIsLabelledAside !== 'Aside branch actions'
   ) {
-    throw new Error(`Expected toolbar actions and suppressed native Ask: ${JSON.stringify(nonProject.askState)}`);
+    throw new Error(
+      `Native selection action must stay usable alongside Aside: ${JSON.stringify(nonProject.askState)}`
+    );
   }
 
   if (
@@ -1104,14 +1203,17 @@ try {
   }
 
   if (
-    nonProject.minimizedState.placement !== 'edge' ||
+    // The rail belongs in free LEFT-side whitespace: right of the provider sidebar,
+    // left of the reading column, overlapping neither.
+    nonProject.minimizedState.placement !== 'left-gutter' ||
     nonProject.minimizedState.flexDirection !== 'column' ||
     !nonProject.minimizedState.tabVisible ||
     nonProject.minimizedState.panelHidden !== true ||
-    (nonProject.minimizedState.tabWidth ?? 0) < 80 ||
-    (nonProject.minimizedState.tabWidth ?? 0) > 110 ||
-    (nonProject.minimizedState.tabBarRight ?? 0) < -12 ||
-    (nonProject.minimizedState.tabBarRight ?? 0) > 0
+    nonProject.minimizedState.overlapsSidebar !== false ||
+    nonProject.minimizedState.overlapsReadingColumn !== false ||
+    nonProject.minimizedState.tabHitInsideRail !== true ||
+    (nonProject.minimizedState.tabBarLeft ?? 0) < (nonProject.minimizedState.sidebarRight ?? 0) ||
+    (nonProject.minimizedState.tabBarLeft ?? 0) >= (nonProject.minimizedState.readingColumnLeft ?? 0)
   ) {
     throw new Error(`Vertical minimized rail scenario failed: ${JSON.stringify(nonProject.minimizedState)}`);
   }
@@ -1121,8 +1223,10 @@ try {
     !nonProject.homeRestoreState.tabVisible ||
     nonProject.homeRestoreState.panelHidden !== true ||
     (nonProject.homeRestoreState.tabWidth ?? 0) < 80 ||
-    (nonProject.homeRestoreState.tabBarRight ?? 0) < -12 ||
-    (nonProject.homeRestoreState.tabBarRight ?? 0) > 0
+    // Restored panels use the same left-gutter placement, not the old right rail.
+    nonProject.homeRestoreState.placement !== 'left-gutter' ||
+    nonProject.homeRestoreState.overlapsSidebar !== false ||
+    nonProject.homeRestoreState.overlapsReadingColumn !== false
   ) {
     throw new Error(
       `Global minimized restore scenario failed: ${JSON.stringify(nonProject.homeRestoreState)}`

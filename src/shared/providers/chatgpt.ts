@@ -255,11 +255,17 @@ export const chatgptAdapter: ProviderAdapter = {
       return candidates.find((element) => Boolean(element)) ?? null;
     },
     getReadingColumnRect(doc) {
-      const thread =
+      // The reading column is where turns and the composer live — not <main>, which
+      // also spans the gutter the rail needs. Returning null is better than a wrong
+      // rectangle: the caller then falls back to the viewport midpoint.
+      const column =
         doc.querySelector<HTMLElement>('article[data-message-author-role]') ??
-        doc.querySelector<HTMLElement>('[data-message-author-role]') ??
-        doc.querySelector<HTMLElement>('main');
-      return thread ? thread.getBoundingClientRect() : null;
+        doc.querySelector<HTMLElement>('form[data-type="unified-composer"], main form');
+      if (!column) {
+        return null;
+      }
+      const rect = column.getBoundingClientRect();
+      return rect.width > 0 ? rect : null;
     }
   },
 
