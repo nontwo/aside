@@ -1185,6 +1185,111 @@ async function runProjectScenario(browser) {
   }
 }
 
+
+async function runCrossTabScenario(browser) {
+  // Two tabs on the SAME conversation, so both mount the same panel. Covers the
+  // two failures the per-panel protocol exists to prevent: a stale whole-store
+  // write losing another tab's edit, and a closed panel being resurrected.
+  routeMap = {
+    '/c/source-cross-tab': buildSourceHtml(),
+    '/': buildSuccessComposerHtml({ conversationPath: '/c/generated-cross-tab' })
+  };
+
+  const tabA = await createSourcePage(browser, '/c/source-cross-tab');
+  let tabB;
+
+  try {
+    await openDraft(tabA);
+    // Pin the mode: a previous scenario may have left "Temporary" remembered, which
+    // would route this panel to session storage and make the assertions ambiguous.
+    await setPanelBranchKind(tabA, 'Persistent');
+    await tabA.type('.aside-panel:not([hidden]) textarea', 'question from tab A');
+    await sleep(700);
+
+    // The panel under test, named explicitly: the shared profile also holds
+    // minimized panels from earlier scenarios.
+    const panelId = await tabA.evaluate(
+      () => document.querySelector('.aside-panel:not([hidden])')?.getAttribute('data-panel-id') ?? null
+    );
+    if (!panelId) {
+      throw new Error('Cross-tab scenario could not identify the panel under test.');
+    }
+
+    tabB = await createSourcePage(browser, '/c/source-cross-tab');
+    await tabB.waitForFunction(
+      (id) => Boolean(document.querySelector(`.aside-panel[data-panel-id="${id}"]`)),
+      { timeout: 15_000 },
+      panelId
+    );
+
+    // Tab B edits the shared panel; the authority accepts it.
+    await tabB.evaluate((id) => {
+      const textarea = document.querySelector(`.aside-panel[data-panel-id="${id}"] textarea`);
+      textarea.focus();
+      textarea.value = 'edited in tab B';
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      textarea.blur();
+    }, panelId);
+    await sleep(900);
+
+    const tabBWriteState = await tabB.evaluate((id) => {
+      const panel = document.querySelector(`.aside-panel[data-panel-id="${id}"]`);
+      const textarea = panel?.querySelector('textarea');
+      return {
+        found: Boolean(panel),
+        storeStatus: panel?.getAttribute('data-store-status') ?? null,
+        storeRev: panel?.getAttribute('data-store-rev') ?? null,
+        textareaValue: textarea instanceof HTMLTextAreaElement ? textarea.value : null,
+        hidden: panel instanceof HTMLElement ? panel.hidden : null
+      };
+    }, panelId);
+
+    const afterEdit = await readExtensionStorage(browser);
+
+    // Tab A closes the panel. That is a deletion with a tombstone.
+    await clickPanelAction(tabA, 'Close');
+    await sleep(900);
+
+    // Tab B, which still had it mounted a moment ago, writes again. A stale
+    // whole-store write would bring the panel straight back.
+    await tabB.evaluate((id) => {
+      const textarea = document.querySelector(`.aside-panel[data-panel-id="${id}"] textarea`);
+      if (textarea) {
+        textarea.focus();
+        textarea.value = 'late write from tab B';
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        textarea.blur();
+      }
+    }, panelId);
+    await sleep(900);
+
+    const afterClose = await readExtensionStorage(browser);
+
+    return {
+      panelId,
+      editVisibleInStore: afterEdit.local.includes('edited in tab B'),
+      storedQuestionAfterEdit:
+        JSON.parse(afterEdit.local)[`aside:panel:${panelId}`]?.state?.initialQuestion ?? null,
+      storedRevAfterEdit: JSON.parse(afterEdit.local)[`aside:panel:${panelId}`]?.rev ?? null,
+      tabBWriteState: tabBWriteState,
+      panelStoredAfterEdit: afterEdit.local.includes(`aside:panel:${panelId}`),
+      panelResurrectedAfterClose: afterClose.local.includes(`aside:panel:${panelId}`),
+      tombstoneWritten: afterClose.local.includes(`aside:gone:${panelId}`),
+      lateWriteLanded: afterClose.local.includes('late write from tab B'),
+      // Tab B should have dropped the panel once the deletion was broadcast.
+      tabBStillShowsPanel: await tabB.evaluate(
+        (id) => Boolean(document.querySelector(`.aside-panel[data-panel-id="${id}"]`)),
+        panelId
+      )
+    };
+  } finally {
+    if (tabB) {
+      await tabB.close().catch(() => {});
+    }
+    await tabA.close();
+  }
+}
+
 async function runFailureScenario(browser) {
   routeMap = {
     '/c/source-failure': buildSourceHtml(),
@@ -1260,6 +1365,7 @@ try {
   const temporaryChatUnconfirmed = await runTemporaryChatUnconfirmedScenario(browser);
   const temporaryChatVerified = await runTemporaryChatVerifiedScenario(browser);
   const temporaryChatBlocked = await runTemporaryChatBlockedScenario(browser);
+  const crossTab = await runCrossTabScenario(browser);
   const failure = await runFailureScenario(browser);
 
   const result = {
@@ -1271,10 +1377,28 @@ try {
     temporaryChatUnconfirmed,
     temporaryChatVerified,
     temporaryChatBlocked,
+    crossTab,
     failure
   };
 
   console.log(JSON.stringify(result, null, 2));
+
+  if (
+    !crossTab.panelId ||
+    crossTab.panelStoredAfterEdit !== true ||
+    // Tab B's write re-based onto tab A's newer revision instead of being discarded.
+    crossTab.tabBWriteState?.storeStatus !== 'applied' ||
+    crossTab.storedQuestionAfterEdit !== 'edited in tab B' ||
+    // Tab B's edit must reach the store rather than being lost to tab A's snapshot.
+    crossTab.editVisibleInStore !== true ||
+    // A close in tab A must leave a tombstone and must not be undone by tab B.
+    crossTab.tombstoneWritten !== true ||
+    crossTab.panelResurrectedAfterClose !== false ||
+    crossTab.lateWriteLanded !== false ||
+    crossTab.tabBStillShowsPanel !== false
+  ) {
+    throw new Error(`Cross-tab panel protocol failed: ${JSON.stringify(crossTab)}`);
+  }
 
   if (
     nonProject.askState.visibleActions.join('|') !== 'Ask|Why|New-tab' ||

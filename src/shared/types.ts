@@ -59,6 +59,8 @@ export interface BranchPanelState {
   title: string;
   titleStatus: 'pending' | 'ready';
   minimized: boolean;
+  /** Identifies the current attempt; events from an older attempt are rejected. */
+  attemptId?: string;
   initialQuestion?: string;
   initialPrompt?: string;
   status: BranchPanelStatus;
@@ -115,9 +117,21 @@ export type BranchPanelEvent =
   | BranchLiveEvent
   | BranchFailedEvent;
 
-export interface CreateBranchWindowMessage {
-  type: 'CREATE_BRANCH_WINDOW';
+/**
+ * Identity every branch message must carry.
+ *
+ * panelId alone is not enough: a retry reuses the same panel, so an event from the
+ * previous attempt would look legitimate. attemptId is minted fresh per attempt and
+ * checked before any state is mutated or any event forwarded.
+ */
+export interface BranchAttemptRef {
+  providerId: string;
   panelId: string;
+  attemptId: string;
+}
+
+export interface CreateBranchWindowMessage extends BranchAttemptRef {
+  type: 'CREATE_BRANCH_WINDOW';
   prompt: string;
   launchUrl: string;
   branchKind: BranchKind;
@@ -147,9 +161,8 @@ export interface FocusBranchWindowResponse {
   reason?: string;
 }
 
-export interface RunBranchPromptInTabMessage {
+export interface RunBranchPromptInTabMessage extends BranchAttemptRef {
   type: 'RUN_BRANCH_PROMPT_IN_TAB';
-  panelId: string;
   prompt: string;
   launchUrl: string;
   branchKind: BranchKind;
@@ -160,15 +173,13 @@ export interface RunBranchPromptInTabResponse {
   reason?: string;
 }
 
-export interface BranchAutomationEventMessage {
+export interface BranchAutomationEventMessage extends BranchAttemptRef {
   type: 'BRANCH_AUTOMATION_EVENT';
-  panelId: string;
   event: BranchPanelEvent;
 }
 
-export interface ForwardBranchPanelEventMessage {
+export interface ForwardBranchPanelEventMessage extends BranchAttemptRef {
   type: 'BRANCH_PANEL_EVENT';
-  panelId: string;
   event: BranchPanelEvent;
 }
 
@@ -176,3 +187,63 @@ export type BackgroundRequestMessage =
   | CreateBranchWindowMessage
   | FocusBranchWindowMessage
   | BranchAutomationEventMessage;
+
+/* ------------------------------------------------------------------ *
+ * Panel store messages. The service worker is the single authoritative
+ * writer; content scripts propose changes and are told the outcome.
+ * ------------------------------------------------------------------ */
+
+export interface PanelUpsertMessage {
+  type: 'PANEL_UPSERT';
+  panelId: string;
+  scopeKey: string;
+  area: 'local' | 'session';
+  baseRev: number;
+  state: BranchPanelState;
+}
+
+export interface PanelDeleteMessage {
+  type: 'PANEL_DELETE';
+  panelId: string;
+  baseRev: number;
+}
+
+export interface PanelListMessage {
+  type: 'PANEL_LIST';
+}
+
+export interface PanelListedRecord {
+  panelId: string;
+  scopeKey: string;
+  area: 'local' | 'session';
+  rev: number;
+  state: BranchPanelState;
+}
+
+export interface PanelListResponse {
+  ok: boolean;
+  records: PanelListedRecord[];
+  /** True when private branches could not be read, so the UI can say so. */
+  sessionUnavailable?: boolean;
+}
+
+export interface PanelWriteResponse {
+  ok: boolean;
+  status: 'applied' | 'deleted' | 'conflict' | 'rejected-deleted' | 'noop' | 'error';
+  rev?: number;
+  /** Present on conflict: the record the writer must reconcile against. */
+  current?: PanelListedRecord;
+  reason?: string;
+  /** True when the write could not be stored at all, so the tab shows unsaved state. */
+  unsaved?: boolean;
+}
+
+/** Broadcast to every tab after an accepted write. */
+export interface PanelChangedMessage {
+  type: 'PANEL_CHANGED';
+  panelId: string;
+  scopeKey: string;
+  rev: number;
+  deleted: boolean;
+  state?: BranchPanelState;
+}

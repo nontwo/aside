@@ -18,7 +18,12 @@ import {
   isPanelStorageKey,
   mergePanelBuckets
 } from '../shared/panel-storage';
-import type { PersistedPanelBucket } from '../shared/panel-storage';
+import type {
+  PanelChangedMessage,
+  PanelListResponse,
+  PanelListedRecord,
+  PanelWriteResponse
+} from '../shared/types';
 import {
   buildSelectionPayloadFromDraft,
   captureSelectionDraftFromRange,
@@ -56,10 +61,17 @@ import type {
   BranchPanelStatus,
   CreateBranchWindowResponse,
   FocusBranchWindowResponse,
+  BranchAttemptRef,
   ForwardBranchPanelEventMessage,
   RunBranchPromptInTabMessage,
   SelectionPayload
 } from '../shared/types';
+import {
+  createAttemptId,
+  isBranchAttemptRef,
+  isBranchPanelEvent,
+  ownsAttempt
+} from '../shared/branch-attempt';
 import {
   clipText,
   compactWhitespace,
@@ -98,15 +110,23 @@ interface PanelRuntime {
   watchdogId?: number;
 }
 
+/** The attempt a panel is currently running, if any. */
+function currentAttemptRef(runtime: PanelRuntime): BranchAttemptRef | null {
+  const attemptId = runtime.state.attemptId;
+  if (!attemptId) {
+    return null;
+  }
+  return { providerId: provider.id, panelId: runtime.state.panelId, attemptId };
+}
+
 type AutomationTransport = 'frame' | 'background';
 
 type ThemeMode = 'light' | 'dark';
 
-interface FrameStartBranchMessage {
+interface FrameStartBranchMessage extends BranchAttemptRef {
   source: 'aside';
   target: 'frame';
   type: 'SB_FRAME_START_BRANCH';
-  panelId: string;
   prompt: string;
   launchUrl: string;
   branchKind: BranchKind;
@@ -119,11 +139,10 @@ interface FrameReadyMessage {
   currentUrl: string;
 }
 
-interface FrameBranchEventMessage {
+interface FrameBranchEventMessage extends BranchAttemptRef {
   source: 'aside';
   target: 'parent';
   type: 'SB_FRAME_EVENT';
-  panelId: string;
   event: BranchPanelEvent;
 }
 
@@ -255,7 +274,7 @@ function recordAutomationLog(message: string, details?: unknown): string {
   const entry = formatDebugLogEntry(message, details);
   console.info('[Aside]', entry);
 
-  if (activeAutomationPanelId) {
+  if (activeAttempt) {
     void sendAutomationEvent({
       kind: 'debug-log',
       message: entry
@@ -281,203 +300,170 @@ function appendPanelLogEntries(runtime: PanelRuntime, entries: string[]): void {
   runtime.state.updatedAt = Date.now();
 }
 
-async function readPersistedPanels(url = lastKnownUrl): Promise<BranchPanelState[]> {
-  if (!hasRuntimeAccess()) {
-    return [];
-  }
-
-  const key = getConversationStorageKey(url);
-
-  try {
-    const stored = (await chrome.storage.local.get(key)) as Record<string, unknown>;
-    const raw = stored[key];
-    return Array.isArray(raw) ? (raw as BranchPanelState[]) : [];
-  } catch (error) {
-    if (isInvalidatedError(error)) {
-      return [];
-    }
-    throw error;
-  }
-}
-
-async function migrateLegacyPanelStorage(): Promise<void> {
-  if (!hasRuntimeAccess()) {
-    return;
-  }
-
-  try {
-    const stored = (await chrome.storage.local.get(null)) as Record<string, unknown>;
-    const nextEntries: Record<string, unknown> = {};
-
-    Object.entries(stored).forEach(([key, value]) => {
-      if (!key.startsWith(LEGACY_PANEL_STORAGE_PREFIX)) {
-        return;
-      }
-
-      const nextKey = `${PANEL_STORAGE_PREFIX}${key.slice(LEGACY_PANEL_STORAGE_PREFIX.length)}`;
-      if (!(nextKey in stored) && !(nextKey in nextEntries)) {
-        nextEntries[nextKey] = value;
-      }
-    });
-
-    if (
-      !(LAST_BRANCH_KIND_STORAGE_KEY in stored) &&
-      LEGACY_LAST_BRANCH_KIND_STORAGE_KEY in stored
-    ) {
-      nextEntries[LAST_BRANCH_KIND_STORAGE_KEY] = stored[LEGACY_LAST_BRANCH_KIND_STORAGE_KEY];
-    }
-
-    if (Object.keys(nextEntries).length) {
-      await chrome.storage.local.set(nextEntries);
-    }
-  } catch (error) {
-    if (!isInvalidatedError(error)) {
-      throw error;
-    }
-  }
-}
-
 /**
- * Private branches never reach durable storage.
+ * Panel persistence client.
  *
- * A Temporary Chat / Incognito branch exists so its text stays out of history, so
- * its panel — question, prompt, answer snapshot, derived title and logs — lives in
- * chrome.storage.session, which the browser clears when the session ends. Persistent
- * branches keep using storage.local as before.
+ * The tab no longer reads, merges and rewrites the panel store: the service worker
+ * is the single authority. Each panel is proposed individually with the revision
+ * this tab last saw, so a concurrent write from another tab is reported as a
+ * conflict instead of being silently overwritten, and a panel closed elsewhere
+ * stays closed.
  */
-type PanelStorageArea = 'local' | 'session';
+const panelRevisions = new Map<string, number>();
+const dirtyPanelIds = new Set<string>();
+const unsavedPanelIds = new Set<string>();
+let sessionStorageUsable = true;
 
-function storageAreaForPanel(state: Pick<BranchPanelState, 'branchKind'>): PanelStorageArea {
+function storageAreaForPanel(state: Pick<BranchPanelState, 'branchKind'>): 'local' | 'session' {
   return state.branchKind === 'temporary' ? 'session' : 'local';
 }
 
-let sessionStorageUsable = true;
-
-function storageAreaApi(area: PanelStorageArea): chrome.storage.StorageArea | null {
-  if (area === 'session') {
-    if (!sessionStorageUsable) {
-      return null;
-    }
-    // storage.session is unavailable in a few contexts; callers treat that as
-    // "cannot persist privately" rather than silently falling back to local.
-    return chrome.storage.session ?? null;
-  }
-  return chrome.storage.local;
+function markPanelDirty(panelId: string): void {
+  dirtyPanelIds.add(panelId);
 }
 
-async function readPanelBucketsFrom(area: PanelStorageArea): Promise<PersistedPanelBucket[]> {
-  const api = storageAreaApi(area);
-  if (!api) {
-    return [];
+function markAllPanelsDirty(): void {
+  panelRuntimes.forEach((runtime) => dirtyPanelIds.add(runtime.state.panelId));
+}
+
+async function sendStoreMessage<T>(message: unknown): Promise<T | null> {
+  if (!hasRuntimeAccess()) {
+    return null;
   }
 
   try {
-    const stored = (await api.get(null)) as Record<string, unknown>;
-    return Object.entries(stored)
-      .filter(([key]) => isPanelStorageKey(key))
-      .map(([key, value]) => ({
-        key,
-        panels: Array.isArray(value) ? (value as BranchPanelState[]) : []
-      }));
+    return (await chrome.runtime.sendMessage(message)) as T;
   } catch (error) {
-    if (isInvalidatedError(error)) {
-      return [];
+    if (!isInvalidatedError(error)) {
+      console.warn('[Aside] Panel store message failed', error);
     }
-    if (area === 'session') {
-      // Session storage can be closed to content scripts. Treat it as empty rather
-      // than letting the failure take the persistent panels down with it — and
-      // never fall back to durable storage for private branches.
-      sessionStorageUsable = false;
-      console.warn('[Aside] Session storage is unavailable; private branches will not persist', error);
-      return [];
-    }
-    throw error;
+    return null;
   }
 }
 
-async function readAllPersistedPanelBuckets(): Promise<PersistedPanelBucket[]> {
-  if (!hasRuntimeAccess()) {
-    return [];
+/** Adopt an authoritative record for a panel this tab has mounted. */
+function adoptAuthoritativeState(panelId: string, state: BranchPanelState, rev: number): void {
+  const runtime = panelRuntimes.get(panelId);
+  panelRevisions.set(panelId, rev);
+  if (!runtime) {
+    return;
   }
 
-  const [local, session] = await Promise.all([
-    readPanelBucketsFrom('local'),
-    readPanelBucketsFrom('session')
-  ]);
+  // Never yank text out from under someone mid-sentence: if the user is typing in
+  // this panel, keep their question and leave the panel marked unsaved.
+  const editing = document.activeElement === runtime.questionInput;
+  const localQuestion = runtime.questionInput.value;
 
-  // Restore reads both areas; a panel appears in exactly one of them.
-  const merged = new Map<string, BranchPanelState[]>();
-  [...local, ...session].forEach(({ key, panels }) => {
-    merged.set(key, [...(merged.get(key) ?? []), ...panels]);
+  runtime.state = editing ? { ...state, initialQuestion: localQuestion } : state;
+  if (!editing) {
+    runtime.questionInput.value = state.initialQuestion ?? '';
+    unsavedPanelIds.delete(panelId);
+  } else {
+    // The user is typing here. Keep their text, but do NOT immediately write it
+    // back: that would silently overwrite the other tab's draft. The panel shows
+    // as unsaved until the user reaches a deliberate save point.
+    unsavedPanelIds.add(panelId);
+  }
+
+  syncPanelUI(runtime);
+  renderTabs();
+}
+
+async function writePanelRecord(runtime: PanelRuntime, isRetry = false): Promise<void> {
+  const panelId = runtime.state.panelId;
+  const response = await sendStoreMessage<PanelWriteResponse>({
+    type: 'PANEL_UPSERT',
+    panelId,
+    scopeKey: runtime.state.rootConversationId,
+    area: storageAreaForPanel(runtime.state),
+    baseRev: panelRevisions.get(panelId) ?? 0,
+    state: runtime.state
   });
 
-  return [...merged.entries()].map(([key, panels]) => ({ key, panels }));
-}
-
-async function writePanelArea(
-  area: PanelStorageArea,
-  mounted: BranchPanelState[],
-  excludedPanelIds: Set<string>
-): Promise<void> {
-  const api = storageAreaApi(area);
-  if (!api) {
+  if (!response) {
+    runtime.element.dataset.storeStatus = 'no-response';
+    unsavedPanelIds.add(panelId);
     return;
   }
 
-  try {
-  const { entries, removableKeys } = mergePanelBuckets(
-    mounted,
-    await readPanelBucketsFrom(area),
-    excludedPanelIds
-  );
+  // The last write outcome, on the element, so the saved/unsaved state is
+  // inspectable rather than only inferable.
+  runtime.element.dataset.storeStatus = response.status;
+  runtime.element.dataset.storeRev = String(response.rev ?? panelRevisions.get(panelId) ?? 0);
 
-  if (removableKeys.length) {
-    await api.remove(removableKeys);
+  if (response.status === 'applied' && typeof response.rev === 'number') {
+    panelRevisions.set(panelId, response.rev);
+    unsavedPanelIds.delete(panelId);
+    return;
   }
 
-  if (Object.keys(entries).length) {
-    await api.set(entries);
+  if (response.status === 'conflict' && response.current) {
+    const theirs = response.current;
+    panelRevisions.set(panelId, theirs.rev);
+
+    const localQuestion = runtime.questionInput.value;
+    const questionDiverged = (theirs.state.initialQuestion ?? '') !== localQuestion;
+
+    // Re-base onto their record and try once more, keeping the one field the user
+    // edits directly. Adopting outright here is how a draft typed in this tab
+    // disappears because another tab happened to write first.
+    if (!isRetry && questionDiverged) {
+      appendPanelLog(runtime, 'Another tab wrote first; re-basing this draft onto it', {
+        theirRev: theirs.rev
+      });
+      runtime.state = {
+        ...theirs.state,
+        initialQuestion: localQuestion,
+        updatedAt: Date.now()
+      };
+      await writePanelRecord(runtime, true);
+      return;
+    }
+
+    appendPanelLog(runtime, 'Another tab wrote this panel; adopting its version', {
+      theirRev: theirs.rev
+    });
+    adoptAuthoritativeState(panelId, theirs.state, theirs.rev);
+    return;
   }
-  } catch (error) {
-    if (area === 'session' && !isInvalidatedError(error)) {
+
+  if (response.status === 'rejected-deleted') {
+    // Closed in another tab. Honour that here rather than resurrecting it.
+    appendPanelLog(runtime, 'Panel was closed in another tab; removing it here');
+    clearPanelWatchdog(runtime);
+    runtime.iframeEl.src = 'about:blank';
+    runtime.element.remove();
+    panelRuntimes.delete(panelId);
+    panelRevisions.delete(panelId);
+    unsavedPanelIds.delete(panelId);
+    renderTabs();
+    return;
+  }
+
+  if (response.unsaved) {
+    unsavedPanelIds.add(panelId);
+    if (storageAreaForPanel(runtime.state) === 'session') {
       sessionStorageUsable = false;
-      console.warn('[Aside] Session storage is unavailable; private branches will not persist', error);
-      return;
     }
-    throw error;
+    syncPanelUI(runtime);
   }
 }
 
-async function writePersistedPanels(): Promise<void> {
-  if (!hasRuntimeAccess()) {
-    return;
-  }
+async function flushPanelWrites(): Promise<void> {
+  const pending = [...dirtyPanelIds];
+  dirtyPanelIds.clear();
 
-  try {
-    const mounted = sortPanels().map((runtime) => runtime.state);
-    const byArea: Record<PanelStorageArea, BranchPanelState[]> = { local: [], session: [] };
-    mounted.forEach((state) => byArea[storageAreaForPanel(state)].push(state));
-
-    // A panel that switched mode must not linger in the area it came from, so each
-    // area also treats the other area's live panels as "not mine".
-    const sessionIds = new Set(byArea.session.map((state) => state.panelId));
-    const localIds = new Set(byArea.local.map((state) => state.panelId));
-
-    await writePanelArea('local', byArea.local, new Set([...closedPanelIds, ...sessionIds]));
-    await writePanelArea('session', byArea.session, new Set([...closedPanelIds, ...localIds]));
-  } catch (error) {
-    if (isInvalidatedError(error)) {
-      return;
+  for (const panelId of pending) {
+    const runtime = panelRuntimes.get(panelId);
+    if (!runtime) {
+      continue;
     }
-
-    // A quota or serialization failure here used to surface as an unhandled rejection and
-    // take the rest of the session's writes with it.
-    console.warn('[Aside] Could not persist branch panels', error);
+    await writePanelRecord(runtime);
   }
 }
 
 function queuePersistWrite(): Promise<void> {
-  persistQueue = persistQueue.catch(() => {}).then(() => writePersistedPanels());
+  persistQueue = persistQueue.catch(() => {}).then(() => flushPanelWrites());
   return persistQueue;
 }
 
@@ -486,25 +472,27 @@ function cancelPendingPersist(): void {
   persistTimer = undefined;
 }
 
-// Structural changes (create, minimize, close, status transitions) are written straight
-// away, because the user may navigate immediately afterwards.
+/**
+ * Structural changes (create, minimize, close, status transitions) are written
+ * straight away, because the user may navigate immediately afterwards.
+ */
 function persistPanels(): void {
   if (!hasRuntimeAccess()) {
     return;
   }
 
+  markAllPanelsDirty();
   cancelPendingPersist();
   void queuePersistWrite();
 }
 
-// Typing in the question box and streaming debug-log lines used to trigger a full
-// read-modify-write of extension storage per keystroke and per log entry. Those paths
-// coalesce instead; the writes stay serialized so two merges cannot race.
+/** Typing and streaming diagnostics coalesce instead of writing per keystroke. */
 function persistPanelsSoon(): void {
   if (!hasRuntimeAccess()) {
     return;
   }
 
+  markAllPanelsDirty();
   if (persistTimer !== undefined) {
     return;
   }
@@ -516,8 +504,104 @@ function persistPanelsSoon(): void {
 }
 
 async function flushPersistedPanels(): Promise<void> {
+  markAllPanelsDirty();
   cancelPendingPersist();
   await queuePersistWrite();
+}
+
+async function deletePanelRecord(panelId: string): Promise<void> {
+  await sendStoreMessage<PanelWriteResponse>({
+    type: 'PANEL_DELETE',
+    panelId,
+    baseRev: panelRevisions.get(panelId) ?? 0
+  });
+  panelRevisions.delete(panelId);
+  unsavedPanelIds.delete(panelId);
+  dirtyPanelIds.delete(panelId);
+}
+
+async function listPanelRecords(): Promise<PanelListedRecord[]> {
+  const response = await sendStoreMessage<PanelListResponse>({ type: 'PANEL_LIST' });
+  if (!response?.ok) {
+    return [];
+  }
+  if (response.sessionUnavailable) {
+    sessionStorageUsable = false;
+  }
+  return response.records;
+}
+
+/**
+ * One-time migration from the previous whole-bucket format.
+ *
+ * Records are written through the authority first; the legacy keys are only
+ * removed once every panel has been confirmed stored, so an interrupted or
+ * repeated migration leaves the original data intact.
+ */
+async function migrateLegacyPanelStorage(): Promise<void> {
+  if (!hasRuntimeAccess()) {
+    return;
+  }
+
+  try {
+    const stored = (await chrome.storage.local.get(null)) as Record<string, unknown>;
+    const legacyKeys = Object.keys(stored).filter(
+      (key) => isPanelStorageKey(key) || key.startsWith(LEGACY_PANEL_STORAGE_PREFIX)
+    );
+
+    if (!legacyKeys.length) {
+      return;
+    }
+
+    const migrated: string[] = [];
+    let allConfirmed = true;
+
+    for (const key of legacyKeys) {
+      const panels = Array.isArray(stored[key]) ? (stored[key] as BranchPanelState[]) : [];
+      for (const panel of panels) {
+        if (!panel?.panelId) {
+          continue;
+        }
+
+        const response = await sendStoreMessage<PanelWriteResponse>({
+          type: 'PANEL_UPSERT',
+          panelId: panel.panelId,
+          scopeKey: panel.rootConversationId || currentIdentity(panel.rootChatUrl).scopeKey,
+          area: storageAreaForPanel(panel),
+          baseRev: 0,
+          state: panel
+        });
+
+        // 'rejected-deleted' and 'conflict' both mean the authority already knows
+        // better than this legacy row, so they count as successfully handled.
+        const settled =
+          response?.status === 'applied' ||
+          response?.status === 'conflict' ||
+          response?.status === 'rejected-deleted' ||
+          response?.status === 'noop';
+        if (!settled) {
+          allConfirmed = false;
+        }
+      }
+      migrated.push(key);
+    }
+
+    if (allConfirmed && migrated.length) {
+      await chrome.storage.local.remove(migrated);
+      console.info('[Aside] Migrated legacy panel storage', { buckets: migrated.length });
+    } else if (!allConfirmed) {
+      console.warn('[Aside] Legacy panel storage was kept because migration was incomplete');
+    }
+
+    const legacyKindKey = LEGACY_LAST_BRANCH_KIND_STORAGE_KEY;
+    if (legacyKindKey in stored && !(branchKindStorageKey() in stored)) {
+      await chrome.storage.local.set({ [branchKindStorageKey()]: stored[legacyKindKey] });
+    }
+  } catch (error) {
+    if (!isInvalidatedError(error)) {
+      console.warn('[Aside] Legacy panel migration failed; existing data was left alone', error);
+    }
+  }
 }
 
 /**
@@ -563,7 +647,7 @@ function persistLastUsedBranchKind(kind: BranchKind): void {
 }
 
 async function createNativeBranchWindow(options: {
-  panelId: string;
+  attempt: BranchAttemptRef;
   prompt: string;
   launchUrl: string;
   branchKind: BranchKind;
@@ -580,7 +664,7 @@ async function createNativeBranchWindow(options: {
   try {
     return (await chrome.runtime.sendMessage({
       type: 'CREATE_BRANCH_WINDOW',
-      panelId: options.panelId,
+      ...options.attempt,
       prompt: options.prompt,
       launchUrl: options.launchUrl,
       branchKind: options.branchKind,
@@ -2228,6 +2312,14 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     syncPanelUI(runtime);
     persistPanelsSoon();
   });
+  // Leaving the box is a deliberate save point, which is also how a panel that went
+  // unsaved because another tab wrote first gets reconciled.
+  questionInput.addEventListener('blur', () => {
+    runtime.state.initialQuestion = questionInput.value;
+    runtime.state.updatedAt = Date.now();
+    markPanelDirty(runtime.state.panelId);
+    persistPanels();
+  });
   // Enter sends, Shift+Enter adds a line, matching the composer the user just came from.
   // isComposing keeps IME candidate selection from submitting a half-typed question.
   questionInput.addEventListener('keydown', (event) => {
@@ -2304,7 +2396,11 @@ function syncPanelUI(runtime: PanelRuntime): void {
 
   runtime.element.hidden = state.minimized;
   runtime.titleEl.textContent = getDisplayTitle(state);
-  runtime.statusEl.textContent = state.statusLabel;
+  const unsaved = unsavedPanelIds.has(state.panelId);
+  runtime.statusEl.textContent = unsaved
+    ? `${state.statusLabel} (not saved — this branch is only in this tab)`
+    : state.statusLabel;
+  runtime.element.dataset.unsaved = String(unsaved);
   runtime.errorEl.textContent = state.status === 'failed' ? state.errorMessage ?? '' : '';
   runtime.errorEl.style.display = runtime.errorEl.textContent ? 'block' : 'none';
   runtime.focusTextEl.textContent = state.focusPreview;
@@ -2513,40 +2609,37 @@ function createStateFromRestore(raw: BranchPanelState): BranchPanelState | null 
 
 async function restorePanels(): Promise<void> {
   const urlAtStart = lastKnownUrl;
-  const currentStorageKey = getConversationStorageKey(urlAtStart);
-  const restored = await readAllPersistedPanelBuckets();
+  const currentScopeKey = currentIdentity(urlAtStart).scopeKey;
+  const records = await listPanelRecords();
   if (urlAtStart !== lastKnownUrl) {
     return;
   }
 
-  restored
-    .flatMap(({ key, panels }) =>
-      panels
-        // Another tab can write a panel back after this page closed it; do not bring it
-        // back into a page the user already dismissed it from.
-        .filter((raw) => !closedPanelIds.has(raw?.panelId))
-        .filter((raw) => key === currentStorageKey || Boolean(raw?.minimized))
-        .map((raw) => {
-          const restoredState = createStateFromRestore(raw);
-          if (!restoredState) {
-            return null;
-          }
+  records
+    // Another tab can write a panel back after this page closed it; do not bring it
+    // back into a page the user already dismissed it from.
+    .filter((record) => !closedPanelIds.has(record.panelId))
+    // A panel belongs to this page if it shares the scope; otherwise only a
+    // minimized one is offered, and only as a rail tab.
+    .filter((record) => record.scopeKey === currentScopeKey || Boolean(record.state?.minimized))
+    .forEach((record) => {
+      const restoredState = createStateFromRestore(record.state);
+      if (!restoredState) {
+        return;
+      }
 
-          // Minimized tabs from other chats should remain available globally,
-          // but only the current chat gets its full panel restore state. The catch-all
-          // bucket is shared by every non-conversation page, so its panels stay in the
-          // rail instead of reopening on the home page, a project, or a branch window.
-          if (key !== currentStorageKey || isCatchAllPanelStorageKey(key)) {
-            restoredState.minimized = true;
-          }
-          return restoredState;
-        })
-    )
-    .filter((state): state is BranchPanelState => Boolean(state))
-    .filter((state, index, states) => states.findIndex((item) => item.panelId === state.panelId) === index)
-    .forEach((state) => {
-      if (!panelRuntimes.has(state.panelId)) {
-        createPanelRuntime(state);
+      // Panels from another scope, and anything in the shared catch-all scope,
+      // come back as rail tabs rather than reopening over the current page.
+      if (
+        record.scopeKey !== currentScopeKey ||
+        isCatchAllPanelStorageKey(getPanelStorageKeyForConversationId(record.scopeKey))
+      ) {
+        restoredState.minimized = true;
+      }
+
+      panelRevisions.set(record.panelId, record.rev);
+      if (!panelRuntimes.has(record.panelId)) {
+        createPanelRuntime(restoredState);
       }
     });
 
@@ -2593,7 +2686,9 @@ function closePanel(panelId: string): void {
   runtime.element.remove();
   panelRuntimes.delete(panelId);
   renderTabs();
-  persistPanels();
+  // A close is a deletion with a tombstone, not the absence of a write: another
+  // tab that still has this panel mounted must not write it back.
+  void deletePanelRecord(panelId);
 }
 
 // Navigating away is not the same as closing: these panels stay in storage so the user
@@ -2661,8 +2756,16 @@ async function promotePersistentBranchToNativeWindow(runtime: PanelRuntime): Pro
   syncPanelUI(runtime);
   persistPanels();
 
+  // Promotion continues the same attempt, so it keeps the same attempt id: the
+  // embedded frame that just failed is already identified by it and cannot come back.
+  const attempt = currentAttemptRef(runtime);
+  if (!attempt) {
+    appendPanelLog(runtime, 'Refusing to promote a branch without an attempt id');
+    return;
+  }
+
   const response = await createNativeBranchWindow({
-    panelId: runtime.state.panelId,
+    attempt,
     prompt: runtime.state.initialPrompt,
     launchUrl: runtime.state.launchUrl,
     branchKind: runtime.state.branchKind,
@@ -2709,7 +2812,7 @@ async function openSelectionInNewTab(
   const panelId = randomId('native');
   persistLastUsedBranchKind(branchKind);
   const response = await createNativeBranchWindow({
-    panelId,
+    attempt: { providerId: provider.id, panelId, attemptId: createAttemptId() },
     prompt,
     launchUrl,
     branchKind,
@@ -2990,11 +3093,17 @@ function tryDispatchPendingFrameStart(runtime: PanelRuntime): void {
   syncPanelUI(runtime);
   persistPanels();
 
+  const attempt = currentAttemptRef(runtime);
+  if (!attempt) {
+    appendPanelLog(runtime, 'Refusing to dispatch a branch start without an attempt id');
+    return;
+  }
+
   postToEmbeddedFrame(runtime, {
     source: 'aside',
     target: 'frame',
     type: 'SB_FRAME_START_BRANCH',
-    panelId: runtime.state.panelId,
+    ...attempt,
     prompt,
     launchUrl: runtime.state.launchUrl,
     branchKind: runtime.state.branchKind
@@ -3074,7 +3183,16 @@ function handleEmbeddedFrameMessage(event: MessageEvent<FrameIncomingMessage>): 
   }
 
   if (data.type === 'SB_FRAME_EVENT') {
-    if (data.panelId !== runtime.state.panelId) {
+    if (!isBranchAttemptRef(data) || !isBranchPanelEvent(data.event)) {
+      return;
+    }
+
+    if (!ownsAttempt(data, currentAttemptRef(runtime))) {
+      appendPanelLog(runtime, 'Ignored a branch frame event from a superseded attempt', {
+        eventKind: data.event.kind,
+        messageAttemptId: data.attemptId,
+        currentAttemptId: runtime.state.attemptId ?? null
+      });
       return;
     }
 
@@ -3092,9 +3210,58 @@ function handleEmbeddedFrameMessage(event: MessageEvent<FrameIncomingMessage>): 
   }
 }
 
+/**
+ * A write accepted by the authority, made anywhere. Keeps every open tab in step
+ * instead of each one discovering the change on its next navigation.
+ */
+function handlePanelChanged(message: PanelChangedMessage): void {
+  if (!message.panelId) {
+    return;
+  }
+
+  if (message.deleted) {
+    const runtime = panelRuntimes.get(message.panelId);
+    if (runtime) {
+      clearPanelWatchdog(runtime);
+      runtime.iframeEl.src = 'about:blank';
+      runtime.element.remove();
+      panelRuntimes.delete(message.panelId);
+      renderTabs();
+    }
+    panelRevisions.delete(message.panelId);
+    unsavedPanelIds.delete(message.panelId);
+    return;
+  }
+
+  const known = panelRevisions.get(message.panelId) ?? 0;
+  if (message.rev <= known) {
+    return;
+  }
+
+  if (panelRuntimes.has(message.panelId) && message.state) {
+    adoptAuthoritativeState(message.panelId, message.state, message.rev);
+    return;
+  }
+
+  panelRevisions.set(message.panelId, message.rev);
+}
+
 function handleForwardedBranchPanelEvent(message: ForwardBranchPanelEventMessage): void {
+  if (!isBranchAttemptRef(message) || !isBranchPanelEvent(message.event)) {
+    return;
+  }
+
   const runtime = panelRuntimes.get(message.panelId);
   if (!runtime) {
+    return;
+  }
+
+  if (!ownsAttempt(message, currentAttemptRef(runtime))) {
+    appendPanelLog(runtime, 'Ignored a background branch event from a superseded attempt', {
+      eventKind: message.event.kind,
+      messageAttemptId: message.attemptId,
+      currentAttemptId: runtime.state.attemptId ?? null
+    });
     return;
   }
 
@@ -3119,11 +3286,17 @@ function installRuntimeMessageListener(): void {
   }
 
   const runtimeMessageListener = (
-    message: RunBranchPromptInTabMessage | ForwardBranchPanelEventMessage,
+    message: RunBranchPromptInTabMessage | ForwardBranchPanelEventMessage | PanelChangedMessage,
     _sender: chrome.runtime.MessageSender,
     sendResponse: (response?: unknown) => void
   ) => {
     if (!isTopFrame() || !message || typeof message !== 'object' || !('type' in message)) {
+      return false;
+    }
+
+    if (message.type === 'PANEL_CHANGED') {
+      handlePanelChanged(message);
+      sendResponse({ ok: true });
       return false;
     }
 
@@ -3197,6 +3370,10 @@ async function startBranch(panelId: string, question: string): Promise<void> {
     });
   }
 
+  // A fresh attempt id per try. Anything still running from the previous attempt —
+  // an orphaned native window, a frame that has not been torn down yet — is
+  // identified by the old id and can no longer touch this panel.
+  runtime.state.attemptId = createAttemptId();
   runtime.state.initialQuestion = question;
   runtime.state.initialPrompt = prompt;
   runtime.state.surfaceMode = 'embedded';
@@ -4854,7 +5031,7 @@ async function waitForConversationUrlAfterSubmit(launchUrl: string, timeoutMs = 
   );
 }
 
-let activeAutomationPanelId: string | undefined;
+let activeAttempt: BranchAttemptRef | undefined;
 let activeAutomationTransport: AutomationTransport | undefined;
 let automationTaskRunning = false;
 let titleWatcherId: number | undefined;
@@ -4904,7 +5081,7 @@ function clearComposerAfterFailure(prompt: string): void {
 }
 
 async function sendAutomationEvent(event: BranchPanelEvent): Promise<void> {
-  if (!activeAutomationPanelId || !activeAutomationTransport) {
+  if (!activeAttempt || !activeAutomationTransport) {
     return;
   }
 
@@ -4918,7 +5095,7 @@ async function sendAutomationEvent(event: BranchPanelEvent): Promise<void> {
         source: 'aside',
         target: 'parent',
         type: 'SB_FRAME_EVENT',
-        panelId: activeAutomationPanelId,
+        ...activeAttempt,
         event
       } satisfies FrameBranchEventMessage,
       window.location.origin
@@ -4933,7 +5110,7 @@ async function sendAutomationEvent(event: BranchPanelEvent): Promise<void> {
   try {
     await chrome.runtime.sendMessage({
       type: 'BRANCH_AUTOMATION_EVENT',
-      panelId: activeAutomationPanelId,
+      ...activeAttempt,
       event
     });
   } catch (error) {
@@ -5045,7 +5222,11 @@ async function runBranchPromptAutomation(
   if (automationTaskRunning) {
     return;
   }
-  activeAutomationPanelId = message.panelId;
+  activeAttempt = {
+    providerId: message.providerId,
+    panelId: message.panelId,
+    attemptId: message.attemptId
+  };
   activeAutomationTransport = transport;
   observedBranchTitle = '';
   automationTaskRunning = true;
@@ -5196,7 +5377,8 @@ function initEmbeddedFrame(): void {
       typeof data !== 'object' ||
       data.source !== 'aside' ||
       data.target !== 'frame' ||
-      data.type !== 'SB_FRAME_START_BRANCH'
+      data.type !== 'SB_FRAME_START_BRANCH' ||
+      !isBranchAttemptRef(data)
     ) {
       return;
     }

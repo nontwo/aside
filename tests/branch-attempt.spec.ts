@@ -1,0 +1,72 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  createAttemptId,
+  isBranchAttemptRef,
+  isBranchPanelEvent,
+  ownsAttempt
+} from '../src/shared/branch-attempt';
+
+const current = { providerId: 'chatgpt', panelId: 'panel-1', attemptId: 'attempt-2' };
+
+describe('branch message validation', () => {
+  it('accepts a well-formed reference', () => {
+    expect(isBranchAttemptRef(current)).toBe(true);
+  });
+
+  it('rejects references that are missing or malformed', () => {
+    // These arrive across postMessage and runtime messaging, so they are data.
+    expect(isBranchAttemptRef(null)).toBe(false);
+    expect(isBranchAttemptRef('panel-1')).toBe(false);
+    expect(isBranchAttemptRef({ panelId: 'panel-1', attemptId: 'a' })).toBe(false);
+    expect(isBranchAttemptRef({ providerId: 'chatgpt', panelId: '', attemptId: 'a' })).toBe(false);
+    expect(isBranchAttemptRef({ providerId: 'chatgpt', panelId: 'p', attemptId: 42 })).toBe(false);
+  });
+
+  it('only accepts known event kinds', () => {
+    expect(isBranchPanelEvent({ kind: 'live' })).toBe(true);
+    expect(isBranchPanelEvent({ kind: 'failed', reason: 'x' })).toBe(true);
+    expect(isBranchPanelEvent({ kind: 'take-over' })).toBe(false);
+    expect(isBranchPanelEvent({})).toBe(false);
+    expect(isBranchPanelEvent(undefined)).toBe(false);
+  });
+});
+
+describe('attempt ownership', () => {
+  it('accepts an event from the attempt currently in flight', () => {
+    expect(ownsAttempt({ ...current }, current)).toBe(true);
+  });
+
+  it('rejects an event from a superseded attempt on the same panel', () => {
+    // The regression: a retry reuses the panel, so an orphaned native window from
+    // the previous try would otherwise look like a legitimate reporter.
+    expect(ownsAttempt({ ...current, attemptId: 'attempt-1' }, current)).toBe(false);
+  });
+
+  it('rejects an event for another panel or another provider', () => {
+    expect(ownsAttempt({ ...current, panelId: 'panel-2' }, current)).toBe(false);
+    expect(ownsAttempt({ ...current, providerId: 'claude' }, current)).toBe(false);
+  });
+
+  it('rejects everything when the panel has no attempt in flight', () => {
+    // A panel sitting in draft or already finished must not be mutated by a
+    // late event from a window that is still open.
+    expect(ownsAttempt({ ...current }, null)).toBe(false);
+    expect(ownsAttempt({ ...current }, undefined)).toBe(false);
+  });
+
+  it('cannot be satisfied by a message that nominates its own attempt', () => {
+    // Ownership is decided against the panel's record, never against the message,
+    // so a spoofed sender cannot promote itself to current.
+    const spoofed = { providerId: 'chatgpt', panelId: 'panel-1', attemptId: 'whatever-i-say' };
+    expect(ownsAttempt(spoofed, current)).toBe(false);
+  });
+});
+
+describe('attempt ids', () => {
+  it('are unguessable and unique per attempt', () => {
+    const ids = new Set(Array.from({ length: 500 }, () => createAttemptId()));
+    expect(ids.size).toBe(500);
+    ids.forEach((id) => expect(id).toMatch(/^[0-9a-f]{24}$/));
+  });
+});

@@ -1,4 +1,6 @@
 import type {
+  PanelDeleteMessage,
+  PanelUpsertMessage,
   BackgroundRequestMessage,
   BranchAutomationEventMessage,
   BranchFailedEvent,
@@ -12,9 +14,14 @@ import type {
   RunBranchPromptInTabResponse
 } from '../shared/types';
 import { providerHostnames } from '../shared/providers/origins';
+import { isBranchAttemptRef, isBranchPanelEvent, ownsAttempt } from '../shared/branch-attempt';
+import { handlePanelDelete, handlePanelList, handlePanelUpsert } from './panel-authority';
 
 interface BranchWindowSession {
   panelId: string;
+  providerId: string;
+  /** The attempt that owns this window. Events from any other attempt are dropped. */
+  attemptId: string;
   sourceTabId: number;
   sourceWindowId?: number;
   launchTabId: number;
@@ -282,7 +289,9 @@ async function forwardPanelEvent(panelId: string, event: BranchPanelEvent): Prom
 
   const payload: ForwardBranchPanelEventMessage = {
     type: 'BRANCH_PANEL_EVENT',
+    providerId: session.providerId,
     panelId,
+    attemptId: session.attemptId,
     event
   };
 
@@ -322,6 +331,8 @@ async function handleCreateBranchWindow(
 
     const session: BranchWindowSession = {
       panelId: message.panelId,
+      providerId: message.providerId,
+      attemptId: message.attemptId,
       sourceTabId,
       sourceWindowId: sender.tab?.windowId,
       launchTabId: createdTabId,
@@ -346,7 +357,9 @@ async function handleCreateBranchWindow(
 
     const response = await sendRunMessageToTab(createdTabId, {
       type: 'RUN_BRANCH_PROMPT_IN_TAB',
+      providerId: message.providerId,
       panelId: message.panelId,
+      attemptId: message.attemptId,
       prompt: message.prompt,
       launchUrl: message.launchUrl,
       branchKind: message.branchKind
@@ -412,6 +425,8 @@ async function handleFocusBranchWindow(
       const createdTabId = createdTab.id;
       const nextSession = session ?? {
         panelId: message.panelId,
+        providerId: 'chatgpt',
+        attemptId: '',
         sourceTabId: -1,
         launchTabId: createdTabId,
         launchWindowId: createdWindow.id,
@@ -444,6 +459,13 @@ async function handleAutomationEvent(
 ): Promise<void> {
   const session = (await hydrateSessions()).get(message.panelId);
   if (!session) {
+    return;
+  }
+
+  // An event may not nominate itself as the current attempt. A window left over
+  // from a previous try reports the old attemptId and is dropped here, before it
+  // can reassign the session's tab or forward anything to the panel.
+  if (!ownsAttempt(message, session)) {
     return;
   }
 
@@ -487,8 +509,29 @@ async function handleAutomationEvent(
 // Every branch that keeps the channel open has to answer, otherwise the content script
 // waits on a port that is already closed. Unknown message types return false so the
 // channel is released immediately instead of leaking.
-chrome.runtime.onMessage.addListener((message: BackgroundRequestMessage, sender, sendResponse) => {
+type WorkerMessage =
+  | BackgroundRequestMessage
+  | PanelUpsertMessage
+  | PanelDeleteMessage
+  | { type: 'PANEL_LIST' };
+
+chrome.runtime.onMessage.addListener((message: WorkerMessage, sender, sendResponse) => {
   if (!message || typeof message !== 'object' || !('type' in message)) {
+    return false;
+  }
+
+  // Every branch message is validated as data on arrival, not trusted by shape.
+  if (
+    (message.type === 'CREATE_BRANCH_WINDOW' ||
+      message.type === 'FOCUS_BRANCH_WINDOW' ||
+      message.type === 'BRANCH_AUTOMATION_EVENT') &&
+    message.type !== 'FOCUS_BRANCH_WINDOW' &&
+    !isBranchAttemptRef(message)
+  ) {
+    return false;
+  }
+
+  if (message.type === 'BRANCH_AUTOMATION_EVENT' && !isBranchPanelEvent(message.event)) {
     return false;
   }
 
@@ -509,6 +552,24 @@ chrome.runtime.onMessage.addListener((message: BackgroundRequestMessage, sender,
       void handleAutomationEvent(message, sender).then(
         () => sendResponse({ ok: true }),
         (error: unknown) => sendResponse({ ok: false, reason: describeError(error) })
+      );
+      return true;
+
+    case 'PANEL_UPSERT':
+      void handlePanelUpsert(message).then(sendResponse, (error: unknown) =>
+        sendResponse({ ok: false, status: 'error', unsaved: true, reason: describeError(error) })
+      );
+      return true;
+
+    case 'PANEL_DELETE':
+      void handlePanelDelete(message).then(sendResponse, (error: unknown) =>
+        sendResponse({ ok: false, status: 'error', unsaved: true, reason: describeError(error) })
+      );
+      return true;
+
+    case 'PANEL_LIST':
+      void handlePanelList().then(sendResponse, (error: unknown) =>
+        sendResponse({ ok: false, records: [], reason: describeError(error) })
       );
       return true;
 
