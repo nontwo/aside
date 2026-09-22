@@ -22,18 +22,96 @@ interface BranchWindowSession {
   live: boolean;
 }
 
+// MV3 service workers are torn down after ~30s idle, which can easily happen while a
+// branch is still generating. Keeping the sessions only in memory silently dropped the
+// "live"/"failed" events that come back afterwards and left the panel spinning forever,
+// so the map is mirrored into chrome.storage.session.
+const SESSION_STORAGE_KEY = 'aside:branch-sessions';
+
 const sessions = new Map<string, BranchWindowSession>();
+let hydration: Promise<Map<string, BranchWindowSession>> | null = null;
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+// Memoize the promise, not a boolean: messages arrive concurrently after the worker
+// restarts, and a plain flag would let the second caller read an empty map while the
+// first is still awaiting storage — dropping exactly the events this is meant to keep.
+function hydrateSessions(): Promise<Map<string, BranchWindowSession>> {
+  hydration ??= (async () => {
+    try {
+      const stored = await chrome.storage.session.get(SESSION_STORAGE_KEY);
+      const raw = stored[SESSION_STORAGE_KEY] as Record<string, BranchWindowSession> | undefined;
+      if (raw && typeof raw === 'object') {
+        Object.entries(raw).forEach(([panelId, session]) => {
+          if (session && typeof session.launchTabId === 'number' && !sessions.has(panelId)) {
+            sessions.set(panelId, session);
+          }
+        });
+      }
+    } catch {
+      // Session storage is unavailable in some contexts; stay with the in-memory map.
+    }
+
+    return sessions;
+  })();
+
+  return hydration;
+}
+
+async function persistSessions(): Promise<void> {
+  try {
+    await chrome.storage.session.set({
+      [SESSION_STORAGE_KEY]: Object.fromEntries(sessions.entries())
+    });
+  } catch {
+    // Best effort only; the in-memory map still works for this worker lifetime.
+  }
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
 }
 
-async function focusTab(tabId: number): Promise<void> {
+const BRANCH_HOSTS = new Set(['chatgpt.com', 'chat.openai.com']);
+
+function isBranchTabUrl(url: string | undefined, expectedUrl?: string): boolean {
+  if (!url) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(url);
+    if (!BRANCH_HOSTS.has(parsed.hostname)) {
+      return false;
+    }
+
+    if (!expectedUrl) {
+      return true;
+    }
+
+    const expected = new URL(expectedUrl);
+    return parsed.hostname === expected.hostname && parsed.pathname === expected.pathname;
+  } catch {
+    return false;
+  }
+}
+
+// Tab and window ids are only meaningful within a browser session, and Chrome hands the
+// same numbers out again after a restart. Panels are persisted to disk, so focusing a
+// stored id without checking could activate a completely unrelated tab and report success.
+async function focusTab(tabId: number, expectedUrl?: string): Promise<boolean> {
   const tab = await chrome.tabs.get(tabId);
+  if (!isBranchTabUrl(tab.url, expectedUrl)) {
+    return false;
+  }
+
   await chrome.tabs.update(tabId, { active: true });
   if (typeof tab.windowId === 'number') {
     await chrome.windows.update(tab.windowId, { focused: true });
   }
+  return true;
 }
 
 function hasNumericBounds(
@@ -92,13 +170,18 @@ async function arrangeWindowsSideBySide(
     return;
   }
 
-  await chrome.windows.update(sourceWindowId, {
-    state: 'normal',
-    left: layout.left,
-    top: layout.top,
-    width: layout.leftWidth,
-    height: layout.height
-  });
+  // Tiling has to move the source window, including out of 'maximized' — that is the only
+  // way to put the branch beside it. What it must not do is fight the window states where
+  // resizing is either meaningless or actively hostile.
+  if (sourceWindow.state !== 'minimized' && sourceWindow.state !== 'fullscreen') {
+    await chrome.windows.update(sourceWindowId, {
+      state: 'normal',
+      left: layout.left,
+      top: layout.top,
+      width: layout.leftWidth,
+      height: layout.height
+    });
+  }
 
   await chrome.windows.update(launchWindowId, {
     state: 'normal',
@@ -163,7 +246,7 @@ async function sendRunMessageToTab(
 }
 
 async function forwardPanelEvent(panelId: string, event: BranchPanelEvent): Promise<void> {
-  const session = sessions.get(panelId);
+  const session = (await hydrateSessions()).get(panelId);
   if (!session) {
     return;
   }
@@ -193,6 +276,8 @@ async function handleCreateBranchWindow(
     };
   }
 
+  await hydrateSessions();
+
   try {
     const createdWindow = await chrome.windows.create({
       url: 'about:blank',
@@ -215,6 +300,7 @@ async function handleCreateBranchWindow(
       live: false
     };
     sessions.set(message.panelId, session);
+    await persistSessions();
 
     if (message.arrangeSideBySide !== false) {
       try {
@@ -248,9 +334,10 @@ async function handleCreateBranchWindow(
     };
   } catch (error) {
     sessions.delete(message.panelId);
+    await persistSessions();
     return {
       ok: false,
-      reason: error instanceof Error ? error.message : String(error)
+      reason: describeError(error)
     };
   }
 }
@@ -258,73 +345,75 @@ async function handleCreateBranchWindow(
 async function handleFocusBranchWindow(
   message: FocusBranchWindowMessage
 ): Promise<FocusBranchWindowResponse> {
-  const session = sessions.get(message.panelId);
+  const session = (await hydrateSessions()).get(message.panelId);
   const tabId = message.launchTabId ?? session?.launchTabId;
   const windowId = message.launchWindowId ?? session?.launchWindowId;
 
-  if (typeof windowId === 'number') {
-    try {
-      await chrome.windows.update(windowId, { focused: true });
-      if (typeof tabId === 'number') {
-        await focusTab(tabId);
-      }
-      return { ok: true, tabId, windowId };
-    } catch {
-      // Fall through to URL-based open below.
-    }
-  }
+  const branchChatUrl = message.branchChatUrl ?? session?.branchChatUrl;
 
   if (typeof tabId === 'number') {
     try {
-      await focusTab(tabId);
-      return { ok: true, tabId };
+      if (await focusTab(tabId, branchChatUrl)) {
+        return { ok: true, tabId, windowId };
+      }
     } catch {
       // Fall through to URL-based open below.
     }
   }
 
-  if (!message.branchChatUrl && !session?.branchChatUrl) {
+  if (!branchChatUrl) {
     return {
       ok: false,
       reason: 'No persistent branch URL is available yet.'
     };
   }
 
-  const createdWindow = await chrome.windows.create({
-    url: message.branchChatUrl ?? session?.branchChatUrl,
-    focused: true,
-    type: 'normal'
-  });
-  const createdTab = createdWindow.tabs?.[0];
+  // Opening a window can still fail (for example when the profile is shutting down).
+  // Without this guard the rejection escaped the message handler and the caller was
+  // left waiting on a response that never arrived.
+  try {
+    const createdWindow = await chrome.windows.create({
+      url: branchChatUrl,
+      focused: true,
+      type: 'normal'
+    });
+    const createdTab = createdWindow.tabs?.[0];
 
-  if (createdTab && typeof createdTab.id === 'number') {
-    const createdTabId = createdTab.id;
-    const nextSession = session ?? {
-      panelId: message.panelId,
-      sourceTabId: -1,
-      launchTabId: createdTabId,
-      launchWindowId: createdWindow.id,
-      live: true
+    if (createdTab && typeof createdTab.id === 'number') {
+      const createdTabId = createdTab.id;
+      const nextSession = session ?? {
+        panelId: message.panelId,
+        sourceTabId: -1,
+        launchTabId: createdTabId,
+        launchWindowId: createdWindow.id,
+        live: true
+      };
+      nextSession.launchTabId = createdTabId;
+      nextSession.launchWindowId = createdWindow.id;
+      nextSession.branchChatUrl = branchChatUrl;
+      nextSession.live = true;
+      sessions.set(message.panelId, nextSession);
+      await persistSessions();
+    }
+
+    return {
+      ok: true,
+      tabId: createdTab?.id,
+      windowId: createdWindow.id
     };
-    nextSession.launchTabId = createdTabId;
-    nextSession.launchWindowId = createdWindow.id;
-    nextSession.branchChatUrl = message.branchChatUrl ?? session?.branchChatUrl;
-    nextSession.live = true;
-    sessions.set(message.panelId, nextSession);
+  } catch (error) {
+    return {
+      ok: false,
+      reason: describeError(error)
+    };
   }
-
-  return {
-    ok: true,
-    tabId: createdTab?.id,
-    windowId: createdWindow.id
-  };
 }
 
 async function handleAutomationEvent(
   message: BranchAutomationEventMessage,
   sender: chrome.runtime.MessageSender
 ): Promise<void> {
-  const session = sessions.get(message.panelId);
+  const session = (await hydrateSessions()).get(message.panelId);
   if (!session) {
     return;
   }
@@ -339,6 +428,7 @@ async function handleAutomationEvent(
   if (message.event.kind === 'live') {
     session.live = true;
     session.branchChatUrl = message.event.branchChatUrl;
+    await persistSessions();
     const event: BranchPanelEvent = {
       ...message.event,
       launchTabId: session.launchTabId,
@@ -357,6 +447,7 @@ async function handleAutomationEvent(
     if (message.event.branchChatUrl) {
       session.branchChatUrl = message.event.branchChatUrl;
     }
+    await persistSessions();
     await forwardPanelEvent(message.panelId, event);
     return;
   }
@@ -364,47 +455,68 @@ async function handleAutomationEvent(
   await forwardPanelEvent(message.panelId, message.event);
 }
 
+// Every branch that keeps the channel open has to answer, otherwise the content script
+// waits on a port that is already closed. Unknown message types return false so the
+// channel is released immediately instead of leaking.
 chrome.runtime.onMessage.addListener((message: BackgroundRequestMessage, sender, sendResponse) => {
   if (!message || typeof message !== 'object' || !('type' in message)) {
     return false;
   }
 
-  void (async () => {
-    switch (message.type) {
-      case 'CREATE_BRANCH_WINDOW':
-        sendResponse(await handleCreateBranchWindow(message, sender));
-        return;
+  switch (message.type) {
+    case 'CREATE_BRANCH_WINDOW':
+      void handleCreateBranchWindow(message, sender).then(sendResponse, (error: unknown) => {
+        sendResponse({ ok: false, reason: describeError(error) });
+      });
+      return true;
 
-      case 'FOCUS_BRANCH_WINDOW':
-        sendResponse(await handleFocusBranchWindow(message));
-        return;
+    case 'FOCUS_BRANCH_WINDOW':
+      void handleFocusBranchWindow(message).then(sendResponse, (error: unknown) => {
+        sendResponse({ ok: false, reason: describeError(error) });
+      });
+      return true;
 
-      case 'BRANCH_AUTOMATION_EVENT':
-        await handleAutomationEvent(message, sender);
-        sendResponse({ ok: true });
-        return;
-    }
-  })();
+    case 'BRANCH_AUTOMATION_EVENT':
+      void handleAutomationEvent(message, sender).then(
+        () => sendResponse({ ok: true }),
+        (error: unknown) => sendResponse({ ok: false, reason: describeError(error) })
+      );
+      return true;
 
-  return true;
+    default:
+      return false;
+  }
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => {
-  for (const [panelId, session] of sessions.entries()) {
+async function handleBranchTabRemoved(tabId: number): Promise<void> {
+  const knownSessions = await hydrateSessions();
+  let changed = false;
+
+  for (const [panelId, session] of [...knownSessions.entries()]) {
     if (session.launchTabId !== tabId) {
       continue;
     }
 
     if (!session.live) {
-      void forwardPanelEvent(panelId, {
+      await forwardPanelEvent(panelId, {
         kind: 'failed',
         reason: 'The background ChatGPT branch tab was closed before the branch finished creating.',
         launchTabId: tabId
       });
-      sessions.delete(panelId);
-      return;
+      knownSessions.delete(panelId);
+      changed = true;
+      continue;
     }
 
     session.launchTabId = -1;
+    changed = true;
   }
+
+  if (changed) {
+    await persistSessions();
+  }
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  void handleBranchTabRemoved(tabId);
 });

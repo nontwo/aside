@@ -7,6 +7,18 @@ const root = process.cwd();
 const sourceDir = path.join(root, 'course-submission');
 const packageDir = path.resolve(process.argv[2] ?? '/tmp/aside-course-submission');
 
+const packageRelativeToRoot = path.relative(root, packageDir);
+if (
+  packageRelativeToRoot === '' ||
+  (!packageRelativeToRoot.startsWith('..') && !path.isAbsolute(packageRelativeToRoot)) ||
+  !path.relative(packageDir, root).startsWith('..') ||
+  path.dirname(packageDir) === packageDir
+) {
+  // This path is deleted before it is written, so never let it resolve onto the repo.
+  console.error(`Refusing to package into ${packageDir}. Choose a path outside ${root}.`);
+  process.exit(1);
+}
+
 function run(scriptName) {
   const result = spawnSync(process.execPath, [path.join(root, 'scripts', scriptName)], {
     cwd: root,

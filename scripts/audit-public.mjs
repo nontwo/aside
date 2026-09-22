@@ -3,7 +3,10 @@ import path from 'node:path';
 import process from 'node:process';
 
 const root = path.resolve(process.argv[2] ?? process.cwd());
-const ignoredDirNames = new Set(['.git', 'node_modules', 'dist', 'coverage', '.local']);
+const ignoredDirNames = new Set(['.git', 'node_modules', 'coverage', '.local']);
+// The repo's own build output is regenerated and not published, but the preserved
+// extension bundle under course-submission/ is served by GitHub Pages and must be scanned.
+const ignoredRootDirNames = new Set(['dist']);
 const auditScriptRelativePaths = new Set([
   path.join('scripts', 'audit-public.mjs'),
   path.join('scripts', 'audit-submission.mjs')
@@ -55,6 +58,9 @@ async function walk(dir, results = []) {
 
     if (entry.isDirectory()) {
       if (ignoredDirNames.has(entry.name)) {
+        continue;
+      }
+      if (ignoredRootDirNames.has(entry.name) && path.dirname(relativePath) === '.') {
         continue;
       }
       await walk(fullPath, results);

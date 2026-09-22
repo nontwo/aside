@@ -1,6 +1,5 @@
 export type ChatRole = 'user' | 'assistant' | 'system';
 
-export type BranchMode = 'local';
 export type BranchKind = 'persistent' | 'temporary';
 export type BranchEntryAction = 'ask' | 'why' | 'new_tab';
 export type BranchSurfaceMode = 'embedded' | 'native_window';
@@ -16,16 +15,6 @@ export type BranchPanelStatus =
   | 'creating_branch'
   | 'opening_branch'
   | 'live'
-  | 'failed';
-
-export type BranchRunState =
-  | 'idle'
-  | 'queued'
-  | 'acquiring_runner'
-  | 'branching_local'
-  | 'sending'
-  | 'streaming'
-  | 'completed'
   | 'failed';
 
 export interface RangeQuotes {
@@ -80,112 +69,12 @@ export interface BranchPanelState {
   updatedAt: number;
 }
 
-export interface OriginAnchor {
-  rootConversationId: string;
-  rootChatUrl: string;
-  selectedText: string;
-  selectedBlocks: SelectedBlock[];
-  rangeQuotes: RangeQuotes;
-  fallbackScrollY: number;
-}
-
 export interface TranscriptTurn {
   id: string;
   role: ChatRole;
   turnIndex: number;
   text: string;
   excerpt: string;
-}
-
-export interface BranchMessage {
-  id: string;
-  role: ChatRole;
-  displayText: string;
-  rawTransportPrompt?: string;
-  streamState: 'pending' | 'streaming' | 'done' | 'error';
-  source: 'visible' | 'hidden';
-  createdAt: number;
-}
-
-export interface BranchRecord {
-  branchId: string;
-  rootConversationId: string;
-  mode: BranchMode;
-  backingConversationId?: string;
-  backingChatUrl?: string;
-  title: string;
-  titleStatus: 'pending' | 'ready';
-  focusPreview: string;
-  originAnchor: OriginAnchor;
-  messages: BranchMessage[];
-  runState: BranchRunState;
-  queuePosition?: number;
-  statusLabel?: string;
-  minimized: boolean;
-  runnerTabId?: number;
-  errorMessage?: string;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface BranchDraft {
-  draftId: string;
-  selection: SelectionPayload;
-  createdAt: number;
-}
-
-export interface RootConversationState {
-  rootConversationId: string;
-  rootChatUrl: string;
-  branchIds: string[];
-  activeBranchId: string | null;
-  draft?: BranchDraft;
-}
-
-export interface TabConversationContext {
-  rootConversationId: string;
-  rootChatUrl: string;
-}
-
-export interface ExtensionSettings {
-  maxConcurrentRunners: number;
-}
-
-export interface ExtensionState {
-  branches: Record<string, BranchRecord>;
-  conversations: Record<string, RootConversationState>;
-  tabConversations: Record<string, TabConversationContext>;
-  settings: ExtensionSettings;
-}
-
-export interface StartBranchRequest {
-  selection: SelectionPayload;
-  question: string;
-  tabId: number;
-}
-
-export interface FollowUpBranchRequest {
-  branchId: string;
-  question: string;
-  tabId: number;
-}
-
-export interface JumpToOriginRequest {
-  rootConversationId: string;
-  originAnchor: OriginAnchor;
-}
-
-export interface RootContextUpdate {
-  rootConversationId: string;
-  rootChatUrl: string;
-}
-
-export interface PanelBootstrap {
-  tabId: number | null;
-  rootConversationId: string | null;
-  rootChatUrl: string | null;
-  conversation?: RootConversationState;
-  branches: BranchRecord[];
 }
 
 export interface BranchStatusEvent {
@@ -287,9 +176,3 @@ export type BackgroundRequestMessage =
   | CreateBranchWindowMessage
   | FocusBranchWindowMessage
   | BranchAutomationEventMessage;
-
-export type BackgroundResponseMessage =
-  | CreateBranchWindowResponse
-  | FocusBranchWindowResponse
-  | RunBranchPromptInTabResponse
-  | { ok: boolean };

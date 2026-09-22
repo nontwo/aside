@@ -92,6 +92,40 @@ export function stripAssistantLabel(text: string): string {
   return next;
 }
 
+const BLOCK_LEVEL_SELECTORS = [
+  'address',
+  'article',
+  'blockquote',
+  'div',
+  'dd',
+  'dl',
+  'dt',
+  'figcaption',
+  'figure',
+  'footer',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'header',
+  'hr',
+  'li',
+  'ol',
+  'p',
+  'pre',
+  'section',
+  'table',
+  'tbody',
+  'td',
+  'tfoot',
+  'th',
+  'thead',
+  'tr',
+  'ul'
+].join(',');
+
 export function extractCleanNodeText(node: Node): string {
   if (node.nodeType === Node.TEXT_NODE) {
     return compactWhitespace(node.textContent ?? '');
@@ -108,7 +142,19 @@ export function extractCleanNodeText(node: Node): string {
     element.remove();
   });
 
-  return compactWhitespace(container.innerText || container.textContent || '');
+  // The container is never inserted into the document, so innerText is specified to fall
+  // back to textContent. ChatGPT's rendered markdown has no whitespace between sibling
+  // block elements, which fused the last word of a paragraph into the first word of the
+  // next one. Write the boundaries in explicitly rather than depending on layout.
+  container.querySelectorAll('br').forEach((element) => {
+    element.replaceWith(document.createTextNode(' '));
+  });
+  container.querySelectorAll<HTMLElement>(BLOCK_LEVEL_SELECTORS).forEach((element) => {
+    element.prepend(document.createTextNode(' '));
+    element.append(document.createTextNode(' '));
+  });
+
+  return compactWhitespace(container.textContent ?? '');
 }
 
 export function extractCleanRangeText(range: Range): string {
@@ -188,20 +234,84 @@ function getMessageText(element: HTMLElement, role: ChatRole): string {
 
 function uniqueMessageElements(root: ParentNode = document): HTMLElement[] {
   const nodes = Array.from(root.querySelectorAll<HTMLElement>(MESSAGE_SELECTORS));
-  const filtered = nodes.filter((candidate, index) => {
-    if (!(candidate instanceof HTMLElement)) {
+
+  // inferRole walks the subtree, and this runs inside polling loops on conversations
+  // with hundreds of turns, so resolve each role once and compare against ancestors
+  // instead of every other candidate.
+  const roles = new Map<HTMLElement, ChatRole | null>();
+  nodes.forEach((node) => {
+    roles.set(node, inferRole(node));
+  });
+
+  return nodes.filter((candidate) => {
+    const role = roles.get(candidate) ?? null;
+    if (role === null) {
       return false;
     }
 
-    return !nodes.some((other, otherIndex) => {
-      if (index === otherIndex) {
+    // Some ChatGPT layouts wrap a message element in an outer element that also
+    // matches MESSAGE_SELECTORS; keep only the innermost one for a given role.
+    let ancestor = candidate.parentElement;
+    while (ancestor) {
+      if (roles.has(ancestor) && roles.get(ancestor) === role) {
         return false;
       }
-      return other.contains(candidate) && inferRole(other) === inferRole(candidate);
-    });
+      ancestor = ancestor.parentElement;
+    }
+
+    return true;
+  });
+}
+
+// The toolbar promises a branch, but a branch needs an assistant answer to anchor to.
+// Checking before showing it avoids offering Ask/Why/New-tab on a selection whose click
+// can only be a silent no-op.
+export function rangeTouchesAssistantMessage(range: Range): boolean {
+  const boundaries = [range.startContainer, range.endContainer, range.commonAncestorContainer];
+
+  const boundaryHit = boundaries.some((node) => {
+    const element = node instanceof Element ? node : node.parentElement;
+    const turn = element?.closest<HTMLElement>(MESSAGE_SELECTORS);
+    return Boolean(turn && inferRole(turn) === 'assistant');
   });
 
-  return filtered.filter((element) => inferRole(element) !== null);
+  if (boundaryHit) {
+    return true;
+  }
+
+  // A drag from one user turn, through an assistant answer, into the next user turn has
+  // no assistant message at either boundary — but it is exactly the selection this
+  // feature is for, so look inside the range before giving up.
+  const container = range.commonAncestorContainer;
+  const scope = container instanceof Element ? container : container.parentElement;
+  if (!scope) {
+    return false;
+  }
+
+  return Array.from(scope.querySelectorAll<HTMLElement>(MESSAGE_SELECTORS)).some((element) => {
+    if (inferRole(element) !== 'assistant') {
+      return false;
+    }
+
+    try {
+      return range.intersectsNode(element);
+    } catch {
+      return false;
+    }
+  });
+}
+
+export function countTranscriptTurns(root: ParentNode = document): number {
+  return uniqueMessageElements(root).length;
+}
+
+export function getRecentAssistantTexts(limit = 3, root: ParentNode = document): string[] {
+  return uniqueMessageElements(root)
+    .filter((element) => inferRole(element) === 'assistant')
+    .slice(-Math.max(1, limit))
+    .map((element) => getMessageText(element, 'assistant'))
+    .filter(Boolean)
+    .reverse();
 }
 
 export interface DomTranscriptTurn extends TranscriptTurn {
@@ -247,15 +357,45 @@ export function extractTranscript(root: ParentNode = document): DomTranscriptTur
     .filter((turn): turn is DomTranscriptTurn => Boolean(turn));
 }
 
-function getQuoteContext(range: Range): RangeQuotes {
-  const exact = extractCleanRangeText(range);
-  const startContainerText = range.startContainer.textContent ?? '';
-  const endContainerText = range.endContainer.textContent ?? '';
+const QUOTE_CONTEXT_CHARS = 40;
 
+function getBoundaryScope(container: Node): Element | null {
+  const element = container instanceof Element ? container : container.parentElement;
+  return element?.closest(MESSAGE_SELECTORS) ?? element;
+}
+
+// Range offsets are character offsets only when the boundary container is a text node.
+// Chrome routinely hands back an Element container for selections that end on a block
+// boundary, where the offset is a child-node index; slicing textContent by it produced
+// nonsense prefixes and suffixes that then mis-scored re-anchoring.
+function getBoundaryContext(range: Range, side: 'before' | 'after'): string {
+  const scope = getBoundaryScope(side === 'before' ? range.startContainer : range.endContainer);
+  if (!scope) {
+    return '';
+  }
+
+  try {
+    const contextRange = document.createRange();
+    if (side === 'before') {
+      contextRange.setStart(scope, 0);
+      contextRange.setEnd(range.startContainer, range.startOffset);
+    } else {
+      contextRange.setStart(range.endContainer, range.endOffset);
+      contextRange.setEnd(scope, scope.childNodes.length);
+    }
+
+    const text = compactWhitespace(contextRange.toString());
+    return side === 'before' ? text.slice(-QUOTE_CONTEXT_CHARS) : text.slice(0, QUOTE_CONTEXT_CHARS);
+  } catch {
+    return '';
+  }
+}
+
+function getQuoteContext(range: Range): RangeQuotes {
   return {
-    exact,
-    prefix: startContainerText.slice(Math.max(0, range.startOffset - 40), range.startOffset).trim(),
-    suffix: endContainerText.slice(range.endOffset, range.endOffset + 40).trim()
+    exact: extractCleanRangeText(range),
+    prefix: getBoundaryContext(range, 'before'),
+    suffix: getBoundaryContext(range, 'after')
   };
 }
 
@@ -421,8 +561,33 @@ function shouldIgnoreTextNode(node: Text): boolean {
   return false;
 }
 
+// extractCleanNodeText deletes these subtrees before it injects separators, so nothing
+// inside one may contribute a boundary to the index either.
+const STRIPPED_SUBTREE_SELECTORS = `${NON_CONTENT_SELECTORS},[hidden],[aria-busy="true"]`;
+
+function isStrippedElement(node: Node): node is Element {
+  return node instanceof Element && node.matches(STRIPPED_SUBTREE_SELECTORS);
+}
+
+function isTextSeparatingElement(node: Node): boolean {
+  if (!(node instanceof Element)) {
+    return false;
+  }
+
+  return node.tagName === 'BR' || node.matches(BLOCK_LEVEL_SELECTORS);
+}
+
 function buildNormalizedTextIndex(element: HTMLElement): NormalizedTextIndex {
-  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  // extractCleanNodeText writes a separator at every block boundary and in place of every
+  // <br>, so this index has to produce the identical string or a passage that spans one of
+  // those boundaries can never be re-anchored.
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, {
+    acceptNode(node) {
+      // Rejecting the element skips its whole subtree, which is what keeps a hidden
+      // <div> from contributing a separator the extracted text does not have.
+      return isStrippedElement(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+    }
+  });
   let text = '';
   const points: NormalizedTextIndex['points'] = [];
   let pendingWhitespace:
@@ -432,11 +597,31 @@ function buildNormalizedTextIndex(element: HTMLElement): NormalizedTextIndex {
       }
     | null = null;
 
+  let previousBlock: Element | null = null;
+  let pendingBoundary = false;
+
   while (walker.nextNode()) {
-    const node = walker.currentNode as Text;
+    const current = walker.currentNode;
+
+    if (current.nodeType !== Node.TEXT_NODE) {
+      // Covers <br> and void blocks like <hr>, which the block-ancestor comparison below
+      // cannot see because they are siblings rather than ancestors. Stripped subtrees
+      // never reach here: the walker filter rejects them outright.
+      pendingBoundary ||= isTextSeparatingElement(current);
+      continue;
+    }
+
+    const node = current as Text;
     if (shouldIgnoreTextNode(node)) {
       continue;
     }
+
+    const block = node.parentElement?.closest(BLOCK_LEVEL_SELECTORS) ?? null;
+    if (text.length && (pendingBoundary || block !== previousBlock)) {
+      pendingWhitespace ??= { node, offset: 0 };
+    }
+    pendingBoundary = false;
+    previousBlock = block;
 
     const value = node.textContent ?? '';
     for (let index = 0; index < value.length; index += 1) {
@@ -584,15 +769,39 @@ export function findTurnElementByAnchor(anchor: {
   const transcript = extractTranscript(document);
   const candidates = [...anchor.selectedBlocks].reverse();
 
+  // Identity first: the synthetic message id hashes the turn's own text, so it only
+  // matches the message the passage actually came from.
   for (const block of candidates) {
-    const turn = transcript.find((item) => item.id === block.messageId || item.turnIndex === block.turnIndex);
+    const turn = transcript.find((item) => item.id === block.messageId);
     if (turn?.element) {
       return turn.element;
     }
   }
 
-  const fallback = transcript.find((turn) => turn.text.includes(anchor.selectedText));
-  return fallback?.element ?? null;
+  // Then content: the conversation may have grown or been edited, which shifts turn
+  // indexes but leaves the quoted passage where it was. A branch always anchors to an
+  // assistant answer, and the user's own question usually quotes the same phrase, so
+  // assistant turns are searched first.
+  const anchorRoles = new Set(anchor.selectedBlocks.map((block) => block.role));
+  const quoted =
+    transcript.find((turn) => turn.role === 'assistant' && turn.text.includes(anchor.selectedText)) ??
+    transcript.find((turn) => anchorRoles.has(turn.role) && turn.text.includes(anchor.selectedText));
+  if (quoted?.element) {
+    return quoted.element;
+  }
+
+  // Positional guess last, and only when the role still agrees, so a turn index that
+  // now points at a different message does not win over a real text match.
+  for (const block of candidates) {
+    const turn = transcript.find(
+      (item) => item.turnIndex === block.turnIndex && item.role === block.role
+    );
+    if (turn?.element) {
+      return turn.element;
+    }
+  }
+
+  return null;
 }
 
 export function getLatestAssistantText(root: ParentNode = document): string {

@@ -9,7 +9,10 @@ const profilePath = process.env.SMOKE_PROFILE ?? '/tmp/aside-embedded-smoke';
 const chromePath =
   process.env.CHROME_PATH ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const headless = process.env.HEADLESS !== 'false';
-const includeNativeWindowSmoke = process.env.INCLUDE_NATIVE_WINDOW_SMOKE === 'true';
+// The native-window scenarios used to be opt-in because extension-created windows raced
+// request interception and loaded the real chatgpt.com. Interception is now installed
+// before a new target runs, so they are part of the default run.
+const includeNativeWindowSmoke = process.env.SKIP_NATIVE_WINDOW_SMOKE !== 'true';
 
 let routeMap = {};
 
@@ -215,43 +218,63 @@ function buildFalsePositiveComposerHtml() {
 </html>`;
 }
 
-async function attachInterception(page) {
-  if (!page || page.__asideInterceptInstalled) {
+const NOT_FOUND_HTML = '<!doctype html><html><body>not found</body></html>';
+
+function resolveRouteBody(pathname) {
+  return routeMap[pathname] ?? routeMap['*'] ?? NOT_FOUND_HTML;
+}
+
+async function fulfillPausedRequest(session, event) {
+  const { requestId } = event;
+
+  let url = null;
+  try {
+    url = new URL(event.request.url);
+  } catch {
+    url = null;
+  }
+
+  if (!url || url.hostname !== 'chatgpt.com') {
+    await session.send('Fetch.continueRequest', { requestId }).catch(() => {});
     return;
   }
 
-  page.__asideInterceptInstalled = true;
-  await page.setRequestInterception(true);
-  page.on('request', (request) => {
-    const url = new URL(request.url());
-    if (url.hostname !== 'chatgpt.com') {
-      request.continue();
-      return;
-    }
-
-    const body = routeMap[url.pathname] ?? routeMap['*'];
-    request.respond({
-      status: 200,
-      contentType: 'text/html',
-      body: body ?? '<!doctype html><html><body>not found</body></html>'
-    });
-  });
+  await session
+    .send('Fetch.fulfillRequest', {
+      requestId,
+      responseCode: 200,
+      responseHeaders: [{ name: 'Content-Type', value: 'text/html; charset=utf-8' }],
+      body: Buffer.from(resolveRouteBody(url.pathname), 'utf8').toString('base64')
+    })
+    .catch(() => {});
 }
 
-async function installBrowserInterception(browser) {
-  const existingPages = await browser.pages();
-  await Promise.all(existingPages.map((page) => attachInterception(page)));
+async function prepareAttachedSession(session) {
+  try {
+    session.on('Fetch.requestPaused', (event) => {
+      void fulfillPausedRequest(session, event);
+    });
+    await session.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+  } catch {
+    // Some targets reject Fetch.enable; they still have to be resumed below.
+  } finally {
+    await session.send('Runtime.runIfWaitingForDebugger').catch(() => {});
+  }
+}
 
-  browser.on('targetcreated', async (target) => {
-    if (target.type() !== 'page') {
-      return;
-    }
-    try {
-      const page = await target.page();
-      await attachInterception(page);
-    } catch {
-      // Ignore short-lived targets.
-    }
+// Windows opened by the extension navigate as soon as chrome.tabs.update resolves, which
+// is faster than puppeteer's targetcreated -> page() -> setRequestInterception round trip.
+// Auto-attaching at the browser level with waitForDebuggerOnStart pauses every new target
+// before its first request, so the fake chatgpt.com routes always win that race.
+async function installBrowserInterception(browser) {
+  const browserSession = await browser.target().createCDPSession();
+  browserSession.on('sessionattached', (session) => {
+    void prepareAttachedSession(session);
+  });
+  await browserSession.send('Target.setAutoAttach', {
+    autoAttach: true,
+    waitForDebuggerOnStart: true,
+    flatten: true
   });
 }
 
@@ -261,7 +284,6 @@ async function createSourcePage(browser, pathName) {
   page.on('console', (message) => {
     page.__consoleMessages.push(message.text());
   });
-  await attachInterception(page);
   await page.goto(`https://chatgpt.com${pathName}`, {
     waitUntil: 'domcontentloaded',
     timeout: 60_000
@@ -275,7 +297,6 @@ async function waitForAdditionalPage(browser, existingPages, timeoutMs = 20_000)
     const pages = await browser.pages();
     const extra = pages.find((candidate) => !existingPages.includes(candidate));
     if (extra) {
-      await attachInterception(extra);
       return extra;
     }
     await sleep(200);
@@ -746,12 +767,17 @@ async function runNewTabScenario(browser) {
     await newPage.waitForFunction(() => window.location.href.includes('/c/generated-new-window'), {
       timeout: 45_000
     });
-    await newPage.waitForFunction(() => {
-      const composer =
-        document.querySelector('#prompt-textarea') ??
-        document.querySelector('textarea[name="prompt-textarea"]');
-      return composer instanceof HTMLElement;
-    });
+    // The composer is focused asynchronously once the branch reports live, so wait for
+    // that instead of sampling document.activeElement at an arbitrary moment.
+    await newPage.waitForFunction(
+      () => {
+        const composer =
+          document.querySelector('#prompt-textarea') ??
+          document.querySelector('textarea[name="prompt-textarea"]');
+        return composer instanceof HTMLElement && document.activeElement === composer;
+      },
+      { timeout: 20_000 }
+    );
 
     return await Promise.all([
       page.evaluate(() => ({
@@ -907,6 +933,13 @@ async function runTemporaryChatBlockedScenario(browser) {
         errorText:
           document.querySelector('.aside-panel:not([hidden]) .aside-error-copy')?.textContent ??
           null,
+        openBranchVisible: Array.from(
+          document.querySelectorAll('.aside-panel:not([hidden]) .aside-panel-actions button')
+        ).some(
+          (button) =>
+            button.textContent?.trim() === 'Open branch' &&
+            getComputedStyle(button).display !== 'none'
+        ),
         bodyText: document.body.innerText
       })),
       branchFrame.evaluate(() => {
@@ -1158,10 +1191,10 @@ try {
 
   if (
     temporaryChatBlocked.status !== 'Local branch creation failed.' ||
-    !(
-      temporaryChatBlocked.errorText?.includes('temporary-chat mode') ||
-      temporaryChatBlocked.errorText?.includes('persistent chat after temporary mode could not be confirmed')
-    ) ||
+    !temporaryChatBlocked.errorText?.includes('saved this branch as a normal conversation') ||
+    // The leaked conversation has to be surfaced so the user can go and delete it.
+    temporaryChatBlocked.branchLocation !== 'https://chatgpt.com/c/generated-temp-blocked' ||
+    temporaryChatBlocked.openBranchVisible !== true ||
     temporaryChatBlocked.temporaryChatToggleClicks < 1
   ) {
     throw new Error(
