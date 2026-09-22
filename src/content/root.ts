@@ -204,7 +204,19 @@ let persistTimer: number | undefined;
 let persistQueue: Promise<void> = Promise.resolve();
 let toolbarSyncFrame: number | undefined;
 
-type TemporaryChatVerification = 'confirmed' | 'assumed';
+/**
+ * Raised when a requested private mode could not be positively verified. It is a
+ * distinct type because the caller must never treat it as a generic automation
+ * failure and retry in another mode.
+ */
+class PrivacyNotVerifiedError extends Error {
+  readonly privacyBlocked = true;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'PrivacyNotVerifiedError';
+  }
+}
 
 function hasRuntimeAccess(): boolean {
   try {
@@ -325,13 +337,42 @@ async function migrateLegacyPanelStorage(): Promise<void> {
   }
 }
 
-async function readAllPersistedPanelBuckets(): Promise<PersistedPanelBucket[]> {
-  if (!hasRuntimeAccess()) {
+/**
+ * Private branches never reach durable storage.
+ *
+ * A Temporary Chat / Incognito branch exists so its text stays out of history, so
+ * its panel — question, prompt, answer snapshot, derived title and logs — lives in
+ * chrome.storage.session, which the browser clears when the session ends. Persistent
+ * branches keep using storage.local as before.
+ */
+type PanelStorageArea = 'local' | 'session';
+
+function storageAreaForPanel(state: Pick<BranchPanelState, 'branchKind'>): PanelStorageArea {
+  return state.branchKind === 'temporary' ? 'session' : 'local';
+}
+
+let sessionStorageUsable = true;
+
+function storageAreaApi(area: PanelStorageArea): chrome.storage.StorageArea | null {
+  if (area === 'session') {
+    if (!sessionStorageUsable) {
+      return null;
+    }
+    // storage.session is unavailable in a few contexts; callers treat that as
+    // "cannot persist privately" rather than silently falling back to local.
+    return chrome.storage.session ?? null;
+  }
+  return chrome.storage.local;
+}
+
+async function readPanelBucketsFrom(area: PanelStorageArea): Promise<PersistedPanelBucket[]> {
+  const api = storageAreaApi(area);
+  if (!api) {
     return [];
   }
 
   try {
-    const stored = (await chrome.storage.local.get(null)) as Record<string, unknown>;
+    const stored = (await api.get(null)) as Record<string, unknown>;
     return Object.entries(stored)
       .filter(([key]) => isPanelStorageKey(key))
       .map(([key, value]) => ({
@@ -341,6 +382,67 @@ async function readAllPersistedPanelBuckets(): Promise<PersistedPanelBucket[]> {
   } catch (error) {
     if (isInvalidatedError(error)) {
       return [];
+    }
+    if (area === 'session') {
+      // Session storage can be closed to content scripts. Treat it as empty rather
+      // than letting the failure take the persistent panels down with it — and
+      // never fall back to durable storage for private branches.
+      sessionStorageUsable = false;
+      console.warn('[Aside] Session storage is unavailable; private branches will not persist', error);
+      return [];
+    }
+    throw error;
+  }
+}
+
+async function readAllPersistedPanelBuckets(): Promise<PersistedPanelBucket[]> {
+  if (!hasRuntimeAccess()) {
+    return [];
+  }
+
+  const [local, session] = await Promise.all([
+    readPanelBucketsFrom('local'),
+    readPanelBucketsFrom('session')
+  ]);
+
+  // Restore reads both areas; a panel appears in exactly one of them.
+  const merged = new Map<string, BranchPanelState[]>();
+  [...local, ...session].forEach(({ key, panels }) => {
+    merged.set(key, [...(merged.get(key) ?? []), ...panels]);
+  });
+
+  return [...merged.entries()].map(([key, panels]) => ({ key, panels }));
+}
+
+async function writePanelArea(
+  area: PanelStorageArea,
+  mounted: BranchPanelState[],
+  excludedPanelIds: Set<string>
+): Promise<void> {
+  const api = storageAreaApi(area);
+  if (!api) {
+    return;
+  }
+
+  try {
+  const { entries, removableKeys } = mergePanelBuckets(
+    mounted,
+    await readPanelBucketsFrom(area),
+    excludedPanelIds
+  );
+
+  if (removableKeys.length) {
+    await api.remove(removableKeys);
+  }
+
+  if (Object.keys(entries).length) {
+    await api.set(entries);
+  }
+  } catch (error) {
+    if (area === 'session' && !isInvalidatedError(error)) {
+      sessionStorageUsable = false;
+      console.warn('[Aside] Session storage is unavailable; private branches will not persist', error);
+      return;
     }
     throw error;
   }
@@ -352,19 +454,17 @@ async function writePersistedPanels(): Promise<void> {
   }
 
   try {
-    const { entries, removableKeys } = mergePanelBuckets(
-      sortPanels().map((runtime) => runtime.state),
-      await readAllPersistedPanelBuckets(),
-      closedPanelIds
-    );
+    const mounted = sortPanels().map((runtime) => runtime.state);
+    const byArea: Record<PanelStorageArea, BranchPanelState[]> = { local: [], session: [] };
+    mounted.forEach((state) => byArea[storageAreaForPanel(state)].push(state));
 
-    if (removableKeys.length) {
-      await chrome.storage.local.remove(removableKeys);
-    }
+    // A panel that switched mode must not linger in the area it came from, so each
+    // area also treats the other area's live panels as "not mine".
+    const sessionIds = new Set(byArea.session.map((state) => state.panelId));
+    const localIds = new Set(byArea.local.map((state) => state.panelId));
 
-    if (Object.keys(entries).length) {
-      await chrome.storage.local.set(entries);
-    }
+    await writePanelArea('local', byArea.local, new Set([...closedPanelIds, ...sessionIds]));
+    await writePanelArea('session', byArea.session, new Set([...closedPanelIds, ...localIds]));
   } catch (error) {
     if (isInvalidatedError(error)) {
       return;
@@ -420,16 +520,25 @@ async function flushPersistedPanels(): Promise<void> {
   await queuePersistWrite();
 }
 
+/**
+ * Mode preference is per provider: "Temporary Chat" on ChatGPT and "Incognito" on
+ * Claude are different features with different guarantees, and a choice made on one
+ * must not silently become the default on the other.
+ */
+function branchKindStorageKey(): string {
+  return `${LAST_BRANCH_KIND_STORAGE_KEY}:${provider.id}`;
+}
+
 async function loadLastUsedBranchKind(): Promise<void> {
   if (!hasRuntimeAccess()) {
     lastUsedBranchKind = 'persistent';
     return;
   }
 
+  const key = branchKindStorageKey();
   try {
-    const stored = (await chrome.storage.local.get(LAST_BRANCH_KIND_STORAGE_KEY)) as Record<string, unknown>;
-    lastUsedBranchKind =
-      stored[LAST_BRANCH_KIND_STORAGE_KEY] === 'temporary' ? 'temporary' : 'persistent';
+    const stored = (await chrome.storage.local.get(key)) as Record<string, unknown>;
+    lastUsedBranchKind = stored[key] === 'temporary' ? 'temporary' : 'persistent';
   } catch (error) {
     if (!isInvalidatedError(error)) {
       throw error;
@@ -445,7 +554,7 @@ function persistLastUsedBranchKind(kind: BranchKind): void {
   }
 
   void chrome.storage.local
-    .set({ [LAST_BRANCH_KIND_STORAGE_KEY]: kind })
+    .set({ [branchKindStorageKey()]: kind })
     .catch((error) => {
       if (!isInvalidatedError(error)) {
         console.warn('[Aside] Failed to persist branch kind', error);
@@ -1318,7 +1427,15 @@ function materializeSelectionPayload(
   }
 }
 
+/**
+ * A selection taken inside a private chat defaults to a private branch, whatever the
+ * user last chose elsewhere. Inheriting a remembered "Persistent" default here is how
+ * a passage the user deliberately kept out of history ends up saved to it.
+ */
 function getBranchKindForNewDraft(): BranchKind {
+  if (currentIdentity().urlPrivacyHint === 'private') {
+    return 'temporary';
+  }
   return lastUsedBranchKind;
 }
 
@@ -1916,14 +2033,27 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   const copyLogButton = document.createElement('button');
   copyLogButton.type = 'button';
   copyLogButton.textContent = 'Copy log';
-  copyLogButton.title = 'Copy a diagnostic report with the selected text, sent prompt, URLs, and automation steps.';
+  copyLogButton.title =
+    'Copy a redacted diagnostic report: URLs, status and automation steps, without your selected text or prompt.';
+  const copyLogWithContentButton = document.createElement('button');
+  copyLogWithContentButton.type = 'button';
+  copyLogWithContentButton.textContent = 'Copy log + text';
+  copyLogWithContentButton.title =
+    'Copy the diagnostic report including your selected text and the generated prompt.';
   const minimizeButton = document.createElement('button');
   minimizeButton.type = 'button';
   minimizeButton.textContent = 'Minimize';
   const closeButton = document.createElement('button');
   closeButton.type = 'button';
   closeButton.textContent = 'Close';
-  actions.append(jumpButton, openTabHeaderButton, copyLogButton, minimizeButton, closeButton);
+  actions.append(
+    jumpButton,
+    openTabHeaderButton,
+    copyLogButton,
+    copyLogWithContentButton,
+    minimizeButton,
+    closeButton
+  );
   header.append(headingWrap, actions);
 
   const body = document.createElement('div');
@@ -1989,7 +2119,7 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   debugLogTitle.textContent = 'Copyable debug log';
   const debugLogHelp = document.createElement('p');
   debugLogHelp.textContent =
-    'Clipboard access was blocked, so select this log and paste it here. It may include selected text and the first prompt.';
+    'Clipboard access was blocked, so select this log and paste it where you need it.';
   const debugLogTextarea = document.createElement('textarea');
   debugLogTextarea.readOnly = true;
   debugLogTextarea.spellcheck = false;
@@ -2045,7 +2175,10 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     void openBranchInNewTab(runtime.state.panelId);
   });
   copyLogButton.addEventListener('click', () => {
-    void copyBranchDebugLog(runtime.state.panelId);
+    void copyBranchDebugLog(runtime.state.panelId, false);
+  });
+  copyLogWithContentButton.addEventListener('click', () => {
+    void copyBranchDebugLog(runtime.state.panelId, true);
   });
   selectDebugLogButton.addEventListener('click', () => {
     debugLogTextarea.focus();
@@ -2608,11 +2741,25 @@ async function openSelectionInNewTab(
   }
 }
 
-function buildBranchDebugLogText(runtime: PanelRuntime): string {
+const REDACTED = '(redacted — use "Copy log + text" to include it)';
+
+/**
+ * Diagnostics are redacted by default. The selected passage and the generated prompt
+ * are the user's content — and for a private branch they are exactly the content that
+ * must not leave the session — so including them takes a second, explicit action.
+ */
+function buildBranchDebugLogText(runtime: PanelRuntime, includeContent = false): string {
   const { state } = runtime;
+  const redactable = (value: string | undefined | null): string =>
+    includeContent ? (value ?? '(none)') : REDACTED;
+
   return [
     'Aside Debug Log',
-    'This report may include the selected text and the first prompt so we can debug wrong-output failures.',
+    includeContent
+      ? 'CONTAINS YOUR CONTENT: the selected text and the first prompt are included below.'
+      : 'Content is redacted. Use "Copy log + text" if a maintainer needs the selected text and prompt.',
+    `provider: ${provider.id}`,
+    `branchPrivacy: ${state.branchKind === 'temporary' ? provider.privacy.label : 'persistent'}`,
     `generatedAt: ${new Date().toISOString()}`,
     `panelId: ${state.panelId}`,
     `rootChatUrl: ${state.rootChatUrl}`,
@@ -2631,27 +2778,27 @@ function buildBranchDebugLogText(runtime: PanelRuntime): string {
     `titleStatus: ${state.titleStatus}`,
     `createdAt: ${new Date(state.createdAt).toISOString()}`,
     `updatedAt: ${new Date(state.updatedAt).toISOString()}`,
-    `focusPreview: ${state.focusPreview}`,
+    `focusPreview: ${redactable(state.focusPreview)}`,
     `selectedTextLength: ${state.selection.selectedText.length}`,
-    `initialQuestion: ${state.initialQuestion ?? '(none)'}`,
+    `initialQuestion: ${redactable(state.initialQuestion)}`,
     `branchBaseMessageId: ${state.selection.branchBaseMessageId}`,
-    `rangeQuotes: ${JSON.stringify(state.selection.rangeQuotes, null, 2)}`,
+    `rangeQuotes: ${includeContent ? JSON.stringify(state.selection.rangeQuotes, null, 2) : REDACTED}`,
     `selectedBlocks: ${JSON.stringify(
       state.selection.selectedBlocks.map((block) => ({
         role: block.role,
         turnIndex: block.turnIndex,
         messageId: block.messageId,
-        excerpt: block.excerpt
+        excerpt: includeContent ? block.excerpt : REDACTED
       })),
       null,
       2
     )}`,
     '',
     'SELECTED TEXT',
-    state.selection.selectedText,
+    redactable(state.selection.selectedText),
     '',
-    'FIRST PROMPT SENT TO CHATGPT',
-    state.initialPrompt ?? '(none)',
+    `FIRST PROMPT SENT TO ${provider.label.toUpperCase()}`,
+    redactable(state.initialPrompt),
     '',
     'AUTOMATION LOG',
     '',
@@ -2666,13 +2813,13 @@ function showCopyableDebugLog(runtime: PanelRuntime, logText: string): void {
   runtime.debugLogTextarea.select();
 }
 
-async function copyBranchDebugLog(panelId: string): Promise<void> {
+async function copyBranchDebugLog(panelId: string, includeContent = false): Promise<void> {
   const runtime = panelRuntimes.get(panelId);
   if (!runtime) {
     return;
   }
 
-  const logText = buildBranchDebugLogText(runtime);
+  const logText = buildBranchDebugLogText(runtime, includeContent);
   try {
     await navigator.clipboard.writeText(logText);
     appendPanelLog(runtime, 'Debug log copied to clipboard');
@@ -2694,7 +2841,7 @@ async function copyBranchDebugLog(panelId: string): Promise<void> {
     const copyError = error instanceof Error ? error.message : String(error);
     appendPanelLog(runtime, 'Debug log copy failed', copyError);
     runtime.state.statusLabel = 'Clipboard copy was blocked. Select the diagnostic log below and paste it here.';
-    showCopyableDebugLog(runtime, buildBranchDebugLogText(runtime));
+    showCopyableDebugLog(runtime, buildBranchDebugLogText(runtime, includeContent));
     syncPanelUI(runtime);
     persistPanels();
   }
@@ -4180,11 +4327,13 @@ async function ensurePersistentChatMode(
 
 async function ensureTemporaryChatMode(
   composer: HTMLElement | HTMLTextAreaElement
-): Promise<TemporaryChatVerification> {
+): Promise<void> {
+  const label = provider.privacy.label;
   const directActiveControl = findDirectTemporaryChatControl(composer, 'active');
   const directAnyControl = directActiveControl ?? findDirectTemporaryChatControl(composer, 'any');
   const candidates = getRankedTemporaryChatControls(composer);
-  recordAutomationLog('Detected temporary chat controls for temporary branch', {
+  recordAutomationLog('Detected private-mode controls for private branch', {
+    privacyLabel: label,
     directActiveControl: directActiveControl
       ? describeTemporaryChatCandidate(directActiveControl, composer)
       : null,
@@ -4198,71 +4347,98 @@ async function ensureTemporaryChatMode(
   const primaryScore = primaryCandidate ? scoreTemporaryChatCandidate(primaryCandidate, composer) : undefined;
 
   if (!primaryCandidate) {
-    throw new Error(
-      'The temporary-chat control could not be found, so this branch was not sent. Turn temporary chat on in ChatGPT and try again, or switch this branch to Persistent.'
+    throw new PrivacyNotVerifiedError(
+      `Aside could not find ${provider.label}'s ${label} control, so nothing was typed or sent. Turn ${label} on yourself and try again, or switch this branch to Persistent.`
+    );
+  }
+
+  if (isDisabledElement(primaryCandidate)) {
+    throw new PrivacyNotVerifiedError(
+      `${provider.label}'s ${label} control is disabled here, so nothing was typed or sent. This often means the current project or workspace does not allow it.`
     );
   }
 
   const primaryState = inferTemporaryChatState(primaryCandidate);
   if (primaryState === 'active') {
-    recordAutomationLog('Temporary chat mode is already active', {
+    recordAutomationLog('Private mode already active', {
       control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore)
     });
-    return 'confirmed';
+    return;
   }
 
   if (primaryState === 'unknown') {
-    // Fail closed: a temporary branch exists so the passage stays out of chat history,
-    // and guessing here is how it ends up saved.
-    throw new Error(
-      'ChatGPT did not report whether temporary chat is on, so this branch was not sent. Turn temporary chat on in ChatGPT and try again, or switch this branch to Persistent.'
+    throw new PrivacyNotVerifiedError(
+      `${provider.label} did not report whether ${label} is on, so nothing was typed or sent. Turn ${label} on yourself and try again, or switch this branch to Persistent.`
     );
   }
 
-  recordAutomationLog('Temporary chat mode appears inactive; enabling it before send', {
+  recordAutomationLog('Private mode inactive; enabling it before anything is typed', {
     control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore)
   });
   activateControl(primaryCandidate);
 
+  // Only a control we can still see, reporting active, counts as verification. A
+  // control that vanished, never flipped, or timed out is not evidence of anything,
+  // and this is the decision that determines whether private text is saved.
   const deadline = Date.now() + 4_000;
   while (Date.now() < deadline) {
     const refreshedActive = findDirectTemporaryChatControl(composer, 'active');
     const refreshedAny = refreshedActive ?? findDirectTemporaryChatControl(composer, 'any');
-    if (!refreshedAny) {
-      recordAutomationLog('Temporary chat control disappeared after activation; proceeding optimistically', {
-        verification: 'assumed'
-      });
-      return 'assumed';
-    }
 
-    const nextState = inferTemporaryChatState(refreshedAny);
-    if (nextState === 'active') {
-      recordAutomationLog('Temporary chat mode enabled successfully', {
+    if (refreshedAny && inferTemporaryChatState(refreshedAny) === 'active') {
+      recordAutomationLog('Private mode verified active', {
         control: describeTemporaryChatCandidate(refreshedAny, composer)
       });
-      return 'confirmed';
+      return;
     }
 
     await sleep(200);
   }
 
-  recordAutomationLog('Temporary chat mode could not be confirmed after activation; proceeding optimistically', {
-    control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore),
-    verification: 'assumed'
+  throw new PrivacyNotVerifiedError(
+    `Aside turned on ${provider.label}'s ${label} but ${provider.label} never confirmed it, so nothing was typed or sent. Check ${label} yourself and try again, or switch this branch to Persistent.`
+  );
+}
+
+/**
+ * Re-check that the mode still holds after the prompt has been typed. The composer
+ * can remount and a provider can drop out of private mode between the two steps.
+ */
+async function assertPrivateModeStillActive(
+  composer: HTMLElement | HTMLTextAreaElement,
+  prompt: string
+): Promise<void> {
+  const control =
+    findDirectTemporaryChatControl(composer, 'active') ??
+    findDirectTemporaryChatControl(composer, 'any') ??
+    getRankedTemporaryChatControls(composer)[0]?.candidate ??
+    null;
+
+  const state = control ? inferTemporaryChatState(control) : 'missing';
+  if (state === 'active') {
+    return;
+  }
+
+  recordAutomationLog('Private mode stopped being verifiable after the prompt was typed', {
+    state,
+    control: control ? describeTemporaryChatCandidate(control, composer) : null
   });
-  return 'assumed';
+  clearComposerAfterFailure(prompt);
+  throw new PrivacyNotVerifiedError(
+    `${provider.label} stopped reporting ${provider.privacy.label} while the branch was being prepared, so it was not sent. The text was removed from the composer.`
+  );
 }
 
 async function ensureBranchKindMode(
   branchKind: BranchKind,
   composer: HTMLElement | HTMLTextAreaElement
-): Promise<TemporaryChatVerification> {
+): Promise<void> {
   if (branchKind === 'temporary') {
-    return ensureTemporaryChatMode(composer);
+    await ensureTemporaryChatMode(composer);
+    return;
   }
 
   await ensurePersistentChatMode(composer);
-  return 'confirmed';
 }
 
 function scoreSendButtonCandidate(
@@ -4400,23 +4576,36 @@ async function submitComposer(
   branchKind: BranchKind
 ): Promise<{
   acceptedSignal: 'persistent_url' | 'stop_button' | 'transcript_growth';
-  temporaryVerification: TemporaryChatVerification;
 }> {
-  recordAutomationLog('Submitting first branch prompt', {
+  recordAutomationLog('Preparing first branch prompt', {
     promptLength: prompt.length,
+    branchKind,
     currentUrl: normalizeChatUrl(window.location.href)
   });
   const initialUrl = normalizeChatUrl(window.location.href);
   const baselineTurnCount = countTranscriptTurns(document);
+
+  // Order matters and is the whole point of this sequence:
+  //   surface -> activate the requested mode -> verify it -> acquire composer ->
+  //   fill -> recheck the mode -> submit once.
+  // Filling first, as this used to, means the selected passage is already sitting
+  // in the composer when a mode control that might itself submit gets clicked.
   let composer = await waitForComposer();
+  await ensureBranchKindMode(branchKind, composer);
+
+  // The mode toggle can navigate and remount the composer, so acquire it again
+  // rather than typing into a detached node.
+  composer = await waitForComposer();
   let composerSnapshot = describeComposerCandidate(composer);
   let form = composer.closest('form');
-  recordAutomationLog('Composer found for first branch prompt', {
+  recordAutomationLog('Composer acquired after the chat mode was verified', {
     composerTag: composer.tagName,
     composerCandidate: composerSnapshot,
     baselineTurnCount,
+    branchKind,
     hasForm: form instanceof HTMLFormElement
   });
+
   const fillResult = await fillComposerWithStrategies(composer, prompt);
   composer = fillResult.composer;
   composerSnapshot = describeComposerCandidateForLog(composer, composerSnapshot);
@@ -4426,48 +4615,10 @@ async function submitComposer(
     valueLength: fillResult.valueLength,
     composerCandidate: composerSnapshot
   });
-  await sleep(450);
-  const temporaryVerification = await ensureBranchKindMode(branchKind, composer);
 
-  // Toggling temporary chat navigates ChatGPT to a fresh chat and remounts the composer.
-  // Without re-checking, the prompt that was typed a moment ago is silently gone and the
-  // send button click posts nothing at all.
-  composer = refreshComposerReference(composer);
-  const significantAfterToggle = getComposerSignificantLength(composer);
-  const expectedSignificant = countSignificantChars(prompt);
-
-  // Only react to the composer actually losing the prompt: a rich-text composer can
-  // normalize its content and come back a little short, and refilling on that would cost
-  // a needless round trip on every branch.
-  if (significantAfterToggle < expectedSignificant / 2) {
-    // The toggle can itself be a submit control, in which case the composer is empty
-    // because the prompt was already sent. Refilling there would ask twice.
-    const alreadyAccepted = await waitForAcceptedGenerationSignalOrNull(
-      baselineTurnCount,
-      initialUrl,
-      0
-    );
-
-    if (alreadyAccepted) {
-      recordAutomationLog('Chat-mode toggle submitted the prompt; not refilling', {
-        acceptedSignal: alreadyAccepted,
-        branchKind
-      });
-      return { acceptedSignal: alreadyAccepted, temporaryVerification };
-    }
-
-    recordAutomationLog('Composer lost the prompt after the chat-mode toggle; refilling', {
-      significantLength: significantAfterToggle,
-      expectedSignificantLength: expectedSignificant,
-      branchKind
-    });
-    const refill = await fillComposerWithStrategies(composer, prompt);
-    composer = refill.composer;
-    fillResult.composer = refill.composer;
-    fillResult.strategy = refill.strategy;
-    fillResult.valueLength = refill.valueLength;
-    composerSnapshot = describeComposerCandidateForLog(composer, composerSnapshot);
-    form = composer.closest('form');
+  // The mode can change between typing and sending; check again before submitting.
+  if (branchKind === 'temporary') {
+    await assertPrivateModeStillActive(composer, prompt);
   }
 
   const logVisibleButtonContext = (label: string) => {
@@ -4481,8 +4632,7 @@ async function submitComposer(
         .map((candidate) => describeSendButtonCandidate(candidate, currentComposer)),
       temporaryChatCandidates: getRankedTemporaryChatControls(currentComposer)
         .slice(0, 8)
-        .map((entry) => describeTemporaryChatCandidate(entry.candidate, currentComposer, entry.score)),
-      temporaryVerification
+        .map((entry) => describeTemporaryChatCandidate(entry.candidate, currentComposer, entry.score))
     });
   };
 
@@ -4564,19 +4714,18 @@ async function submitComposer(
     stage: string
   ): Promise<{
     acceptedSignal: 'persistent_url' | 'stop_button' | 'transcript_growth';
-    temporaryVerification: TemporaryChatVerification;
   }> => {
     recordAutomationLog('Composer was cleared after submit; waiting instead of resending', {
       stage,
       currentUrl: normalizeChatUrl(window.location.href)
     });
     const acceptedSignal = await waitForAcceptedGenerationSignal(baselineTurnCount, initialUrl);
-    return { acceptedSignal, temporaryVerification };
+    return { acceptedSignal };
   };
 
   const primarySendSignal = await attemptClickSendButton('primary');
   if (primarySendSignal) {
-    return { acceptedSignal: primarySendSignal, temporaryVerification };
+    return { acceptedSignal: primarySendSignal };
   }
 
   if (promptLooksAccepted()) {
@@ -4612,7 +4761,7 @@ async function submitComposer(
       acceptedSignal: enterSignal,
       currentUrl: normalizeChatUrl(window.location.href)
     });
-    return { acceptedSignal: enterSignal, temporaryVerification };
+    return { acceptedSignal: enterSignal };
   }
 
   recordAutomationLog('No generation signal appeared after Enter fallback', {
@@ -4639,7 +4788,7 @@ async function submitComposer(
         acceptedSignal: syntheticSignal,
         currentUrl: normalizeChatUrl(window.location.href)
       });
-      return { acceptedSignal: syntheticSignal, temporaryVerification };
+      return { acceptedSignal: syntheticSignal };
     }
 
     recordAutomationLog('No generation signal appeared after guarded synthetic submit', {
@@ -4653,7 +4802,7 @@ async function submitComposer(
 
   const rescannedSignal = await attemptClickSendButton('final_rescan', 4_500);
   if (rescannedSignal) {
-    return { acceptedSignal: rescannedSignal, temporaryVerification };
+    return { acceptedSignal: rescannedSignal };
   }
 
   logVisibleButtonContext('All embedded submit strategies were attempted without a generation signal');
@@ -4666,7 +4815,7 @@ async function submitComposer(
     currentUrl: normalizeChatUrl(window.location.href),
     stopButtonVisible: Boolean(findStopButton())
   });
-  return { acceptedSignal, temporaryVerification };
+  return { acceptedSignal };
 }
 
 // A temporary chat never gets a /c/<id> URL. ChatGPT rewrites the URL a beat after it
@@ -4715,21 +4864,15 @@ let observedBranchTitle = '';
 // typing in that window, and wiping their text would be far worse than the stray prompt.
 // A temporary branch that produced a /c/ URL is in the user's permanent history. Report
 // the URL rather than a bare failure, so the panel can offer to open and delete it.
-async function reportTemporaryBranchLeak(
-  branchChatUrl: string,
-  temporaryVerification: TemporaryChatVerification
-): Promise<void> {
-  recordAutomationLog('Temporary branch landed in a persistent conversation', {
-    temporaryVerification,
+async function reportTemporaryBranchLeak(branchChatUrl: string): Promise<void> {
+  recordAutomationLog('Private branch landed in a persistent conversation', {
+    privacyLabel: provider.privacy.label,
     branchChatUrl
   });
 
   await sendAutomationEvent({
     kind: 'failed',
-    reason:
-      temporaryVerification === 'assumed'
-        ? 'ChatGPT saved this branch as a normal conversation because temporary mode could not be confirmed. Open the branch to review or delete it.'
-        : 'ChatGPT saved this branch as a normal conversation even though temporary mode looked active. Open the branch to review or delete it.',
+    reason: `${provider.label} saved this branch as a normal conversation even though ${provider.privacy.label} was verified before sending. Open the branch to review or delete it.`,
     branchChatUrl
   });
 }
@@ -4931,7 +5074,7 @@ async function runBranchPromptAutomation(
       await sleep(1200);
     }
 
-    const { acceptedSignal, temporaryVerification } = await submitComposer(
+    const { acceptedSignal } = await submitComposer(
       message.prompt,
       message.branchKind
     );
@@ -4941,13 +5084,12 @@ async function runBranchPromptAutomation(
 
     if (message.branchKind === 'temporary') {
       if (immediateBranchUrl) {
-        await reportTemporaryBranchLeak(immediateBranchUrl, temporaryVerification);
+        await reportTemporaryBranchLeak(immediateBranchUrl);
         return;
       }
 
-      recordAutomationLog('Temporary branch accepted generation signal', {
+      recordAutomationLog('Private branch accepted generation signal', {
         acceptedSignal,
-        temporaryVerification,
         currentUrl: normalizeChatUrl(window.location.href)
       });
       // Go live now and keep watching: ChatGPT rewrites the URL a beat after it starts
@@ -4958,7 +5100,7 @@ async function runBranchPromptAutomation(
       void (async () => {
         const leakedUrl = await watchForPersistentConversationUrl(TEMPORARY_LEAK_WATCH_MS);
         if (leakedUrl) {
-          await reportTemporaryBranchLeak(leakedUrl, temporaryVerification);
+          await reportTemporaryBranchLeak(leakedUrl);
         }
       })();
 

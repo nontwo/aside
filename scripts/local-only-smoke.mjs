@@ -20,6 +20,10 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Unique per-run text so a storage assertion cannot be satisfied by another
+// scenario's content in the shared browser profile.
+const PRIVATE_PROBE_QUESTION = 'private probe marker 4711';
+
 const LAYOUT_CHROME_CSS = `    <style>
       :root { color-scheme: light; }
       * { box-sizing: border-box; }
@@ -305,6 +309,34 @@ async function installBrowserInterception(browser) {
     autoAttach: true,
     waitForDebuggerOnStart: true,
     flatten: true
+  });
+}
+
+
+/**
+ * Read the extension's own storage through its service worker. Page contexts cannot
+ * see chrome.storage, and asserting on what actually landed on disk is the only way
+ * to prove a private branch stayed out of it.
+ */
+async function readExtensionStorage(browser) {
+  const deadline = Date.now() + 15_000;
+  let workerTarget = null;
+  while (Date.now() < deadline && !workerTarget) {
+    workerTarget = browser.targets().find((target) => target.type() === 'service_worker');
+    if (!workerTarget) {
+      await sleep(200);
+    }
+  }
+
+  if (!workerTarget) {
+    throw new Error('Extension service worker target was not found.');
+  }
+
+  const worker = await workerTarget.worker();
+  return worker.evaluate(async () => {
+    const local = await chrome.storage.local.get(null);
+    const session = chrome.storage.session ? await chrome.storage.session.get(null) : {};
+    return { local: JSON.stringify(local), session: JSON.stringify(session) };
   });
 }
 
@@ -933,7 +965,9 @@ async function runEnterOnlyScenario(browser) {
   }
 }
 
-async function runTemporaryChatRecoveryScenario(browser) {
+async function runTemporaryChatUnconfirmedScenario(browser) {
+  // The toggle flips internally but never reflects an active state in the DOM, so
+  // Aside cannot positively verify privacy. Nothing may be typed or sent.
   routeMap = {
     '/c/source-temp-recovery': buildSourceHtml(),
     '/': buildSuccessComposerHtml({
@@ -961,29 +995,97 @@ async function runTemporaryChatRecoveryScenario(browser) {
       button.click();
     });
     const branchFrame = await waitForBranchFrame(page);
-    await waitForPanelStatus(page, /Branch answer is ready in this window\./);
+    await waitForPanelStatus(page, /Local branch creation failed\./);
 
     return await Promise.all([
       page.evaluate(() => ({
         status:
           document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
           null,
-        openBranchVisible: Array.from(
-          document.querySelectorAll('.aside-panel:not([hidden]) .aside-panel-actions button')
-        ).some((button) => button.textContent?.trim() === 'Open branch' && getComputedStyle(button).display !== 'none')
+        errorText:
+          document.querySelector('.aside-panel:not([hidden]) .aside-error-copy')?.textContent ??
+          null,
+        // The question must survive so the user can retry or switch mode.
+        questionPreserved:
+          document.querySelector('.aside-panel:not([hidden]) textarea')?.value ?? null,
+        formVisible:
+          getComputedStyle(document.querySelector('.aside-panel:not([hidden]) form')).display !==
+          'none'
       })),
       branchFrame.evaluate(() => {
-        const temporaryChatToggle = document.getElementById('temporary-chat-toggle');
+        const composer = document.querySelector('#composer-form textarea');
+        return {
+          branchLocation: window.location.href,
+          temporaryChatToggleClicks: window.__temporaryChatToggleClicks ?? 0,
+          // The two facts that matter: nothing was typed, nothing was submitted.
+          composerValue: composer instanceof HTMLTextAreaElement ? composer.value : null,
+          lastPrompt: window.__lastPrompt ?? null,
+          turnsRendered: document.querySelectorAll('#turns [data-message-author-role]').length
+        };
+      })
+    ]).then(([source, branch]) => ({ ...source, ...branch }));
+  } finally {
+    await page.close();
+  }
+}
+
+async function runTemporaryChatVerifiedScenario(browser) {
+  // The happy path: the toggle reports active, so the branch proceeds and stays
+  // out of persistent history.
+  routeMap = {
+    '/c/source-temp-ok': buildSourceHtml(),
+    '/': buildSuccessComposerHtml({
+      conversationPath: '/c/generated-temp-ok',
+      includeTemporaryChatToggle: true,
+      temporaryChatInitiallyActive: false,
+      temporaryChatDisableable: true,
+      temporaryChatActivationStyle: 'visible',
+      temporaryModeSkipsConversationUrl: true,
+      realComposerId: ''
+    })
+  };
+
+  const page = await createSourcePage(browser, '/c/source-temp-ok');
+
+  try {
+    await openDraft(page);
+    await setPanelBranchKind(page, 'Temporary');
+    await page.type('.aside-panel:not([hidden]) textarea', PRIVATE_PROBE_QUESTION);
+    await page.evaluate(() => {
+      const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
+      if (!(button instanceof HTMLButtonElement)) {
+        throw new Error('Panel submit button not found');
+      }
+      button.click();
+    });
+    const branchFrame = await waitForBranchFrame(page);
+    await waitForPanelStatus(page, /Branch answer is ready in this window\./);
+
+    const storage = await readExtensionStorage(browser);
+
+    return await Promise.all([
+      page.evaluate(() => ({
+        status:
+          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
+          null
+      })),
+      branchFrame.evaluate(() => {
+        const toggle = document.getElementById('temporary-chat-toggle');
         return {
           branchLocation: window.location.href,
           temporaryChatToggleClicks: window.__temporaryChatToggleClicks ?? 0,
           temporaryChatModeActive: window.__temporaryChatModeActive ?? false,
-          temporaryChatState: temporaryChatToggle?.getAttribute('aria-pressed') ?? null,
-          temporaryChatLabel: temporaryChatToggle?.getAttribute('aria-label') ?? null,
-          temporaryChatText: temporaryChatToggle?.textContent ?? null
+          temporaryChatState: toggle?.getAttribute('aria-pressed') ?? null,
+          lastPrompt: window.__lastPrompt ?? null
         };
       })
-    ]).then(([source, branch]) => ({ ...source, ...branch }));
+    ]).then(([source, branch]) => ({
+      ...source,
+      ...branch,
+      // The question text must be findable in session storage and absent from local.
+      privateTextInLocalStorage: storage.local.includes(PRIVATE_PROBE_QUESTION),
+      privateTextInSessionStorage: storage.session.includes(PRIVATE_PROBE_QUESTION)
+    }));
   } finally {
     await page.close();
   }
@@ -1036,11 +1138,15 @@ async function runTemporaryChatBlockedScenario(browser) {
       })),
       branchFrame.evaluate(() => {
         const temporaryChatToggle = document.getElementById('temporary-chat-toggle');
+        const composer = document.querySelector('#composer-form textarea');
         return {
           branchLocation: window.location.href,
           temporaryChatToggleClicks: window.__temporaryChatToggleClicks ?? 0,
           temporaryChatLabel: temporaryChatToggle?.getAttribute('aria-label') ?? null,
-          temporaryChatText: temporaryChatToggle?.textContent ?? null
+          temporaryChatText: temporaryChatToggle?.textContent ?? null,
+          composerValue: composer instanceof HTMLTextAreaElement ? composer.value : null,
+          lastPrompt: window.__lastPrompt ?? null,
+          turnsRendered: document.querySelectorAll('#turns [data-message-author-role]').length
         };
       })
     ]).then(([source, branch]) => ({ ...source, ...branch }));
@@ -1151,7 +1257,8 @@ try {
   const newTab = includeNativeWindowSmoke ? await runNewTabScenario(browser) : null;
   const enterOnly = await runEnterOnlyScenario(browser);
   const project = await runProjectScenario(browser);
-  const temporaryChatRecovery = await runTemporaryChatRecoveryScenario(browser);
+  const temporaryChatUnconfirmed = await runTemporaryChatUnconfirmedScenario(browser);
+  const temporaryChatVerified = await runTemporaryChatVerifiedScenario(browser);
   const temporaryChatBlocked = await runTemporaryChatBlockedScenario(browser);
   const failure = await runFailureScenario(browser);
 
@@ -1161,7 +1268,8 @@ try {
     newTab,
     enterOnly,
     project,
-    temporaryChatRecovery,
+    temporaryChatUnconfirmed,
+    temporaryChatVerified,
     temporaryChatBlocked,
     failure
   };
@@ -1282,23 +1390,47 @@ try {
   }
 
   if (
-    temporaryChatRecovery.status !== 'Branch answer is ready in this window.' ||
-    temporaryChatRecovery.branchLocation.includes('/c/') ||
-    temporaryChatRecovery.temporaryChatToggleClicks < 1 ||
-    temporaryChatRecovery.temporaryChatModeActive !== true ||
-    temporaryChatRecovery.openBranchVisible !== false
+    // Unverifiable privacy must block BEFORE anything is typed or sent.
+    temporaryChatUnconfirmed.status !== 'Local branch creation failed.' ||
+    !/never confirmed it|did not report/i.test(temporaryChatUnconfirmed.errorText ?? '') ||
+    temporaryChatUnconfirmed.composerValue !== '' ||
+    temporaryChatUnconfirmed.lastPrompt !== null ||
+    temporaryChatUnconfirmed.turnsRendered !== 0 ||
+    temporaryChatUnconfirmed.branchLocation.includes('/c/') ||
+    // …and the user keeps their question and a way to retry.
+    temporaryChatUnconfirmed.questionPreserved !== 'Why this assumption?' ||
+    temporaryChatUnconfirmed.formVisible !== true
   ) {
     throw new Error(
-      `Temporary-chat recovery scenario failed: ${JSON.stringify(temporaryChatRecovery)}`
+      `Unverified temporary chat must block the send: ${JSON.stringify(temporaryChatUnconfirmed)}`
     );
   }
 
   if (
+    temporaryChatVerified.status !== 'Branch answer is ready in this window.' ||
+    temporaryChatVerified.temporaryChatToggleClicks < 1 ||
+    temporaryChatVerified.temporaryChatModeActive !== true ||
+    temporaryChatVerified.temporaryChatState !== 'true' ||
+    temporaryChatVerified.branchLocation.includes('/c/') ||
+    !temporaryChatVerified.lastPrompt?.includes('SELECTED PASSAGE') ||
+    // A private branch must never reach durable storage.
+    temporaryChatVerified.privateTextInLocalStorage !== false ||
+    temporaryChatVerified.privateTextInSessionStorage !== true
+  ) {
+    throw new Error(
+      `Verified temporary chat should send normally: ${JSON.stringify(temporaryChatVerified)}`
+    );
+  }
+
+  if (
+    // A temporary chat that cannot be turned on must block, not leak. Previously
+    // this path typed the passage into a persistent chat and reported it afterwards.
     temporaryChatBlocked.status !== 'Local branch creation failed.' ||
-    !temporaryChatBlocked.errorText?.includes('saved this branch as a normal conversation') ||
-    // The leaked conversation has to be surfaced so the user can go and delete it.
-    temporaryChatBlocked.branchLocation !== 'https://chatgpt.com/c/generated-temp-blocked' ||
-    temporaryChatBlocked.openBranchVisible !== true ||
+    !/never confirmed it|did not report|could not find/i.test(temporaryChatBlocked.errorText ?? '') ||
+    temporaryChatBlocked.composerValue !== '' ||
+    temporaryChatBlocked.lastPrompt !== null ||
+    temporaryChatBlocked.turnsRendered !== 0 ||
+    temporaryChatBlocked.branchLocation.includes('/c/') ||
     temporaryChatBlocked.temporaryChatToggleClicks < 1
   ) {
     throw new Error(

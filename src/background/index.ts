@@ -61,6 +61,32 @@ function hydrateSessions(): Promise<Map<string, BranchWindowSession>> {
   return hydration;
 }
 
+/**
+ * Private branch panels are stored in chrome.storage.session so they never reach
+ * disk. That area is TRUSTED_CONTEXTS-only by default, which excludes content
+ * scripts, so the worker opens it to this extension's own content scripts. It stays
+ * extension-scoped: no web page can read it.
+ */
+async function allowContentScriptSessionStorage(): Promise<void> {
+  try {
+    await chrome.storage.session.setAccessLevel({
+      accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS'
+    });
+  } catch {
+    // Older Chrome builds lack setAccessLevel; the content script then treats
+    // session storage as unavailable and refuses to persist private branches
+    // rather than falling back to durable storage.
+  }
+}
+
+void allowContentScriptSessionStorage();
+chrome.runtime.onStartup.addListener(() => {
+  void allowContentScriptSessionStorage();
+});
+chrome.runtime.onInstalled.addListener(() => {
+  void allowContentScriptSessionStorage();
+});
+
 async function persistSessions(): Promise<void> {
   try {
     await chrome.storage.session.set({
