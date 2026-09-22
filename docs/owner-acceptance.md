@@ -19,7 +19,8 @@ npm run build
    page load only.
 
 Reference images captured from the fixtures live in
-[`docs/layout-evidence/`](./layout-evidence/).
+[`docs/layout-evidence/`](./layout-evidence/), including the panel with its
+Context section and each provider's private-mode note.
 
 ## Checklist
 
@@ -60,11 +61,17 @@ On ChatGPT and again on Claude:
 
 ### 4. Private branches
 
-- [ ] Choose Temporary (ChatGPT) / Incognito (Claude) and send. It only proceeds
-      once the provider's own control reads as on.
+- [ ] The private toggle reads the provider's own name for the mode — `Temporary
+      Chat` on ChatGPT, `Incognito chat` on Claude — and opening the note under it
+      lists what that provider documents about the mode.
+- [ ] Choose it and send. It only proceeds once the provider's own control reads
+      as on.
 - [ ] Turn the provider's private mode off, then try again. Aside must refuse
       **before typing anything**, keep your question, and offer a retry. Check the
       provider's composer is empty — nothing should have been typed into it.
+- [ ] Turn private mode off *while* a branch is being prepared (right after
+      pressing Start branch). Aside must stop and clear the composer rather than
+      finishing the send.
 - [ ] Select text inside a private chat and open a branch. It should default to
       private, not to whatever you last used.
 
@@ -81,10 +88,19 @@ On ChatGPT and again on Claude:
 
 - [ ] Open the same conversation in two tabs. Edit a draft in one; the other
       picks it up.
+- [ ] Open a third tab on that conversation *while* you are typing in the first.
+      The new tab shows the draft, not a stale copy of it.
+- [ ] Edit the same draft in both tabs at once. Whichever tab loses keeps the text
+      you typed in its box — it is never replaced by the other tab's version
+      without you seeing it — and the panel reads as unsaved until it lands.
+- [ ] Mark a branch Private in one tab. Reload the other. It comes back Private,
+      not Persistent.
 - [ ] Close the branch in tab A. It disappears from tab B and does not come back.
 
 ## What to expect to be imperfect
 
+- Neither provider was run against a live account in this work. Both declare their
+  surfaces as `fixture-only`, which is what this checklist exists to move past.
 - Claude's selectors are fixture-verified only. If Claude's interface has moved on
   your account, Aside should report the capability as unavailable rather than
   misbehave — if it does something else, that is a bug worth reporting.

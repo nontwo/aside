@@ -17,6 +17,9 @@ own selection action, injected by the harness so coexistence can be measured.
 | `rail-1440-collapsed-dark.png` | Dark theme, sidebar collapsed — the rail re-anchors into the freed space |
 | `rail-1024-open-light.png` | Laptop width with the sidebar open |
 | `rail-768-open-light.png` | No usable gutter: the rail is replaced by the compact `Aside (n)` launcher in verified free space, clear of the sidebar and the native action |
+| `panel-chatgpt-context-and-privacy.png` | The ChatGPT panel with the Context section open and ChatGPT's own name for the private mode on the toggle |
+| `panel-claude-private-constraints.png` | The Claude panel: the toggle reads `Incognito chat`, and Claude's documented constraints are on screen before a private branch runs |
+| `panel-claude-context.png` | The Claude panel with a question typed, ready to open a branch in a driven window |
 
 The branch count in the compact launcher reflects panels accumulated across
 scenarios in the shared test profile, not a realistic session.

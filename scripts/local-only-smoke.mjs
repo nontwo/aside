@@ -1082,6 +1082,20 @@ async function runTemporaryChatUnconfirmedScenario(browser) {
   try {
     await openDraft(page);
     await setPanelBranchKind(page, 'temporary');
+    // Evidence for the owner checklist: the ChatGPT panel with its Context
+    // section and ChatGPT's own name for the private mode.
+    await page.evaluate(() => {
+      const note = document.querySelector('.aside-panel:not([hidden]) .aside-privacy-note');
+      if (note instanceof HTMLDetailsElement) {
+        note.open = true;
+      }
+      const context = document.querySelector('.aside-panel:not([hidden]) .aside-context details');
+      if (context instanceof HTMLDetailsElement) {
+        context.open = true;
+      }
+    });
+    await sleep(150);
+    await capture(page, 'panel-chatgpt-context-and-privacy');
     await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
     await page.evaluate(() => {
       const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
@@ -1606,11 +1620,30 @@ async function runClaudeScenario(browser, { variant = 'current' } = {}) {
         document.querySelector('.aside-panel:not([hidden]) .aside-context-preview')?.textContent ?? ''
     );
 
+    if (variant === 'current') {
+      // Evidence for the owner checklist: the private toggle carries Claude's own
+      // word for the mode, and its documented constraints are on screen before a
+      // private branch runs.
+      await setPanelBranchKind(page, 'temporary');
+      await page.evaluate(() => {
+        const note = document.querySelector('.aside-panel:not([hidden]) .aside-privacy-note');
+        if (note instanceof HTMLDetailsElement) {
+          note.open = true;
+        }
+      });
+      await sleep(150);
+      await capture(page, 'panel-claude-private-constraints');
+    }
+
     await setPanelBranchKind(page, 'persistent');
     await page.type(
       '.aside-panel:not([hidden]) textarea[data-aside-role="question"]',
       'Why this assumption?'
     );
+    if (variant === 'current') {
+      await sleep(150);
+      await capture(page, 'panel-claude-context');
+    }
     await page.evaluate(() => {
       document.querySelector('.aside-panel:not([hidden]) button[type="submit"]')?.click();
     });

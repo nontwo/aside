@@ -44,7 +44,14 @@ to be readable, the rail is replaced by the compact entry in verified free space
 | Branch surface | embedded panel | window Aside drives (claude.ai refuses framing) |
 | Private mode | Temporary Chat | Incognito chat |
 | Private mode caveats | controls history, not personalization; can later be saved to history from ChatGPT | unavailable inside projects, so starting one leaves the project; a closed Incognito chat cannot be reopened |
-| Verified against | offline fixtures and the live site's DOM conventions | offline fixtures only — **not live-verified** |
+| Evidence level | `fixture-only` | `fixture-only` |
+| Verified against | offline fixtures and the live site's DOM conventions | offline fixtures only |
+
+No surface is declared `verified`. In this codebase that level means the adapter
+positively observed the capability in a live DOM, and nothing here does: neither
+provider was run against a live logged-in account in this work. `fixture-only`
+means implemented and exercised against local fixtures — Aside offers it, and does
+not claim it is proven.
 
 Claude's selectors are candidates ordered semantic-first and are re-detected after
 navigation. Claude's interface is mid-migration between the current and previous
@@ -60,10 +67,23 @@ so you can retry or switch to a persistent branch. Nothing is ever downgraded fr
 private to persistent automatically, and a selection made inside a private chat
 defaults to a private branch.
 
+Before a private branch runs, the panel shows what that provider documents about
+its own private mode — including, on Claude, that Incognito is unavailable inside
+projects and that a closed Incognito chat cannot be reopened. The toggle carries
+the provider's own name for the mode, so it is recognisable in the provider's own
+interface.
+
 Private branch text, prompts, answers and logs are kept in session storage, which
-the browser clears when the session ends. They never reach durable storage. That
-is a statement about this extension only: Aside can observe the page, and cannot
-make any claim about what a provider retains on its servers.
+the browser clears when the session ends. They never reach durable storage. If a
+browser does not make session storage available, Aside says so in the panel and
+keeps refusing to write private branch content to disk — a private branch still
+runs, it just cannot be kept. That is a statement about this extension only: Aside
+can observe the page, and cannot make any claim about what a provider retains on
+its servers.
+
+The mode is re-checked after the composer is acquired and again before every
+submit attempt, not only the first: the fallback chain that handles providers
+where a click does not send spans several seconds of further attempts.
 
 ## Local development
 
