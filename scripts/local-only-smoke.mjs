@@ -15,6 +15,7 @@ const headless = process.env.HEADLESS !== 'false';
 const includeNativeWindowSmoke = process.env.SKIP_NATIVE_WINDOW_SMOKE !== 'true';
 
 let routeMap = {};
+let claudeRouteMap = {};
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -254,8 +255,18 @@ function buildFalsePositiveComposerHtml() {
 
 const NOT_FOUND_HTML = '<!doctype html><html><body>not found</body></html>';
 
-function resolveRouteBody(pathname) {
-  return routeMap[pathname] ?? routeMap['*'] ?? NOT_FOUND_HTML;
+/** Every host the harness is allowed to answer for. Anything else is an escape. */
+const SERVED_HOSTS = new Set(['chatgpt.com', 'chat.openai.com', 'claude.ai']);
+
+/**
+ * Requests that reached a host the harness does not serve. The run fails on any
+ * entry: a default smoke must never touch a real provider.
+ */
+const networkEscapes = [];
+
+function resolveRouteBody(hostname, pathname) {
+  const hostRoutes = hostname === 'claude.ai' ? claudeRouteMap : routeMap;
+  return hostRoutes[pathname] ?? hostRoutes['*'] ?? NOT_FOUND_HTML;
 }
 
 async function fulfillPausedRequest(session, event) {
@@ -268,17 +279,31 @@ async function fulfillPausedRequest(session, event) {
     url = null;
   }
 
-  if (!url || url.hostname !== 'chatgpt.com') {
+  if (!url) {
     await session.send('Fetch.continueRequest', { requestId }).catch(() => {});
     return;
   }
 
+  if (!SERVED_HOSTS.has(url.hostname)) {
+    // Everything that is not a fixture host is blocked outright and recorded, so
+    // an accidental request to a real provider fails the run instead of silently
+    // succeeding against a live account.
+    if (url.protocol === 'http:' || url.protocol === 'https:') {
+      networkEscapes.push(url.origin + url.pathname);
+      await session.send('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' }).catch(() => {});
+      return;
+    }
+    await session.send('Fetch.continueRequest', { requestId }).catch(() => {});
+    return;
+  }
+
+  const servedBody = resolveRouteBody(url.hostname, url.pathname);
   await session
     .send('Fetch.fulfillRequest', {
       requestId,
       responseCode: 200,
       responseHeaders: [{ name: 'Content-Type', value: 'text/html; charset=utf-8' }],
-      body: Buffer.from(resolveRouteBody(url.pathname), 'utf8').toString('base64')
+      body: Buffer.from(servedBody, 'utf8').toString('base64')
     })
     .catch(() => {});
 }
@@ -914,7 +939,7 @@ async function runWhyScenario(browser) {
         })} :: ${error instanceof Error ? error.message : String(error)}`
       );
     }
-    await waitForPanelStatus(page, /native ChatGPT window/i, 30_000);
+    await waitForPanelStatus(page, /ready in its ChatGPT window/i, 30_000);
 
     return await Promise.all([
       page.evaluate(() => ({
@@ -1361,6 +1386,256 @@ async function runCrossTabScenario(browser) {
   }
 }
 
+
+/**
+ * Claude fixtures.
+ *
+ * Sanitized shapes built from the adapter's candidate selectors: user turns carry
+ * data-testid="user-message", assistant turns render in .font-claude-message with
+ * .standard-markdown content, and the composer is a ProseMirror contenteditable
+ * with an aria-labelled send button. These exercise the adapter offline; they are
+ * not a capture of a live Claude account.
+ */
+function buildClaudeSourceHtml({ variant = 'current' } = {}) {
+  const assistantMarkup =
+    variant === 'legacy'
+      ? `<div data-testid="assistant-message"><div class="standard-markdown">
+           <p>The convexity assumption guarantees the relaxation stays tight and keeps optimization stable.</p>
+           <p>Older unrelated details should not matter.</p>
+         </div></div>`
+      : `<div class="font-claude-message"><div class="standard-markdown">
+           <p>The convexity assumption guarantees the relaxation stays tight and keeps optimization stable.</p>
+           <p>Older unrelated details should not matter.</p>
+         </div></div>`;
+
+  return `<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Fake Claude Source</title>${LAYOUT_CHROME_CSS}</head>
+  <body data-sidebar="open">
+    <nav aria-label="Chat history"><div>Recents</div></nav>
+    <main>
+      <header>Fake Claude header</header>
+      <div data-testid="user-message"><p>Tell me about convexity.</p></div>
+      ${assistantMarkup}
+    </main>
+  </body>
+</html>`;
+}
+
+function buildClaudeComposerHtml({ conversationPath = '/chat/generated-claude', incognito = 'available' } = {}) {
+  const incognitoMarkup =
+    incognito === 'none'
+      ? ''
+      : `<button id="incognito-toggle" type="button" aria-label="Start incognito chat" aria-pressed="false">Incognito</button>`;
+
+  return `<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Fake Claude Branch</title>${LAYOUT_CHROME_CSS}</head>
+  <body data-sidebar="open">
+    <nav aria-label="Chat history"><div>Recents</div></nav>
+    <main>
+      <header>Fake Claude header</header>
+      <div id="turns"></div>
+      <form id="composer-form">
+        <fieldset style="border:0;padding:0;margin:0;">
+          <div id="prompt" class="ProseMirror" contenteditable="true" role="textbox"
+               aria-label="Write your prompt to Claude"
+               style="min-height:56px;width:100%;border:1px solid #ccc;padding:8px;box-sizing:border-box;"></div>
+        </fieldset>
+        ${incognitoMarkup}
+        <button type="button" aria-label="Send message">Send</button>
+      </form>
+    </main>
+    <script>
+      const composer = document.getElementById('prompt');
+      const incognitoToggle = document.getElementById('incognito-toggle');
+      if (incognitoToggle) {
+        incognitoToggle.addEventListener('click', () => {
+          const active = incognitoToggle.getAttribute('aria-pressed') === 'true';
+          window.__incognitoClicks = (window.__incognitoClicks || 0) + 1;
+          incognitoToggle.setAttribute('aria-pressed', active ? 'false' : 'true');
+          incognitoToggle.setAttribute('aria-label', active ? 'Start incognito chat' : 'Leave incognito chat');
+          window.__incognitoActive = !active;
+        });
+      }
+
+      function submitPrompt() {
+        const prompt = composer.innerText;
+        if (!prompt.trim()) {
+          return;
+        }
+        window.__lastPrompt = prompt;
+        composer.innerHTML = '';
+        if (!window.__incognitoActive) {
+          history.pushState(null, '', ${JSON.stringify(conversationPath)});
+        }
+        document.getElementById('turns').innerHTML =
+          '<div data-testid="user-message"><div class="standard-markdown"></div></div>' +
+          '<div class="font-claude-message"><div class="standard-markdown">' +
+          '<p>[[BRANCH_TITLE: local convexity]]</p><p>This answers the selected passage.</p>' +
+          '</div></div>';
+        document.querySelector('#turns [data-testid="user-message"] .standard-markdown').textContent = prompt;
+      }
+
+      document.querySelector('button[aria-label="Send message"]').addEventListener('click', (event) => {
+        event.preventDefault();
+        window.__sendClicks = (window.__sendClicks || 0) + 1;
+        window.__sendSawText = composer.innerText.length;
+        submitPrompt();
+      });
+      composer.addEventListener('keydown', (event) => {
+        window.__enterKeys = (window.__enterKeys || 0) + 1;
+        if (event.key === 'Enter' && !event.shiftKey) {
+          event.preventDefault();
+          submitPrompt();
+        }
+      });
+      window.__fixtureReady = true;
+    </script>
+  </body>
+</html>`;
+}
+
+async function createClaudePage(browser, pathName) {
+  const page = await browser.newPage();
+  page.__consoleMessages = [];
+  page.on('console', (message) => {
+    page.__consoleMessages.push(message.text());
+  });
+  await page.goto(`https://claude.ai${pathName}`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60_000
+  });
+  return page;
+}
+
+async function selectClaudeAssistantText(page) {
+  await page.evaluate(() => {
+    const paragraph = document.querySelector(
+      '.font-claude-message .standard-markdown p, [data-testid="assistant-message"] .standard-markdown p'
+    );
+    const text = paragraph?.firstChild;
+    if (!text) {
+      throw new Error('Claude assistant paragraph was not found.');
+    }
+    const range = document.createRange();
+    range.setStart(text, 4);
+    range.setEnd(text, 55);
+    const selection = getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    document.dispatchEvent(new Event('selectionchange', { bubbles: true }));
+    document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+  });
+}
+
+async function runClaudeScenario(browser, { variant = 'current' } = {}) {
+  routeMap = { '*': buildSourceHtml() };
+  claudeRouteMap = {
+    '/chat/source-claude': buildClaudeSourceHtml({ variant }),
+    '/new': buildClaudeComposerHtml({}),
+    '*': buildClaudeComposerHtml({})
+  };
+
+  const page = await createClaudePage(browser, '/chat/source-claude');
+  const existingPages = await browser.pages();
+
+  try {
+    await selectClaudeAssistantText(page);
+    await page.waitForFunction(
+      () => {
+        const toolbar = document.querySelector('#aside-selection-toolbar');
+        return toolbar instanceof HTMLElement && !toolbar.hidden;
+      },
+      { timeout: 10_000 }
+    );
+
+    const toolbarState = await page.evaluate(() => {
+      const toolbar = document.querySelector('#aside-selection-toolbar');
+      return {
+        visible: toolbar instanceof HTMLElement && !toolbar.hidden,
+        label: toolbar?.getAttribute('aria-label') ?? null,
+        actions: Array.from(toolbar?.querySelectorAll('button') ?? []).map((b) => b.textContent)
+      };
+    });
+
+    await page.evaluate(() => document.querySelector('#aside-ask-button')?.click());
+    await page.waitForSelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', {
+      timeout: 10_000
+    });
+
+    const contextPreview = await page.evaluate(
+      () =>
+        document.querySelector('.aside-panel:not([hidden]) .aside-context-preview')?.textContent ?? ''
+    );
+
+    await setPanelBranchKind(page, 'Persistent');
+    await page.type(
+      '.aside-panel:not([hidden]) textarea[data-aside-role="question"]',
+      'Why this assumption?'
+    );
+    await page.evaluate(() => {
+      document.querySelector('.aside-panel:not([hidden]) button[type="submit"]')?.click();
+    });
+
+    // Claude cannot be embedded, so the branch must open in a driven window.
+    const branchPage = await waitForAdditionalPage(browser, existingPages, 45_000);
+    branchPage.on('pageerror', (err) => console.error('CLAUDE BRANCH PAGEERROR', err.message));
+    try {
+      await branchPage.waitForFunction(
+        () => window.location.href.includes('/chat/generated-claude'),
+        { timeout: 45_000 }
+      );
+    } catch (error) {
+      const debug = await branchPage.evaluate(() => ({
+        location: window.location.href,
+        fixtureReady: window.__fixtureReady ?? false,
+        composerText: (document.querySelector('#prompt')?.textContent ?? '').slice(0, 120),
+        sendClicks: window.__sendClicks ?? 0,
+        lastPrompt: window.__lastPrompt ? 'set' : null
+      }));
+      console.error('CLAUDE BRANCH DEBUG', JSON.stringify(debug));
+      throw error;
+    }
+
+    await waitForPanelStatus(page, /Branch/);
+
+    const branchState = await branchPage.evaluate(() => ({
+      location: window.location.href,
+      sendClicks: window.__sendClicks ?? 0,
+      lastPrompt: window.__lastPrompt ?? null,
+      assistantText:
+        document.querySelector('#turns .font-claude-message .standard-markdown')?.textContent ?? null
+    }));
+
+    const panelState = await page.evaluate(() => {
+      const panel = document.querySelector('.aside-panel:not([hidden])');
+      const nativeRect = document
+        .querySelector('nav[aria-label]')
+        ?.getBoundingClientRect();
+      const railRect = document.querySelector('#aside-tabbar')?.getBoundingClientRect();
+      return {
+        status: panel?.querySelector('.aside-panel-heading p')?.textContent ?? null,
+        surface: panel?.querySelector('.aside-frame-overlay-title')?.textContent ?? null,
+        railOverlapsSidebar: Boolean(
+          nativeRect &&
+            railRect &&
+            railRect.left < nativeRect.right &&
+            railRect.right > nativeRect.left
+        )
+      };
+    });
+
+    return { variant, toolbarState, contextPreview, branchState, panelState };
+  } finally {
+    const pages = await browser.pages();
+    await Promise.all(
+      pages.filter((candidate) => !existingPages.includes(candidate)).map((c) => c.close().catch(() => {}))
+    );
+    await page.close();
+  }
+}
+
 async function runFailureScenario(browser) {
   routeMap = {
     '/c/source-failure': buildSourceHtml(),
@@ -1436,6 +1711,8 @@ try {
   const temporaryChatUnconfirmed = await runTemporaryChatUnconfirmedScenario(browser);
   const temporaryChatVerified = await runTemporaryChatVerifiedScenario(browser);
   const temporaryChatBlocked = await runTemporaryChatBlockedScenario(browser);
+  const claudeCurrent = await runClaudeScenario(browser, { variant: 'current' });
+  const claudeLegacy = await runClaudeScenario(browser, { variant: 'legacy' });
   const crossTab = await runCrossTabScenario(browser);
   const failure = await runFailureScenario(browser);
 
@@ -1448,11 +1725,41 @@ try {
     temporaryChatUnconfirmed,
     temporaryChatVerified,
     temporaryChatBlocked,
+    claudeCurrent,
+    claudeLegacy,
     crossTab,
     failure
   };
 
   console.log(JSON.stringify(result, null, 2));
+
+  [claudeCurrent, claudeLegacy].forEach((claude) => {
+    if (
+      claude.toolbarState.visible !== true ||
+      claude.toolbarState.label !== 'Aside branch actions' ||
+      // The selection must reach a Claude branch on Claude, never a chatgpt.com URL.
+      !claude.branchState.location.startsWith('https://claude.ai/') ||
+      !claude.branchState.lastPrompt?.includes('SELECTED PASSAGE') ||
+      !claude.branchState.lastPrompt?.includes('convexity assumption') ||
+      !claude.branchState.lastPrompt?.includes('fallible excerpt') ||
+      !claude.branchState.assistantText?.includes('This answers the selected passage.') ||
+      // Claude refuses framing, so the branch must say it runs in a Claude window.
+      // Claude refuses framing, so the branch must report a Claude window surface.
+      !/Claude window/.test(claude.panelState.status || claude.panelState.surface || '') ||
+      claude.panelState.railOverlapsSidebar !== false ||
+      !claude.contextPreview.includes('SELECTED PASSAGE') ||
+      // Exactly one submit: the fallback chain must not post the question twice.
+      claude.branchState.sendClicks !== 1
+    ) {
+      throw new Error(`Claude ${claude.variant} scenario failed: ${JSON.stringify(claude)}`);
+    }
+  });
+
+  if (networkEscapes.length) {
+    throw new Error(
+      `Requests escaped to hosts the harness does not serve: ${JSON.stringify([...new Set(networkEscapes)])}`
+    );
+  }
 
   if (
     !crossTab.panelId ||
@@ -1540,7 +1847,7 @@ try {
     includeNativeWindowSmoke &&
     why &&
     (
-      why.status !== 'Branch continued in a native ChatGPT window.' ||
+      why.status !== 'Branch answer is ready in its ChatGPT window.' ||
       why.formVisible !== false ||
       why.branchLocation !== 'https://chatgpt.com/c/generated-why' ||
       !why.openBranchVisible ||

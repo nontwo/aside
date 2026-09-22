@@ -2675,10 +2675,10 @@ function syncPanelUI(runtime: PanelRuntime): void {
   runtime.iframeOverlayTitle.textContent =
     state.surfaceMode === 'native_window'
       ? state.status === 'failed'
-        ? 'Native branch could not finish loading'
+        ? `${provider.label} branch could not finish loading`
         : state.status === 'live'
           ? ''
-          : 'Branch continued in a native ChatGPT window'
+          : `This branch runs in a ${provider.label} window`
       : state.status === 'failed'
       ? 'Branch could not finish loading'
       : state.status === 'live'
@@ -3643,9 +3643,13 @@ async function startBranch(panelId: string, question: string): Promise<void> {
   // an orphaned native window, a frame that has not been torn down yet — is
   // identified by the old id and can no longer touch this panel.
   runtime.state.attemptId = createAttemptId();
+  // Some providers refuse to be framed. Where that is the case the branch opens in
+  // a window Aside drives instead — a real fallback with the same context and the
+  // same state safety, not an embedded pass reported under another name.
+  const canEmbed = provider.surfaces.embedded === 'verified';
   runtime.state.initialQuestion = question;
   runtime.state.initialPrompt = prompt;
-  runtime.state.surfaceMode = 'embedded';
+  runtime.state.surfaceMode = canEmbed ? 'embedded' : 'native_window';
   runtime.state.launchUrl = launchUrl;
   runtime.state.branchChatUrl = undefined;
   runtime.state.launchTabId = undefined;
@@ -3655,18 +3659,77 @@ async function startBranch(panelId: string, question: string): Promise<void> {
   runtime.state.title = DEFAULT_BRANCH_TITLE;
   runtime.state.titleStatus = 'pending';
   runtime.state.status = 'creating_branch';
-  runtime.state.statusLabel = 'Loading the embedded ChatGPT branch window...';
+  runtime.state.statusLabel = canEmbed
+    ? `Loading the embedded ${provider.label} branch window...`
+    : `Opening a ${provider.label} window for this branch...`;
   runtime.state.errorMessage = undefined;
   runtime.state.updatedAt = Date.now();
   persistLastUsedBranchKind(runtime.state.branchKind);
-  runtime.pendingFramePrompt = prompt;
+  runtime.pendingFramePrompt = canEmbed ? prompt : undefined;
   runtime.frameReady = false;
   runtime.frameStartSent = false;
 
   minimizeOtherPanels(panelId);
-  loadEmbeddedBranchFrame(runtime, launchUrl);
+  if (canEmbed) {
+    loadEmbeddedBranchFrame(runtime, launchUrl);
+  }
   syncPanelUI(runtime);
   renderTabs();
+  persistPanels();
+
+  if (!canEmbed) {
+    await openBranchInDrivenWindow(runtime, prompt, launchUrl);
+  }
+}
+
+/**
+ * Run a branch in a window Aside opens, for providers that cannot be embedded.
+ * Same attempt id, same watchdog, same failure reporting as the embedded path.
+ */
+async function openBranchInDrivenWindow(
+  runtime: PanelRuntime,
+  prompt: string,
+  launchUrl: string
+): Promise<void> {
+  const attempt = currentAttemptRef(runtime);
+  if (!attempt) {
+    appendPanelLog(runtime, 'Refusing to open a branch window without an attempt id');
+    return;
+  }
+
+  startPanelWatchdog(
+    runtime,
+    BRANCH_RESPONSE_TIMEOUT_MS,
+    `The ${provider.label} branch window stopped reporting back. Use Open branch to check it directly, or try again.`
+  );
+
+  const response = await createNativeBranchWindow({
+    attempt,
+    prompt,
+    launchUrl,
+    branchKind: runtime.state.branchKind,
+    focusWindow: true,
+    arrangeSideBySide: true
+  });
+
+  if (!response.ok) {
+    clearPanelWatchdog(runtime);
+    appendPanelLog(runtime, 'Branch window could not be opened', { reason: response.reason });
+    runtime.state.status = 'failed';
+    runtime.state.creationMode = 'failed';
+    runtime.state.statusLabel = `${provider.label} branch creation failed.`;
+    runtime.state.errorMessage =
+      response.reason ?? `The ${provider.label} branch window could not be opened.`;
+    runtime.state.updatedAt = Date.now();
+    syncPanelUI(runtime);
+    persistPanels();
+    return;
+  }
+
+  runtime.state.launchTabId = response.tabId;
+  runtime.state.launchWindowId = response.windowId;
+  runtime.state.updatedAt = Date.now();
+  syncPanelUI(runtime);
   persistPanels();
 }
 
@@ -3719,7 +3782,7 @@ function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): 
         runtime.state.branchKind === 'temporary' ? 'local_temporary' : 'local_persistent';
       runtime.state.statusLabel =
         runtime.state.surfaceMode === 'native_window'
-          ? 'Branch continued in a native ChatGPT window.'
+          ? `Branch answer is ready in its ${provider.label} window.`
           : 'Branch answer is ready in this window.';
       runtime.state.errorMessage = undefined;
       runtime.state.updatedAt = Date.now();
@@ -3769,7 +3832,7 @@ function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): 
       runtime.state.creationMode = 'failed';
       runtime.state.statusLabel =
         runtime.state.surfaceMode === 'native_window'
-          ? 'Native branch creation failed.'
+          ? `${provider.label} branch creation failed.`
           : 'Local branch creation failed.';
       runtime.state.errorMessage = event.reason;
       runtime.state.updatedAt = Date.now();
