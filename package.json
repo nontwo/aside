@@ -7,7 +7,7 @@
   "scripts": {
     "build": "node ./scripts/build.mjs",
     "build:submission": "node ./scripts/build-submission.mjs",
-    "smoke:local": "node ./scripts/local-only-smoke.mjs",
+    "smoke:local": "npm run build && node ./scripts/local-only-smoke.mjs",
     "smoke:submission": "node ./scripts/smoke-submission.mjs",
     "audit:public": "node ./scripts/audit-public.mjs",
     "audit:submission": "node ./scripts/audit-submission.mjs",

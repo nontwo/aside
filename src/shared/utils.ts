@@ -43,8 +43,12 @@ export function parseConversationIdFromUrl(url: string): string | null {
   }
 }
 
+// Everything that is not a /c/<id> conversation — the new-chat home, project homes,
+// /share links, temporary chats — collapses into this one id.
+export const CATCH_ALL_CONVERSATION_ID = 'chat-home';
+
 export function getRootConversationId(url: string): string {
-  return parseConversationIdFromUrl(url) ?? 'chat-home';
+  return parseConversationIdFromUrl(url) ?? CATCH_ALL_CONVERSATION_ID;
 }
 
 export function normalizeChatUrl(url: string): string {

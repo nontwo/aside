@@ -60,53 +60,80 @@ export function isSubmitLikeControl(candidate: HTMLElement): boolean {
   return false;
 }
 
+const ACTIVE_STATE_VALUES = new Set(['true', 'active', 'is-active', 'checked', 'selected', 'enabled', 'on']);
+const INACTIVE_STATE_VALUES = new Set([
+  'false',
+  'inactive',
+  'is-inactive',
+  'unchecked',
+  'unselected',
+  'disabled',
+  'off'
+]);
+
+const TEMPORARY_CHAT_INACTIVE_LABELS =
+  /开启临时聊天|启用临时聊天|开始临时聊天|temporary chat off|turn on temporary chat|start temporary chat|enable temporary chat/;
+const TEMPORARY_CHAT_ACTIVE_LABELS =
+  /关闭临时聊天|退出临时聊天|结束临时聊天|停止临时聊天|temporary chat on|turn off temporary chat|disable temporary chat|exit temporary chat|leave temporary chat/;
+
+/**
+ * This decides whether a branch is about to be written into the user's permanent chat
+ * history, so it only trusts signals that actually mean "this toggle is on".
+ *
+ * The `class` attribute used to be part of the evidence, which made Tailwind variant
+ * classes such as `open:bg-white` or `enabled:hover:bg-token-surface` read as ON while
+ * temporary chat was OFF. Explicit ARIA state comes first, then the control's own label
+ * (which ChatGPT flips between "turn on"/"turn off"), then narrower data-* state hints.
+ */
 export function inferTemporaryChatState(candidate: HTMLElement): TemporaryChatState {
-  const label = getActionLabel(candidate).toLowerCase();
   const ariaPressed = candidate.getAttribute('aria-pressed');
   const ariaChecked = candidate.getAttribute('aria-checked');
-  const stateHints = compactWhitespace(
-    [
-      candidate.getAttribute('data-state'),
-      candidate.getAttribute('data-status'),
-      candidate.getAttribute('data-selected'),
-      candidate.getAttribute('data-active'),
-      candidate.getAttribute('aria-current'),
-      candidate.getAttribute('class')
-    ]
-      .filter(Boolean)
-      .join(' ')
-  ).toLowerCase();
 
-  if (
-    ariaPressed === 'true' ||
-    ariaChecked === 'true' ||
-    /\b(active|checked|selected|enabled|on|open)\b/.test(stateHints)
-  ) {
+  if (ariaPressed === 'true' || ariaChecked === 'true') {
     return 'active';
   }
 
-  if (
-    ariaPressed === 'false' ||
-    ariaChecked === 'false' ||
-    /\b(inactive|unchecked|unselected|disabled|off|closed)\b/.test(stateHints)
-  ) {
+  if (ariaPressed === 'false' || ariaChecked === 'false') {
     return 'inactive';
   }
 
-  if (
-    /开启临时聊天|启用临时聊天|开始临时聊天|temporary chat off|turn on temporary chat|start temporary chat|enable temporary chat/.test(
-      label
-    )
-  ) {
+  const label = getActionLabel(candidate).toLowerCase();
+  if (TEMPORARY_CHAT_INACTIVE_LABELS.test(label)) {
     return 'inactive';
   }
 
-  if (
-    /关闭临时聊天|退出临时聊天|结束临时聊天|停止临时聊天|temporary chat on|turn off temporary chat|disable temporary chat|exit temporary chat|leave temporary chat/.test(
-      label
-    )
-  ) {
+  if (TEMPORARY_CHAT_ACTIVE_LABELS.test(label)) {
     return 'active';
+  }
+
+  // Each attribute is judged on its own: joining them and matching the whole string means
+  // a control that exposes two state attributes never matches anything.
+  const stateAttributes = ['data-state', 'data-status', 'data-selected', 'data-active', 'aria-current']
+    .map((name) => compactWhitespace(candidate.getAttribute(name) ?? '').toLowerCase())
+    .filter(Boolean);
+
+  if (stateAttributes.some((value) => ACTIVE_STATE_VALUES.has(value))) {
+    return 'active';
+  }
+
+  if (stateAttributes.some((value) => INACTIVE_STATE_VALUES.has(value))) {
+    return 'inactive';
+  }
+
+  // Class tokens are the weakest evidence, so only an exact token counts. Tailwind
+  // variants all contain ':' ("disabled:opacity-50", "open:bg-white") and are skipped,
+  // which is what used to make almost every ChatGPT button look like a settled toggle.
+  const classTokens = (candidate.getAttribute('class') ?? '')
+    .split(/\s+/)
+    .filter((token) => token && !token.includes(':'))
+    .map((token) => token.toLowerCase());
+
+  if (classTokens.some((token) => ACTIVE_STATE_VALUES.has(token))) {
+    return 'active';
+  }
+
+  if (classTokens.some((token) => INACTIVE_STATE_VALUES.has(token))) {
+    return 'inactive';
   }
 
   return 'unknown';

@@ -54,3 +54,50 @@ describe('embedded send control helpers', () => {
     expect(inferTemporaryChatState(active)).toBe('active');
   });
 });
+
+describe('temporary chat state inference', () => {
+  function makeToggle(attributes: Record<string, string>, text = ''): HTMLElement {
+    const button = document.createElement('button');
+    Object.entries(attributes).forEach(([name, value]) => button.setAttribute(name, value));
+    button.textContent = text;
+    return button;
+  }
+
+  it('does not read Tailwind variant classes as toggle state', () => {
+    // The regression: `open:`/`enabled:` variants used to match the state word list and
+    // report temporary chat as ON while it was OFF.
+    const toggle = makeToggle(
+      {
+        'aria-label': '开启临时聊天',
+        class: 'open:bg-white enabled:hover:bg-token-main-surface group-open:rotate-180'
+      },
+      '开启临时聊天'
+    );
+
+    expect(inferTemporaryChatState(toggle)).toBe('inactive');
+  });
+
+  it('trusts explicit aria state above everything else', () => {
+    expect(inferTemporaryChatState(makeToggle({ 'aria-pressed': 'true' }, 'Temporary chat'))).toBe(
+      'active'
+    );
+    expect(inferTemporaryChatState(makeToggle({ 'aria-checked': 'false' }, 'Temporary chat'))).toBe(
+      'inactive'
+    );
+  });
+
+  it('reads the label when no aria state is exposed', () => {
+    expect(
+      inferTemporaryChatState(makeToggle({ 'aria-label': 'Turn off temporary chat' }))
+    ).toBe('active');
+    expect(
+      inferTemporaryChatState(makeToggle({ 'aria-label': 'Turn on temporary chat' }))
+    ).toBe('inactive');
+  });
+
+  it('stays unknown rather than guessing from an ambiguous control', () => {
+    expect(
+      inferTemporaryChatState(makeToggle({ 'aria-label': 'Temporary chat', class: 'rounded-lg' }))
+    ).toBe('unknown');
+  });
+});

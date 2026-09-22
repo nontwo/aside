@@ -7,15 +7,26 @@ import {
   HIGHLIGHT_OVERLAY_ID,
   LEGACY_LAST_BRANCH_KIND_STORAGE_KEY,
   LEGACY_PANEL_STORAGE_PREFIX,
+  PANEL_STORAGE_PREFIX,
   ROOT_STYLE_ID,
   LAST_BRANCH_KIND_STORAGE_KEY
 } from '../shared/constants';
 import {
+  getPanelStorageKeyForConversationId,
+  getPanelStorageKeyForState,
+  isCatchAllPanelStorageKey,
+  isPanelStorageKey,
+  mergePanelBuckets
+} from '../shared/panel-storage';
+import type { PersistedPanelBucket } from '../shared/panel-storage';
+import {
   buildSelectionPayloadFromDraft,
   captureSelectionDraftFromRange,
-  extractTranscript,
+  countTranscriptTurns,
   findQuotedTextRangeInElement,
-  findTurnElementByAnchor
+  findTurnElementByAnchor,
+  getRecentAssistantTexts,
+  rangeTouchesAssistantMessage
 } from '../shared/dom';
 import type { SelectionDraft } from '../shared/dom';
 import {
@@ -80,6 +91,7 @@ interface PanelRuntime {
   pendingFramePrompt?: string;
   frameReady: boolean;
   frameStartSent: boolean;
+  watchdogId?: number;
 }
 
 type AutomationTransport = 'frame' | 'background';
@@ -121,12 +133,21 @@ declare global {
 
 const PANEL_CLASS = 'aside-panel';
 const PANEL_TABBAR_ID = 'aside-tabbar';
-const PANEL_STORAGE_PREFIX = 'aside:panels:';
 const FRAME_AUTOMATION_STYLE_ID = 'aside-frame-automation-style';
 const EXTENSION_HOST_ID = 'aside-root';
 const TITLE_WATCH_TIMEOUT_MS = 120_000;
+// The envelope has to stay hidden for as long as the message can re-render, which is
+// longer than it takes to read the title out of it.
+const TITLE_MARKER_WATCH_TIMEOUT_MS = TITLE_WATCH_TIMEOUT_MS;
+const TEMPORARY_LEAK_WATCH_MS = 4_000;
 const MIN_SELECTION_LENGTH = 4;
 const ASK_TRIGGER_SYNC_DELAY_MS = 120;
+const PERSIST_DEBOUNCE_MS = 300;
+// ChatGPT can refuse to be framed, the frame can fail to load, or the branch window can
+// stop answering. Without these ceilings a panel sat on "Loading..." forever with no way
+// back to the question form.
+const FRAME_HANDSHAKE_TIMEOUT_MS = 25_000;
+const BRANCH_RESPONSE_TIMEOUT_MS = 180_000;
 const SELECTION_ACTION_PATTERNS = [
   /ask\s*chatgpt/i,
   /询问\s*chatgpt/i,
@@ -162,11 +183,12 @@ let selectionActionRefreshTimer: number | undefined;
 let isEvaluatingSelection = false;
 let pendingDraftFocusPanelId: string | null = null;
 const suppressedSelectionActions = new Set<HTMLElement>();
-
-interface PersistedPanelBucket {
-  key: string;
-  panels: BranchPanelState[];
-}
+// Panels the user closed on purpose. Everything else found in storage belongs to another
+// conversation (or another tab) and has to survive a write from this page.
+const closedPanelIds = new Set<string>();
+let persistTimer: number | undefined;
+let persistQueue: Promise<void> = Promise.resolve();
+let toolbarSyncFrame: number | undefined;
 
 type TemporaryChatVerification = 'confirmed' | 'assumed';
 
@@ -186,20 +208,8 @@ function isTopFrame(): boolean {
   return window.top === window.self;
 }
 
-function getPanelStorageKeyForConversationId(conversationId: string): string {
-  return `${PANEL_STORAGE_PREFIX}${conversationId}`;
-}
-
 function getConversationStorageKey(url = lastKnownUrl): string {
   return getPanelStorageKeyForConversationId(getRootConversationId(url));
-}
-
-function getPanelStorageKeyForState(
-  state: Pick<BranchPanelState, 'rootConversationId' | 'rootChatUrl'>
-): string {
-  return getPanelStorageKeyForConversationId(
-    state.rootConversationId || getRootConversationId(state.rootChatUrl)
-  );
 }
 
 function formatDebugLogEntry(message: string, details?: unknown): string {
@@ -309,7 +319,7 @@ async function readAllPersistedPanelBuckets(): Promise<PersistedPanelBucket[]> {
   try {
     const stored = (await chrome.storage.local.get(null)) as Record<string, unknown>;
     return Object.entries(stored)
-      .filter(([key]) => key.startsWith(PANEL_STORAGE_PREFIX))
+      .filter(([key]) => isPanelStorageKey(key))
       .map(([key, value]) => ({
         key,
         panels: Array.isArray(value) ? (value as BranchPanelState[]) : []
@@ -327,38 +337,73 @@ async function writePersistedPanels(): Promise<void> {
     return;
   }
 
-  const grouped = new Map<string, BranchPanelState[]>();
-  sortPanels().forEach((runtime) => {
-    const key = getPanelStorageKeyForState(runtime.state);
-    const existing = grouped.get(key) ?? [];
-    existing.push(runtime.state);
-    grouped.set(key, existing);
-  });
-
-  const nextEntries = Object.fromEntries(grouped.entries());
-
   try {
-    const stored = (await chrome.storage.local.get(null)) as Record<string, unknown>;
-    const staleKeys = Object.keys(stored).filter(
-      (key) => key.startsWith(PANEL_STORAGE_PREFIX) && !grouped.has(key)
+    const { entries, removableKeys } = mergePanelBuckets(
+      sortPanels().map((runtime) => runtime.state),
+      await readAllPersistedPanelBuckets(),
+      closedPanelIds
     );
 
-    if (staleKeys.length) {
-      await chrome.storage.local.remove(staleKeys);
+    if (removableKeys.length) {
+      await chrome.storage.local.remove(removableKeys);
     }
 
-    if (Object.keys(nextEntries).length) {
-      await chrome.storage.local.set(nextEntries);
+    if (Object.keys(entries).length) {
+      await chrome.storage.local.set(entries);
     }
   } catch (error) {
-    if (!isInvalidatedError(error)) {
-      throw error;
+    if (isInvalidatedError(error)) {
+      return;
     }
+
+    // A quota or serialization failure here used to surface as an unhandled rejection and
+    // take the rest of the session's writes with it.
+    console.warn('[Aside] Could not persist branch panels', error);
   }
 }
 
+function queuePersistWrite(): Promise<void> {
+  persistQueue = persistQueue.catch(() => {}).then(() => writePersistedPanels());
+  return persistQueue;
+}
+
+function cancelPendingPersist(): void {
+  window.clearTimeout(persistTimer);
+  persistTimer = undefined;
+}
+
+// Structural changes (create, minimize, close, status transitions) are written straight
+// away, because the user may navigate immediately afterwards.
 function persistPanels(): void {
-  void writePersistedPanels();
+  if (!hasRuntimeAccess()) {
+    return;
+  }
+
+  cancelPendingPersist();
+  void queuePersistWrite();
+}
+
+// Typing in the question box and streaming debug-log lines used to trigger a full
+// read-modify-write of extension storage per keystroke and per log entry. Those paths
+// coalesce instead; the writes stay serialized so two merges cannot race.
+function persistPanelsSoon(): void {
+  if (!hasRuntimeAccess()) {
+    return;
+  }
+
+  if (persistTimer !== undefined) {
+    return;
+  }
+
+  persistTimer = window.setTimeout(() => {
+    persistTimer = undefined;
+    void queuePersistWrite();
+  }, PERSIST_DEBOUNCE_MS);
+}
+
+async function flushPersistedPanels(): Promise<void> {
+  cancelPendingPersist();
+  await queuePersistWrite();
 }
 
 async function loadLastUsedBranchKind(): Promise<void> {
@@ -1175,6 +1220,14 @@ function hideSelectionToolbar(): void {
   }
 }
 
+// MutationObserver callbacks run at the microtask checkpoint, long after a synchronous
+// `muted = false` has been reached. Discarding the records we just caused is what
+// actually stops the observer from re-triggering itself in a loop.
+function discardSelfInflictedMutations(): void {
+  selectionActionObserver?.takeRecords();
+  selectionActionMutationMuted = false;
+}
+
 function restoreSuppressedSelectionActions(): void {
   selectionActionMutationMuted = true;
   suppressedSelectionActions.forEach((element) => {
@@ -1183,7 +1236,7 @@ function restoreSuppressedSelectionActions(): void {
     }
   });
   suppressedSelectionActions.clear();
-  selectionActionMutationMuted = false;
+  discardSelfInflictedMutations();
 }
 
 function hideAskButton(clearSelection = true): void {
@@ -1269,6 +1322,53 @@ function positionSelectionToolbar(rect: DOMRect): void {
   toolbar.style.left = `${left}px`;
 }
 
+// The toolbar is positioned with viewport coordinates, so it has to be re-anchored
+// whenever the passage moves under it.
+function getLiveSelectionRect(): DOMRect | null {
+  const draft = currentSelectionDraft;
+  if (!draft) {
+    return null;
+  }
+
+  try {
+    const rect = Array.from(draft.range.getClientRects()).find(
+      (candidate) => candidate.width > 0 || candidate.height > 0
+    );
+    return rect ? new DOMRect(rect.x, rect.y, rect.width, rect.height) : null;
+  } catch {
+    return null;
+  }
+}
+
+// The scroll listener is capturing, so it sees every scrollable element on the page.
+// Coalesce to one measurement per frame: getClientRects() forces layout.
+function scheduleSelectionToolbarSync(): void {
+  if (!selectionToolbar || selectionToolbar.hidden || toolbarSyncFrame !== undefined) {
+    return;
+  }
+
+  toolbarSyncFrame = window.requestAnimationFrame(() => {
+    toolbarSyncFrame = undefined;
+    syncSelectionToolbarToViewport();
+  });
+}
+
+function syncSelectionToolbarToViewport(): void {
+  if (!selectionToolbar || selectionToolbar.hidden) {
+    return;
+  }
+
+  const rect = getLiveSelectionRect();
+  if (!rect || rect.bottom <= 0 || rect.top >= window.innerHeight) {
+    hideSelectionToolbar();
+    restoreSuppressedSelectionActions();
+    return;
+  }
+
+  currentSelectionRect = rect;
+  positionSelectionToolbar(rect);
+}
+
 function isElementVisible(element: HTMLElement): boolean {
   const rect = element.getBoundingClientRect();
   const style = window.getComputedStyle(element);
@@ -1347,6 +1447,11 @@ function evaluateSelection(): void {
     }
 
     const range = selection.getRangeAt(0);
+    if (!rangeTouchesAssistantMessage(range)) {
+      hideAskButton();
+      return;
+    }
+
     const draft = captureSelectionDraftFromRange(range);
     if (!draft || draft.selectedText.length < MIN_SELECTION_LENGTH) {
       hideAskButton();
@@ -1421,7 +1526,7 @@ function refreshSelectionActionButtons(_root: ParentNode = document): void {
       suppressedSelectionActions.add(button);
     }
   });
-  selectionActionMutationMuted = false;
+  discardSelfInflictedMutations();
 }
 
 function installSelectionActionObserver(): void {
@@ -1853,7 +1958,26 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     runtime.state.initialQuestion = questionInput.value;
     runtime.state.updatedAt = Date.now();
     syncPanelUI(runtime);
-    persistPanels();
+    persistPanelsSoon();
+  });
+  // Enter sends, Shift+Enter adds a line, matching the composer the user just came from.
+  // isComposing keeps IME candidate selection from submitting a half-typed question.
+  questionInput.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || event.shiftKey || event.isComposing) {
+      return;
+    }
+
+    event.preventDefault();
+    if (submitButton.disabled) {
+      return;
+    }
+
+    if (typeof formEl.requestSubmit === 'function') {
+      formEl.requestSubmit();
+      return;
+    }
+
+    formEl.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true }));
   });
 
   panelRuntimes.set(state.panelId, runtime);
@@ -1871,14 +1995,23 @@ function getDisplayTitle(state: BranchPanelState): string {
     return 'New branch';
   }
 
+  // The title comes from an instruction the model can simply ignore, so fall back to
+  // something the user recognises instead of a placeholder that never resolves.
+  if (state.status === 'live' || state.status === 'failed') {
+    const fallback = compactWhitespace(state.initialQuestion || state.focusPreview);
+    if (fallback) {
+      return clipText(fallback, 48);
+    }
+  }
+
   return 'Naming branch...';
 }
 
+// A failed branch is the one state where the user most needs the form back, including a
+// branch that was promoted to a native window or that failed after a URL appeared.
+// Without this, "Close" was the only way out of a failure.
 function canShowForm(state: BranchPanelState): boolean {
-  if (state.surfaceMode === 'native_window') {
-    return false;
-  }
-  return state.status === 'draft' || (state.status === 'failed' && !state.branchChatUrl);
+  return state.status === 'draft' || state.status === 'failed';
 }
 
 function canShowBranchKindToggle(state: BranchPanelState): boolean {
@@ -2120,6 +2253,9 @@ async function restorePanels(): Promise<void> {
   restored
     .flatMap(({ key, panels }) =>
       panels
+        // Another tab can write a panel back after this page closed it; do not bring it
+        // back into a page the user already dismissed it from.
+        .filter((raw) => !closedPanelIds.has(raw?.panelId))
         .filter((raw) => key === currentStorageKey || Boolean(raw?.minimized))
         .map((raw) => {
           const restoredState = createStateFromRestore(raw);
@@ -2128,8 +2264,10 @@ async function restorePanels(): Promise<void> {
           }
 
           // Minimized tabs from other chats should remain available globally,
-          // but only the current chat gets its full panel restore state.
-          if (key !== currentStorageKey) {
+          // but only the current chat gets its full panel restore state. The catch-all
+          // bucket is shared by every non-conversation page, so its panels stay in the
+          // rail instead of reopening on the home page, a project, or a branch window.
+          if (key !== currentStorageKey || isCatchAllPanelStorageKey(key)) {
             restoredState.minimized = true;
           }
           return restoredState;
@@ -2180,14 +2318,21 @@ function closePanel(panelId: string): void {
     return;
   }
 
+  clearPanelWatchdog(runtime);
+  closedPanelIds.add(panelId);
+  runtime.iframeEl.src = 'about:blank';
   runtime.element.remove();
   panelRuntimes.delete(panelId);
   renderTabs();
   persistPanels();
 }
 
+// Navigating away is not the same as closing: these panels stay in storage so the user
+// can come back to the conversation and find them again.
 function clearPanelsForCurrentConversation(): void {
   panelRuntimes.forEach((runtime) => {
+    clearPanelWatchdog(runtime);
+    runtime.iframeEl.src = 'about:blank';
     runtime.element.remove();
   });
   panelRuntimes.clear();
@@ -2273,6 +2418,11 @@ async function promotePersistentBranchToNativeWindow(runtime: PanelRuntime): Pro
   runtime.state.launchTabId = response.tabId;
   runtime.state.launchWindowId = response.windowId;
   runtime.state.updatedAt = Date.now();
+  startPanelWatchdog(
+    runtime,
+    BRANCH_RESPONSE_TIMEOUT_MS,
+    'The native ChatGPT branch window stopped reporting back. Use Open branch to check it directly, or try again.'
+  );
   appendPanelLog(runtime, 'Native branch recovery window created', {
     launchTabId: response.tabId,
     launchWindowId: response.windowId
@@ -2300,6 +2450,25 @@ async function openSelectionInNewTab(
 
   if (!response.ok) {
     console.warn('[Aside] Failed to open native New-tab window', response.reason);
+    // The selection has already been cleared by this point, so falling back to an
+    // in-page draft is the only way the user keeps the passage they picked.
+    const runtime = createBranchDraft(selection, {
+      entryAction: 'ask',
+      branchKind
+    });
+    runtime.state.status = 'failed';
+    runtime.state.creationMode = 'failed';
+    runtime.state.statusLabel = 'New-tab could not open a ChatGPT window.';
+    runtime.state.errorMessage = `${
+      response.reason ?? 'The branch window could not be opened.'
+    } Ask here instead, or try New-tab again.`;
+    runtime.state.updatedAt = Date.now();
+    appendPanelLog(runtime, 'New-tab branch window could not be opened', {
+      reason: response.reason
+    });
+    syncPanelUI(runtime);
+    renderTabs();
+    persistPanels();
   }
 }
 
@@ -2373,12 +2542,14 @@ async function copyBranchDebugLog(panelId: string): Promise<void> {
     appendPanelLog(runtime, 'Debug log copied to clipboard');
     runtime.debugLogShell.hidden = true;
     const previousStatus = runtime.state.statusLabel;
-    runtime.state.statusLabel =
+    const copiedStatus =
       'Debug log copied. Paste it here so we can inspect selection, branch URL, and prompt submission.';
+    runtime.state.statusLabel = copiedStatus;
     syncPanelUI(runtime);
     persistPanels();
     window.setTimeout(() => {
-      if (panelRuntimes.get(panelId) === runtime) {
+      // Only roll back if nothing newer has claimed the status line in the meantime.
+      if (panelRuntimes.get(panelId) === runtime && runtime.state.statusLabel === copiedStatus) {
         runtime.state.statusLabel = previousStatus;
         syncPanelUI(runtime);
       }
@@ -2403,14 +2574,70 @@ function buildEmbeddedFrameUrl(launchUrl: string): string {
   }
 }
 
+function clearPanelWatchdog(runtime: PanelRuntime): void {
+  if (runtime.watchdogId !== undefined) {
+    window.clearTimeout(runtime.watchdogId);
+    runtime.watchdogId = undefined;
+  }
+}
+
+function startPanelWatchdog(runtime: PanelRuntime, timeoutMs: number, reason: string): void {
+  clearPanelWatchdog(runtime);
+  runtime.watchdogId = window.setTimeout(() => {
+    runtime.watchdogId = undefined;
+
+    if (panelRuntimes.get(runtime.state.panelId) !== runtime) {
+      return;
+    }
+
+    if (
+      runtime.state.status === 'live' ||
+      runtime.state.status === 'failed' ||
+      runtime.state.status === 'draft'
+    ) {
+      return;
+    }
+
+    appendPanelLog(runtime, 'Branch watchdog fired', {
+      timeoutMs,
+      panelStatus: runtime.state.status,
+      frameReady: runtime.frameReady,
+      frameStartSent: runtime.frameStartSent
+    });
+    applyBranchPanelEvent(runtime, { kind: 'failed', reason });
+  }, timeoutMs);
+}
+
 function loadEmbeddedBranchFrame(runtime: PanelRuntime, launchUrl: string): void {
   runtime.frameReady = false;
   runtime.frameStartSent = false;
+  startPanelWatchdog(
+    runtime,
+    FRAME_HANDSHAKE_TIMEOUT_MS,
+    'The embedded ChatGPT branch window did not finish loading. ChatGPT may be refusing to be embedded here — try again, or use New-tab to run this branch in its own window.'
+  );
   const iframeUrl = buildEmbeddedFrameUrl(launchUrl);
-  runtime.iframeEl.src = iframeUrl;
+  const previousSrc = runtime.iframeEl.src;
+
+  // Retrying reuses the same iframe, and the cache-busting differs only in the fragment.
+  // A fragment-only src change is a same-document navigation: no load event, so the frame
+  // never posts SB_FRAME_READY again and the retry would sit there until the watchdog.
+  // Going through about:blank forces a real document load.
+  if (previousSrc && previousSrc !== 'about:blank') {
+    runtime.iframeEl.src = 'about:blank';
+  }
+
+  window.setTimeout(() => {
+    if (panelRuntimes.get(runtime.state.panelId) !== runtime) {
+      return;
+    }
+    runtime.iframeEl.src = iframeUrl;
+  }, 0);
+
   appendPanelLog(runtime, 'Loading embedded branch frame', {
     targetUrl: launchUrl,
     iframeSrc: iframeUrl,
+    previousSrc: previousSrc || null,
     panelStatus: runtime.state.status
   });
 }
@@ -2418,6 +2645,12 @@ function loadEmbeddedBranchFrame(runtime: PanelRuntime, launchUrl: string): void
 function ensureLiveFrameLocation(runtime: PanelRuntime): void {
   const desiredUrl = runtime.state.branchChatUrl;
   if (!desiredUrl || runtime.pendingFramePrompt) {
+    return;
+  }
+
+  // Restoring a page used to give every minimized branch from every conversation its own
+  // eagerly loading chatgpt.com iframe. Load the frame when the panel is actually shown.
+  if (runtime.state.minimized) {
     return;
   }
 
@@ -2466,6 +2699,11 @@ function tryDispatchPendingFrameStart(runtime: PanelRuntime): void {
     launchUrl: runtime.state.launchUrl,
     promptLength: prompt.length
   });
+  startPanelWatchdog(
+    runtime,
+    BRANCH_RESPONSE_TIMEOUT_MS,
+    'The branch window stopped responding before the answer was ready. Try again, or use Open branch to continue it directly in ChatGPT.'
+  );
   syncPanelUI(runtime);
   persistPanels();
 
@@ -2494,6 +2732,27 @@ function findRuntimeByFrameWindow(source: MessageEventSource | null): PanelRunti
   return null;
 }
 
+function isTrustedBranchOrigin(origin: string, runtime?: PanelRuntime): boolean {
+  if (!origin || origin === 'null') {
+    return false;
+  }
+
+  if (origin === window.location.origin) {
+    return true;
+  }
+
+  const launchUrl = runtime?.state.launchUrl ?? runtime?.state.branchChatUrl;
+  if (!launchUrl) {
+    return false;
+  }
+
+  try {
+    return new URL(launchUrl).origin === origin;
+  } catch {
+    return false;
+  }
+}
+
 function handleEmbeddedFrameMessage(event: MessageEvent<FrameIncomingMessage>): void {
   const data = event.data;
   if (
@@ -2507,6 +2766,15 @@ function handleEmbeddedFrameMessage(event: MessageEvent<FrameIncomingMessage>): 
 
   const runtime = findRuntimeByFrameWindow(event.source);
   if (!runtime) {
+    return;
+  }
+
+  // The window identity check above already rules out unrelated frames; the origin check
+  // keeps a navigated-away branch frame from driving the panel.
+  if (!isTrustedBranchOrigin(event.origin, runtime)) {
+    appendPanelLog(runtime, 'Ignored branch frame message from an unexpected origin', {
+      origin: event.origin
+    });
     return;
   }
 
@@ -2526,6 +2794,17 @@ function handleEmbeddedFrameMessage(event: MessageEvent<FrameIncomingMessage>): 
     if (data.panelId !== runtime.state.panelId) {
       return;
     }
+
+    // A panel that has moved on to a native window is no longer driven by its old frame;
+    // a late event from that frame would otherwise overwrite the current branch state.
+    if (runtime.state.surfaceMode !== 'embedded') {
+      appendPanelLog(runtime, 'Ignored a branch frame event for a panel that is no longer embedded', {
+        eventKind: data.event.kind,
+        surfaceMode: runtime.state.surfaceMode
+      });
+      return;
+    }
+
     applyBranchPanelEvent(runtime, data.event);
   }
 }
@@ -2533,6 +2812,18 @@ function handleEmbeddedFrameMessage(event: MessageEvent<FrameIncomingMessage>): 
 function handleForwardedBranchPanelEvent(message: ForwardBranchPanelEventMessage): void {
   const runtime = panelRuntimes.get(message.panelId);
   if (!runtime) {
+    return;
+  }
+
+  // Only a native-window branch reports through the background. Retrying a failed native
+  // branch switches the panel back to an embedded frame and leaves the old window open;
+  // without this guard a late event from that orphan could mark the new branch live with
+  // the previous conversation's URL.
+  if (runtime.state.surfaceMode !== 'native_window') {
+    appendPanelLog(runtime, 'Ignored a background branch event for an embedded panel', {
+      eventKind: message.event.kind,
+      surfaceMode: runtime.state.surfaceMode
+    });
     return;
   }
 
@@ -2590,6 +2881,19 @@ async function startBranch(panelId: string, question: string): Promise<void> {
 
   const prompt = buildLocalInitialPrompt(runtime.state.selection, question).prompt;
   const launchUrl = normalizeChatUrl(getBranchLaunchUrl(runtime.state.rootChatUrl));
+
+  if (!launchUrl) {
+    runtime.state.initialQuestion = question;
+    runtime.state.status = 'failed';
+    runtime.state.creationMode = 'failed';
+    runtime.state.statusLabel = 'Local branch creation failed.';
+    runtime.state.errorMessage = 'Could not determine a launch URL for this ChatGPT branch.';
+    runtime.state.updatedAt = Date.now();
+    syncPanelUI(runtime);
+    persistPanels();
+    return;
+  }
+
   appendPanelLog(runtime, 'Start branch requested', {
     questionLength: question.length,
     rootChatUrl: runtime.state.rootChatUrl,
@@ -2602,6 +2906,14 @@ async function startBranch(panelId: string, question: string): Promise<void> {
       .map((block) => block.messageId),
     promptLength: prompt.length
   });
+  if (runtime.state.branchChatUrl) {
+    // The previous attempt already created a conversation. Keep the link in the log so a
+    // retry does not erase the only way back to something the user may need to delete.
+    appendPanelLog(runtime, 'Replacing a branch that already has a conversation URL', {
+      previousBranchChatUrl: runtime.state.branchChatUrl
+    });
+  }
+
   runtime.state.initialQuestion = question;
   runtime.state.initialPrompt = prompt;
   runtime.state.surfaceMode = 'embedded';
@@ -2627,15 +2939,6 @@ async function startBranch(panelId: string, question: string): Promise<void> {
   syncPanelUI(runtime);
   renderTabs();
   persistPanels();
-  if (!runtime.state.launchUrl) {
-    runtime.state.status = 'failed';
-    runtime.state.creationMode = 'failed';
-    runtime.state.statusLabel = 'Local branch creation failed.';
-    runtime.state.errorMessage = 'Could not determine a launch URL for this ChatGPT branch.';
-    syncPanelUI(runtime);
-    persistPanels();
-    return;
-  }
 }
 
 function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): void {
@@ -2655,7 +2958,7 @@ function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): 
     case 'debug-log':
       appendPanelLogEntries(runtime, [event.message]);
       syncPanelUI(runtime);
-      persistPanels();
+      persistPanelsSoon();
       return;
 
     case 'title':
@@ -2669,6 +2972,7 @@ function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): 
       return;
 
     case 'live':
+      clearPanelWatchdog(runtime);
       runtime.pendingFramePrompt = undefined;
       runtime.state.launchTabId = event.launchTabId ?? runtime.state.launchTabId;
       runtime.state.launchWindowId = event.launchWindowId ?? runtime.state.launchWindowId;
@@ -2696,6 +3000,7 @@ function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): 
       return;
 
     case 'failed':
+      clearPanelWatchdog(runtime);
       appendPanelLog(runtime, 'Branch reported failure', {
         reason: event.reason,
         branchChatUrl: event.branchChatUrl,
@@ -2713,6 +3018,19 @@ function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): 
         runtime.state.surfaceMode === 'embedded' &&
         /never became a persistent chat url/i.test(event.reason)
       ) {
+        // If the URL turned up late, the branch really did succeed. Re-sending here
+        // would post the same question a second time and leave two conversations.
+        if (runtime.state.branchChatUrl) {
+          appendPanelLog(runtime, 'Persistent branch URL arrived late; keeping the existing branch', {
+            branchChatUrl: runtime.state.branchChatUrl
+          });
+          applyBranchPanelEvent(runtime, {
+            kind: 'live',
+            branchChatUrl: runtime.state.branchChatUrl
+          });
+          return;
+        }
+
         void promotePersistentBranchToNativeWindow(runtime);
         return;
       }
@@ -2809,6 +3127,26 @@ function scrollRectIntoView(rect: DOMRect, anchorElement: HTMLElement): void {
   });
 }
 
+// getClientRects() during a smooth scroll returns coordinates that are stale by the time
+// the fixed-position overlay is painted, so wait for the scroll to finish first.
+function afterScrollSettles(callback: () => void): void {
+  let done = false;
+  const run = () => {
+    if (done) {
+      return;
+    }
+    done = true;
+    window.removeEventListener('scrollend', run, true);
+    window.clearTimeout(fallbackTimer);
+    callback();
+  };
+
+  const fallbackTimer = window.setTimeout(run, 900);
+  if ('onscrollend' in window) {
+    window.addEventListener('scrollend', run, true);
+  }
+}
+
 function scrollToOrigin(selection: SelectionPayload): void {
   const target = findTurnElementByAnchor(selection);
   if (!target) {
@@ -2827,9 +3165,9 @@ function scrollToOrigin(selection: SelectionPayload): void {
       target.classList.add('aside-origin-flash');
       window.setTimeout(() => target.classList.remove('aside-origin-flash'), 2200);
       scrollRectIntoView(firstRect, target);
-      window.setTimeout(() => {
+      afterScrollSettles(() => {
         renderHighlightRects(Array.from(exactRange.getClientRects()).map((rect) => rect as DOMRect));
-      }, 250);
+      });
       return;
     }
   }
@@ -2837,9 +3175,9 @@ function scrollToOrigin(selection: SelectionPayload): void {
   target.scrollIntoView({ behavior: 'smooth', block: 'center' });
   target.classList.add('aside-origin-flash');
   window.setTimeout(() => target.classList.remove('aside-origin-flash'), 2200);
-  window.setTimeout(() => {
+  afterScrollSettles(() => {
     renderHighlightRects([target.getBoundingClientRect()]);
-  }, 250);
+  });
 }
 
 async function handleUrlChange(): Promise<void> {
@@ -2847,6 +3185,11 @@ async function handleUrlChange(): Promise<void> {
   if (nextUrl === lastKnownUrl) {
     return;
   }
+
+  // Each await below is a chance for a newer navigation to start. Without this token the
+  // older run resumes afterwards and restores the previous conversation's panels over it.
+  const token = ++pendingUrlChangeToken;
+  const isStale = () => token !== pendingUrlChangeToken;
 
   const currentConversationId = getRootConversationId(lastKnownUrl);
   const nextConversationId = getRootConversationId(nextUrl);
@@ -2870,9 +3213,9 @@ async function handleUrlChange(): Promise<void> {
     currentConversationId !== 'chat-home' &&
     panelRuntimes.size > 0
   ) {
-    const token = ++pendingUrlChangeToken;
+    // ChatGPT briefly routes through "/" while switching chats; wait for it to settle.
     await sleep(1200);
-    if (token !== pendingUrlChangeToken) {
+    if (isStale()) {
       return;
     }
 
@@ -2883,16 +3226,38 @@ async function handleUrlChange(): Promise<void> {
     }
   }
 
-  await writePersistedPanels();
+  await flushPersistedPanels();
+  if (isStale()) {
+    return;
+  }
+
   clearPanelsForCurrentConversation();
   hideAskButton();
   lastKnownUrl = nextUrl;
   await restorePanels();
+  if (isStale()) {
+    return;
+  }
+
   syncMountedUi();
   scheduleMountedUiSync(350);
 }
 
+const URL_POLL_INTERVAL_MS = 400;
+
 function installUrlObservers(): void {
+  // A content script runs in an isolated world, so patching history.pushState here only
+  // replaces this world's copy — ChatGPT's router calls the real one and never triggers
+  // the patch. The patch is kept as a fast path; polling is what actually catches SPA
+  // navigation between conversations.
+  const urlPollTimer = window.setInterval(() => {
+    if (normalizeChatUrl(window.location.href) !== lastKnownUrl) {
+      pendingUrlChangeToken += 1;
+      void handleUrlChange();
+    }
+  }, URL_POLL_INTERVAL_MS);
+  cleanupFns.push(() => window.clearInterval(urlPollTimer));
+
   const originalPushState = history.pushState.bind(history);
   const originalReplaceState = history.replaceState.bind(history);
 
@@ -2954,13 +3319,11 @@ function initTopFrame(): void {
     selectionTimer = window.setTimeout(evaluateSelection, 80);
   };
   const scrollListener = () => {
-    if (selectionToolbar && !selectionToolbar.hidden) {
-      hideSelectionToolbar();
-      restoreSuppressedSelectionActions();
-    }
+    scheduleSelectionToolbarSync();
   };
   const resizeListener = () => {
     syncMountedUi();
+    syncSelectionToolbarToViewport();
     scheduleAskTriggerSync(0);
   };
   const pageshowListener = () => {
@@ -2973,7 +3336,14 @@ function initTopFrame(): void {
   const visibilityListener = () => {
     if (document.visibilityState === 'visible') {
       focusPendingDraftQuestionInput();
+      return;
     }
+
+    // Debounced writes would otherwise be lost if the tab is discarded while hidden.
+    void flushPersistedPanels();
+  };
+  const pagehideListener = () => {
+    void flushPersistedPanels();
   };
   const keydownListener = (event: KeyboardEvent) => {
     if (event.key === 'Escape') {
@@ -2986,11 +3356,15 @@ function initTopFrame(): void {
 
   document.addEventListener('selectionchange', selectionListener);
   document.addEventListener('mouseup', mouseupListener);
-  window.addEventListener('scroll', scrollListener);
+  // ChatGPT scrolls an inner container, and scroll events from it never reach window
+  // without capture, which used to leave the toolbar stranded over unrelated text.
+  const scrollListenerOptions: AddEventListenerOptions = { capture: true, passive: true };
+  window.addEventListener('scroll', scrollListener, scrollListenerOptions);
   window.addEventListener('resize', resizeListener);
   window.addEventListener('pageshow', pageshowListener);
   window.addEventListener('focus', focusListener);
   document.addEventListener('visibilitychange', visibilityListener);
+  window.addEventListener('pagehide', pagehideListener);
   document.addEventListener('keydown', keydownListener);
   installUrlObservers();
 
@@ -3004,11 +3378,18 @@ function initTopFrame(): void {
 
   cleanupFns.push(() => document.removeEventListener('selectionchange', selectionListener));
   cleanupFns.push(() => document.removeEventListener('mouseup', mouseupListener));
-  cleanupFns.push(() => window.removeEventListener('scroll', scrollListener));
+  cleanupFns.push(() => {
+    window.removeEventListener('scroll', scrollListener, scrollListenerOptions);
+    if (toolbarSyncFrame !== undefined) {
+      window.cancelAnimationFrame(toolbarSyncFrame);
+      toolbarSyncFrame = undefined;
+    }
+  });
   cleanupFns.push(() => window.removeEventListener('resize', resizeListener));
   cleanupFns.push(() => window.removeEventListener('pageshow', pageshowListener));
   cleanupFns.push(() => window.removeEventListener('focus', focusListener));
   cleanupFns.push(() => document.removeEventListener('visibilitychange', visibilityListener));
+  cleanupFns.push(() => window.removeEventListener('pagehide', pagehideListener));
   cleanupFns.push(() => document.removeEventListener('keydown', keydownListener));
 }
 
@@ -3307,7 +3688,13 @@ function fillComposer(
   selection?.addRange(range);
 
   try {
-    document.execCommand('insertText', false, prompt);
+    if (prompt) {
+      document.execCommand('insertText', false, prompt);
+    } else {
+      // insertText with an empty string is a no-op, so deleting the selection is the
+      // only way to actually empty a contenteditable composer.
+      document.execCommand('delete');
+    }
   } catch {
     composer.textContent = prompt;
   }
@@ -3320,6 +3707,20 @@ function fillComposer(
       data: prompt,
       inputType
     })
+  );
+}
+
+function countSignificantChars(value: string): number {
+  return value.replace(/\s+/g, '').length;
+}
+
+// A ProseMirror composer renders the prompt's blank lines as separate paragraphs, so its
+// textContent has no separator at all where the prompt had a newline. Comparing raw or
+// whitespace-collapsed lengths therefore always came up short and the composer was filled
+// twice on every branch. Compare the characters that actually matter instead.
+function getComposerSignificantLength(composer: HTMLElement | HTMLTextAreaElement): number {
+  return countSignificantChars(
+    composer instanceof HTMLTextAreaElement ? composer.value : composer.textContent ?? ''
   );
 }
 
@@ -3347,6 +3748,8 @@ async function fillComposerWithStrategies(
     recordAutomationLog('Composer fill strategy attempted', {
       strategy,
       valueLength,
+      significantLength: getComposerSignificantLength(activeComposer),
+      expectedSignificantLength: countSignificantChars(prompt),
       composerCandidate: describeComposerCandidateForLog(activeComposer)
     });
 
@@ -3358,7 +3761,7 @@ async function fillComposerWithStrategies(
       };
     }
 
-    if (valueLength >= prompt.length) {
+    if (getComposerSignificantLength(activeComposer) >= countSignificantChars(prompt)) {
       return {
         composer: activeComposer,
         strategy,
@@ -3420,10 +3823,10 @@ function getTemporaryChatControlCandidates(scope: ParentNode): HTMLElement[] {
     'button[title*="临时聊天"]',
     '[role="button"][aria-label*="临时聊天"]',
     '[role="button"][title*="临时聊天"]',
-    'button[aria-label*="temporary"]',
-    'button[title*="temporary"]',
-    '[role="button"][aria-label*="temporary"]',
-    '[role="button"][title*="temporary"]'
+    'button[aria-label*="temporary" i]',
+    'button[title*="temporary" i]',
+    '[role="button"][aria-label*="temporary" i]',
+    '[role="button"][title*="temporary" i]'
   ];
   const seen = new Set<HTMLElement>();
   const matches = queryMany<HTMLElement>(selectors, scope);
@@ -3459,20 +3862,20 @@ function findDirectTemporaryChatControl(
     'button[aria-label*="临时聊天"][aria-checked="true"]',
     '[role="button"][aria-label*="临时聊天"][aria-pressed="true"]',
     '[role="button"][aria-label*="临时聊天"][aria-checked="true"]',
-    'button[aria-label*="temporary"][aria-pressed="true"]',
-    'button[aria-label*="temporary"][aria-checked="true"]',
-    '[role="button"][aria-label*="temporary"][aria-pressed="true"]',
-    '[role="button"][aria-label*="temporary"][aria-checked="true"]'
+    'button[aria-label*="temporary" i][aria-pressed="true"]',
+    'button[aria-label*="temporary" i][aria-checked="true"]',
+    '[role="button"][aria-label*="temporary" i][aria-pressed="true"]',
+    '[role="button"][aria-label*="temporary" i][aria-checked="true"]'
   ];
   const anySelectors = [
     'button[aria-label*="临时聊天"]',
     'button[title*="临时聊天"]',
     '[role="button"][aria-label*="临时聊天"]',
     '[role="button"][title*="临时聊天"]',
-    'button[aria-label*="temporary"]',
-    'button[title*="temporary"]',
-    '[role="button"][aria-label*="temporary"]',
-    '[role="button"][title*="temporary"]'
+    'button[aria-label*="temporary" i]',
+    'button[title*="temporary" i]',
+    '[role="button"][aria-label*="temporary" i]',
+    '[role="button"][title*="temporary" i]'
   ];
 
   for (const scope of getComposerSearchScopes(composer)) {
@@ -3621,16 +4024,22 @@ async function ensurePersistentChatMode(
   }
 
   if (primaryState === 'unknown') {
-    throw new Error(
-      'ChatGPT temporary-chat mode could not be determined confidently; persistent branch creation cannot continue.'
-    );
+    // Clicking a toggle whose state we cannot read could switch temporary chat ON, which
+    // is the outcome this function exists to avoid. Leave it alone and let the missing
+    // /c/ URL downstream be the signal if the chat really was temporary.
+    recordAutomationLog('Temporary chat control state is unreadable; leaving it untouched', {
+      control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore)
+    });
+    return;
   }
 
   recordAutomationLog('Temporary chat mode appears active; disabling it before send', {
     control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore),
     toggledOff: false
   });
-  primaryCandidate.click();
+  // A bare .click() is ignored by toggles that listen for pointer events, which is why
+  // the temporary-chat path already uses the full synthetic activation sequence.
+  activateControl(primaryCandidate);
 
   const deadline = Date.now() + 4_000;
   while (Date.now() < deadline) {
@@ -3681,7 +4090,7 @@ async function ensureTemporaryChatMode(
 
   if (!primaryCandidate) {
     throw new Error(
-      'ChatGPT temporary-chat mode could not be enabled confidently; temporary branch creation cannot continue.'
+      'The temporary-chat control could not be found, so this branch was not sent. Turn temporary chat on in ChatGPT and try again, or switch this branch to Persistent.'
     );
   }
 
@@ -3694,8 +4103,10 @@ async function ensureTemporaryChatMode(
   }
 
   if (primaryState === 'unknown') {
+    // Fail closed: a temporary branch exists so the passage stays out of chat history,
+    // and guessing here is how it ends up saved.
     throw new Error(
-      'ChatGPT temporary-chat mode could not be determined confidently; temporary branch creation cannot continue.'
+      'ChatGPT did not report whether temporary chat is on, so this branch was not sent. Turn temporary chat on in ChatGPT and try again, or switch this branch to Persistent.'
     );
   }
 
@@ -3871,7 +4282,7 @@ async function waitForAcceptedGenerationSignal(
       return 'stop_button';
     }
 
-    if (extractTranscript(document).length > baselineTurnCount) {
+    if (countTranscriptTurns(document) > baselineTurnCount) {
       return 'transcript_growth';
     }
 
@@ -3895,7 +4306,7 @@ async function submitComposer(
     currentUrl: normalizeChatUrl(window.location.href)
   });
   const initialUrl = normalizeChatUrl(window.location.href);
-  const baselineTurnCount = extractTranscript(document).length;
+  const baselineTurnCount = countTranscriptTurns(document);
   let composer = await waitForComposer();
   let composerSnapshot = describeComposerCandidate(composer);
   let form = composer.closest('form');
@@ -3917,6 +4328,47 @@ async function submitComposer(
   await sleep(450);
   const temporaryVerification = await ensureBranchKindMode(branchKind, composer);
 
+  // Toggling temporary chat navigates ChatGPT to a fresh chat and remounts the composer.
+  // Without re-checking, the prompt that was typed a moment ago is silently gone and the
+  // send button click posts nothing at all.
+  composer = refreshComposerReference(composer);
+  const significantAfterToggle = getComposerSignificantLength(composer);
+  const expectedSignificant = countSignificantChars(prompt);
+
+  // Only react to the composer actually losing the prompt: a rich-text composer can
+  // normalize its content and come back a little short, and refilling on that would cost
+  // a needless round trip on every branch.
+  if (significantAfterToggle < expectedSignificant / 2) {
+    // The toggle can itself be a submit control, in which case the composer is empty
+    // because the prompt was already sent. Refilling there would ask twice.
+    const alreadyAccepted = await waitForAcceptedGenerationSignalOrNull(
+      baselineTurnCount,
+      initialUrl,
+      0
+    );
+
+    if (alreadyAccepted) {
+      recordAutomationLog('Chat-mode toggle submitted the prompt; not refilling', {
+        acceptedSignal: alreadyAccepted,
+        branchKind
+      });
+      return { acceptedSignal: alreadyAccepted, temporaryVerification };
+    }
+
+    recordAutomationLog('Composer lost the prompt after the chat-mode toggle; refilling', {
+      significantLength: significantAfterToggle,
+      expectedSignificantLength: expectedSignificant,
+      branchKind
+    });
+    const refill = await fillComposerWithStrategies(composer, prompt);
+    composer = refill.composer;
+    fillResult.composer = refill.composer;
+    fillResult.strategy = refill.strategy;
+    fillResult.valueLength = refill.valueLength;
+    composerSnapshot = describeComposerCandidateForLog(composer, composerSnapshot);
+    form = composer.closest('form');
+  }
+
   const logVisibleButtonContext = (label: string) => {
     const currentComposer = refreshComposerReference(composer);
     const currentSnapshot = describeComposerCandidateForLog(currentComposer, composerSnapshot);
@@ -3932,6 +4384,8 @@ async function submitComposer(
       temporaryVerification
     });
   };
+
+  let significantLengthBeforeSend = 0;
 
   const attemptClickSendButton = async (
     stage: 'primary' | 'final_rescan',
@@ -3972,6 +4426,7 @@ async function submitComposer(
         sendButton: describeSendButtonCandidate(sendButton, composer, rankedSendButtons[0]?.score)
       }
     );
+    significantLengthBeforeSend = getComposerSignificantLength(composer);
     activateControl(sendButton);
 
     const signal = await waitForAcceptedGenerationSignalOrNull(
@@ -3996,15 +4451,45 @@ async function submitComposer(
     return null;
   };
 
+  // ChatGPT clears the composer as soon as it accepts a prompt. If that already happened,
+  // every remaining fallback would post the same question a second time. Requiring that
+  // the composer held the prompt immediately before the click keeps a composer that was
+  // merely remounted from looking like a successful send.
+  const promptLooksAccepted = (): boolean =>
+    significantLengthBeforeSend > 0 &&
+    getComposerSignificantLength(refreshComposerReference(composer)) === 0;
+
+  const waitOutAcceptedPrompt = async (
+    stage: string
+  ): Promise<{
+    acceptedSignal: 'persistent_url' | 'stop_button' | 'transcript_growth';
+    temporaryVerification: TemporaryChatVerification;
+  }> => {
+    recordAutomationLog('Composer was cleared after submit; waiting instead of resending', {
+      stage,
+      currentUrl: normalizeChatUrl(window.location.href)
+    });
+    const acceptedSignal = await waitForAcceptedGenerationSignal(baselineTurnCount, initialUrl);
+    return { acceptedSignal, temporaryVerification };
+  };
+
   const primarySendSignal = await attemptClickSendButton('primary');
   if (primarySendSignal) {
     return { acceptedSignal: primarySendSignal, temporaryVerification };
+  }
+
+  if (promptLooksAccepted()) {
+    return waitOutAcceptedPrompt('after_send_button');
   }
 
   logVisibleButtonContext('No enabled send button produced a generation signal near the composer');
   recordAutomationLog('Dispatching Enter key fallback for first branch prompt', {
     hasForm: form instanceof HTMLFormElement
   });
+  // Record what the composer held before each attempt, not just before the button click:
+  // on a page where Enter is the only way to send, this is the signal that tells the next
+  // fallback the prompt is already gone.
+  significantLengthBeforeSend = getComposerSignificantLength(composer);
   ['keydown', 'keypress', 'keyup'].forEach((eventType) => {
     composer.dispatchEvent(
       new KeyboardEvent(eventType, {
@@ -4033,10 +4518,15 @@ async function submitComposer(
     currentUrl: normalizeChatUrl(window.location.href)
   });
 
+  if (promptLooksAccepted()) {
+    return waitOutAcceptedPrompt('after_enter_fallback');
+  }
+
   if (form instanceof HTMLFormElement) {
     recordAutomationLog('Attempting guarded synthetic submit fallback for first branch prompt', {
       action: 'dispatch-submit-event'
     });
+    significantLengthBeforeSend = getComposerSignificantLength(refreshComposerReference(composer));
     form.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true }));
     const syntheticSignal = await waitForAcceptedGenerationSignalOrNull(
       baselineTurnCount,
@@ -4056,6 +4546,10 @@ async function submitComposer(
     });
   }
 
+  if (promptLooksAccepted()) {
+    return waitOutAcceptedPrompt('after_synthetic_submit');
+  }
+
   const rescannedSignal = await attemptClickSendButton('final_rescan', 4_500);
   if (rescannedSignal) {
     return { acceptedSignal: rescannedSignal, temporaryVerification };
@@ -4066,12 +4560,27 @@ async function submitComposer(
   const acceptedSignal = await waitForAcceptedGenerationSignal(baselineTurnCount, initialUrl);
   recordAutomationLog('ChatGPT accepted first branch prompt', {
     baselineTurnCount,
-    currentTurnCount: extractTranscript(document).length,
+    currentTurnCount: countTranscriptTurns(document),
     acceptedSignal,
     currentUrl: normalizeChatUrl(window.location.href),
     stopButtonVisible: Boolean(findStopButton())
   });
   return { acceptedSignal, temporaryVerification };
+}
+
+// A temporary chat never gets a /c/<id> URL. ChatGPT rewrites the URL a beat after it
+// starts generating, so sampling it the instant submitComposer returns cannot see a leak.
+async function watchForPersistentConversationUrl(timeoutMs: number): Promise<string | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const currentUrl = normalizeChatUrl(window.location.href);
+    if (isPersistentConversationUrl(currentUrl)) {
+      return currentUrl;
+    }
+    await sleep(250);
+  }
+
+  return undefined;
 }
 
 async function waitForConversationUrlAfterSubmit(launchUrl: string, timeoutMs = 20_000): Promise<string> {
@@ -4100,6 +4609,55 @@ let activeAutomationTransport: AutomationTransport | undefined;
 let automationTaskRunning = false;
 let titleWatcherId: number | undefined;
 let observedBranchTitle = '';
+
+// Only ever removes our own prompt. By the time a branch fails the user may already be
+// typing in that window, and wiping their text would be far worse than the stray prompt.
+// A temporary branch that produced a /c/ URL is in the user's permanent history. Report
+// the URL rather than a bare failure, so the panel can offer to open and delete it.
+async function reportTemporaryBranchLeak(
+  branchChatUrl: string,
+  temporaryVerification: TemporaryChatVerification
+): Promise<void> {
+  recordAutomationLog('Temporary branch landed in a persistent conversation', {
+    temporaryVerification,
+    branchChatUrl
+  });
+
+  await sendAutomationEvent({
+    kind: 'failed',
+    reason:
+      temporaryVerification === 'assumed'
+        ? 'ChatGPT saved this branch as a normal conversation because temporary mode could not be confirmed. Open the branch to review or delete it.'
+        : 'ChatGPT saved this branch as a normal conversation even though temporary mode looked active. Open the branch to review or delete it.',
+    branchChatUrl
+  });
+}
+
+function clearComposerAfterFailure(prompt: string): void {
+  try {
+    const marker = compactWhitespace(prompt).slice(0, 60);
+    if (!marker) {
+      return;
+    }
+
+    const composer = findComposer();
+    if (!composer) {
+      return;
+    }
+
+    const current = compactWhitespace(
+      composer instanceof HTMLTextAreaElement ? composer.value : composer.textContent ?? ''
+    );
+    if (!current.startsWith(marker)) {
+      return;
+    }
+
+    fillComposer(composer, '');
+    recordAutomationLog('Cleared the unsent branch prompt out of the composer after a failure');
+  } catch {
+    // Never let cleanup mask the original failure.
+  }
+}
 
 async function sendAutomationEvent(event: BranchPanelEvent): Promise<void> {
   if (!activeAutomationPanelId || !activeAutomationTransport) {
@@ -4142,12 +4700,10 @@ async function sendAutomationEvent(event: BranchPanelEvent): Promise<void> {
 }
 
 function findBranchTitleFromTranscript(): string | null {
-  const assistantTurns = extractTranscript(document)
-    .filter((turn) => turn.role === 'assistant')
-    .reverse();
-
-  for (const turn of assistantTurns) {
-    const parsed = stripHiddenTitle(turn.text);
+  // The envelope is always on the branch's own answer, so there is no reason to rebuild
+  // the text of every turn on a 1.2s interval.
+  for (const text of getRecentAssistantTexts(3)) {
+    const parsed = stripHiddenTitle(text);
     if (parsed.title) {
       return parsed.title;
     }
@@ -4156,6 +4712,12 @@ function findBranchTitleFromTranscript(): string | null {
   return null;
 }
 
+const TITLE_MARKER_PATTERN = /\[\[BRANCH_TITLE:.*?\]\]\s*/i;
+const TITLE_MARKER_OPENING = '[[BRANCH_TITLE:';
+
+// The envelope can arrive split across text nodes while the answer streams, and React
+// re-renders the message afterwards and puts it straight back. So this handles the split
+// case and is safe to call repeatedly.
 function stripTitleEnvelopeFromVisibleMessage(): void {
   const candidates = queryMany<HTMLElement>([
     '[data-message-author-role="assistant"] [data-message-content]',
@@ -4164,18 +4726,41 @@ function stripTitleEnvelopeFromVisibleMessage(): void {
     '[data-message-author-role="assistant"] .prose'
   ]);
 
-  const markerPattern = /\[\[BRANCH_TITLE:.*?\]\]\s*/i;
-
   candidates.forEach((candidate) => {
+    if (!candidate.textContent?.includes(TITLE_MARKER_OPENING)) {
+      return;
+    }
+
     const walker = document.createTreeWalker(candidate, NodeFilter.SHOW_TEXT);
+    const nodes: Text[] = [];
     while (walker.nextNode()) {
-      const node = walker.currentNode as Text;
-      const nextValue = (node.nodeValue ?? '').replace(markerPattern, '');
-      if (nextValue !== (node.nodeValue ?? '')) {
-        node.nodeValue = nextValue;
+      nodes.push(walker.currentNode as Text);
+    }
+
+    const combined = nodes.map((node) => node.nodeValue ?? '').join('');
+    const match = combined.match(TITLE_MARKER_PATTERN);
+    if (!match || match.index === undefined) {
+      return;
+    }
+
+    const markerStart = match.index;
+    const markerEnd = markerStart + match[0].length;
+
+    let cursor = 0;
+    nodes.forEach((node) => {
+      const value = node.nodeValue ?? '';
+      const nodeStart = cursor;
+      const nodeEnd = cursor + value.length;
+      cursor = nodeEnd;
+
+      if (nodeEnd <= markerStart || nodeStart >= markerEnd) {
         return;
       }
-    }
+
+      const from = Math.max(0, markerStart - nodeStart);
+      const to = Math.min(value.length, markerEnd - nodeStart);
+      node.nodeValue = value.slice(0, from) + value.slice(to);
+    });
   });
 }
 
@@ -4197,14 +4782,14 @@ function startTitleWatcher(): void {
     if (title && title !== observedBranchTitle) {
       observedBranchTitle = title;
       void sendAutomationEvent({ kind: 'title', title });
-      stripTitleEnvelopeFromVisibleMessage();
-      stopTitleWatcher();
-      return;
     }
 
-    if (Date.now() - startedAt > TITLE_WATCH_TIMEOUT_MS) {
+    // Keep stripping: the marker is detected in the first streamed chunk, and every
+    // later re-render of that message re-inserts it.
+    stripTitleEnvelopeFromVisibleMessage();
+
+    if (Date.now() - startedAt > TITLE_MARKER_WATCH_TIMEOUT_MS) {
       stopTitleWatcher();
-      stripTitleEnvelopeFromVisibleMessage();
     }
   }, 1200);
 }
@@ -4254,19 +4839,28 @@ async function runBranchPromptAutomation(
       : undefined;
 
     if (message.branchKind === 'temporary') {
-      if (temporaryVerification === 'assumed' && immediateBranchUrl) {
-        throw new Error(
-          'ChatGPT opened a persistent chat after temporary mode could not be confirmed.'
-        );
+      if (immediateBranchUrl) {
+        await reportTemporaryBranchLeak(immediateBranchUrl, temporaryVerification);
+        return;
       }
+
       recordAutomationLog('Temporary branch accepted generation signal', {
         acceptedSignal,
         temporaryVerification,
-        branchChatUrl: immediateBranchUrl ?? null,
         currentUrl: normalizeChatUrl(window.location.href)
       });
-      await sendAutomationEvent({ kind: 'live', branchChatUrl: immediateBranchUrl });
+      // Go live now and keep watching: ChatGPT rewrites the URL a beat after it starts
+      // generating, and holding the panel behind the loading overlay for that whole
+      // window would tax every temporary branch that works fine.
+      await sendAutomationEvent({ kind: 'live' });
       startTitleWatcher();
+      void (async () => {
+        const leakedUrl = await watchForPersistentConversationUrl(TEMPORARY_LEAK_WATCH_MS);
+        if (leakedUrl) {
+          await reportTemporaryBranchLeak(leakedUrl, temporaryVerification);
+        }
+      })();
+
       if (transport === 'background') {
         try {
           await focusComposerForFollowUp();
@@ -4305,12 +4899,21 @@ async function runBranchPromptAutomation(
     }
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'Unknown frame error';
+    const currentUrl = normalizeChatUrl(window.location.href);
+    const branchChatUrl = isPersistentConversationUrl(currentUrl) ? currentUrl : undefined;
     recordAutomationLog('Frame task failed', {
-      reason
+      reason,
+      branchChatUrl: branchChatUrl ?? null
     });
+
+    // Leaving the prompt sitting in the user's real composer is worse than useless: the
+    // next thing they type appends to a 3KB machine prompt they never wrote.
+    clearComposerAfterFailure(message.prompt);
+
     await sendAutomationEvent({
       kind: 'failed',
-      reason
+      reason,
+      branchChatUrl
     });
   } finally {
     automationTaskRunning = false;
@@ -4339,6 +4942,11 @@ function initEmbeddedFrame(): void {
   };
 
   const frameMessageListener = (event: MessageEvent<FrameStartBranchMessage>) => {
+    // Only the embedding page may start a branch here, and only from our own origin.
+    if (event.source !== window.parent || event.origin !== window.location.origin) {
+      return;
+    }
+
     const data = event.data;
     if (
       !data ||

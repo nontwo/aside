@@ -5,7 +5,9 @@ Aside is a Chromium extension for asking focused follow-up questions from long C
 It keeps the reading flow centered on the selected passage:
 - select text inside a ChatGPT assistant answer
 - open an in-page branch with `Ask` or `Why`
+- type the question and press `Enter` to send it (`Shift+Enter` for a new line)
 - keep reading while branches run in parallel
+- press `Escape` to tuck the open branch back into the rail
 - restore minimized branches later and jump back to the original selected text
 
 ## What Aside does
@@ -19,7 +21,8 @@ It keeps the reading flow centered on the selected passage:
   - `persistent` branches that must resolve to a real ChatGPT conversation URL
   - `temporary` branches that may stay ephemeral
 - Supports `New-tab`, which opens a second ChatGPT window for a separate branch flow.
-- Preserves minimized branches so you can keep multiple questions running without interrupting each other.
+- Preserves minimized branches so you can keep multiple questions running without interrupting each other. Branches stay saved per conversation, so leaving a chat and coming back does not discard them.
+- Falls back with a real error instead of an endless spinner when ChatGPT refuses to be embedded or a branch window stops responding.
 
 ## Local development
 
@@ -66,12 +69,12 @@ npm run build
 npm run smoke:local
 ```
 
-`npm run smoke:local` uses a fake `chatgpt.com` harness to verify the selection toolbar, branch creation flow, and embedded/native branch behaviors without relying on live production markup.
+`npm run smoke:local` uses a fake `chatgpt.com` harness to verify the selection toolbar, branch creation flow, and embedded/native branch behaviors without relying on live production markup. The harness intercepts requests at the browser level, so windows the extension opens itself are covered too.
 
-For the current native-window scenarios, there is also an opt-in smoke variant:
+The native-window scenarios (`Why` recovery and `New-tab`) run as part of that command. To skip them for a faster loop:
 
 ```bash
-INCLUDE_NATIVE_WINDOW_SMOKE=true npm run smoke:local
+SKIP_NATIVE_WINDOW_SMOKE=true npm run smoke:local
 ```
 
 ## Safe open-source release workflow
