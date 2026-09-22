@@ -1688,10 +1688,32 @@ function ensureSelectionToolbar(): HTMLDivElement {
   return mountInExtensionHost(selectionToolbar);
 }
 
+/**
+ * True while the toolbar is hidden because nothing fitted — not because there is
+ * no selection.
+ *
+ * `hidden` alone cannot tell those apart, and every re-entry path was gated on it,
+ * so a collapse was a one-way latch: the obstruction is usually the provider's own
+ * selection popup, which disappears on the very next click, and Aside stayed
+ * collapsed anyway until the user selected again.
+ */
+let selectionToolbarCollapsed = false;
+
+function selectionToolbarNeedsSync(): boolean {
+  if (!selectionToolbar) {
+    return false;
+  }
+  if (!selectionToolbar.hidden) {
+    return true;
+  }
+  return selectionToolbarCollapsed && Boolean(currentSelectionDraft);
+}
+
 function hideSelectionToolbar(): void {
   if (selectionToolbar) {
     selectionToolbar.hidden = true;
   }
+  selectionToolbarCollapsed = false;
 }
 
 function hideAskButton(clearSelection = true): void {
@@ -1824,7 +1846,125 @@ function isAsideOwned(node: Node | null): boolean {
   return Boolean(element?.closest(`#${EXTENSION_HOST_ID}`));
 }
 
-function positionSelectionToolbar(rect: DOMRect): void {
+/**
+ * The largest share of the viewport an occluding element may take and still be
+ * treated as something to dodge. A full-page overlay or a scroll container is not
+ * a popup, and reserving one would collapse Aside on every page.
+ */
+const MAX_OCCLUDER_VIEWPORT_FRACTION = 0.6;
+
+/**
+ * The floating container an occluding node belongs to.
+ *
+ * A hit test lands on whatever leaf is painted at that point — a label, an icon,
+ * a text node's span. Reserving that leaf would leave Aside overlapping the rest
+ * of the popup around it.
+ */
+function nearestPositionedAncestor(element: Element): HTMLElement | null {
+  let current: HTMLElement | null =
+    element instanceof HTMLElement ? element : element.parentElement;
+
+  while (current && current !== document.body && current !== document.documentElement) {
+    const position = window.getComputedStyle(current).position;
+    if (position === 'fixed' || position === 'absolute' || position === 'sticky') {
+      return current;
+    }
+    current = current.parentElement;
+  }
+
+  return element instanceof HTMLElement ? element : null;
+}
+
+/**
+ * What is actually painted on top of Aside's own controls.
+ *
+ * Selectors are a guess about a provider's markup; paint order is a fact about
+ * the page. Aside's toolbar overlapped ChatGPT's real selection popup because
+ * none of the three selectors written for it matched — and no wider guess would
+ * have been safer, because a selector that over-matches reserves a band the size
+ * of the reading column and collapses Aside for no reason.
+ *
+ * So: place first, then ask the page whether anything is covering us, and reserve
+ * only what genuinely is. This needs no provider knowledge and survives a
+ * redesign.
+ */
+function findOccludingRects(toolbar: HTMLElement): Rect[] {
+  if (typeof document.elementsFromPoint !== 'function') {
+    return [];
+  }
+
+  const controls = Array.from(toolbar.querySelectorAll<HTMLElement>('button'));
+  const probes: HTMLElement[] = controls.length ? controls : [toolbar];
+  const viewportArea = Math.max(window.innerWidth * window.innerHeight, 1);
+  const seen = new Set<Element>();
+  const rects: Rect[] = [];
+
+  probes.forEach((probe) => {
+    const box = probe.getBoundingClientRect();
+    if (box.width <= 0 || box.height <= 0) {
+      return;
+    }
+
+    const x = box.left + box.width / 2;
+    const y = box.top + box.height / 2;
+    if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) {
+      return;
+    }
+
+    const topmost = document.elementsFromPoint(x, y)[0];
+    if (!topmost || isAsideOwned(topmost)) {
+      return;
+    }
+
+    const container = nearestPositionedAncestor(topmost) ?? topmost;
+    if (seen.has(container) || isAsideOwned(container)) {
+      return;
+    }
+    seen.add(container);
+
+    const rect = container.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return;
+    }
+    if (rect.width * rect.height > viewportArea * MAX_OCCLUDER_VIEWPORT_FRACTION) {
+      return;
+    }
+
+    rects.push(toRect(rect));
+  });
+
+  return rects;
+}
+
+let occlusionRecheckFrame: number | undefined;
+
+/**
+ * One re-place, on the frame after painting, if anything covered us.
+ *
+ * Exactly one: if the provider repositions its own popup in response to ours,
+ * a second pass would chase it around the screen.
+ */
+function scheduleOcclusionRecheck(anchor: DOMRect): void {
+  if (occlusionRecheckFrame !== undefined) {
+    return;
+  }
+
+  occlusionRecheckFrame = window.requestAnimationFrame(() => {
+    occlusionRecheckFrame = undefined;
+    if (!selectionToolbar || selectionToolbar.hidden) {
+      return;
+    }
+
+    const occluding = findOccludingRects(selectionToolbar);
+    if (!occluding.length) {
+      return;
+    }
+
+    positionSelectionToolbar(anchor, occluding);
+  });
+}
+
+function positionSelectionToolbar(rect: DOMRect, extraReserved: Rect[] = []): void {
   const toolbar = ensureSelectionToolbar();
   currentSelectionRect = rect;
 
@@ -1842,7 +1982,7 @@ function positionSelectionToolbar(rect: DOMRect): void {
     anchor: toRect(rect),
     size,
     viewport: { width: window.innerWidth, height: window.innerHeight },
-    reserved: collectReservedRegions()
+    reserved: [...collectReservedRegions(), ...extraReserved]
   });
 
   if (!placement) {
@@ -1850,15 +1990,26 @@ function positionSelectionToolbar(rect: DOMRect): void {
     // winning with z-index, collapse to the compact launcher in the left rail.
     toolbar.hidden = true;
     toolbar.style.visibility = '';
+    selectionToolbarCollapsed = true;
     setCompactLauncherVisible(true);
     return;
   }
 
+  selectionToolbarCollapsed = false;
   setCompactLauncherVisible(false);
   toolbar.style.top = `${placement.top}px`;
   toolbar.style.left = `${placement.left}px`;
   toolbar.dataset.side = placement.side;
+  // Restore visibility BEFORE the hit test: elementsFromPoint skips a
+  // visibility:hidden element, so a recheck run inline with the measurement above
+  // would always report Aside itself on top and never see the occluder.
   toolbar.style.visibility = '';
+
+  // Only the first pass re-checks. A pass that already carries occluders is the
+  // retry, and must not schedule another.
+  if (!extraReserved.length) {
+    scheduleOcclusionRecheck(rect);
+  }
 }
 
 // The toolbar is positioned with viewport coordinates, so it has to be re-anchored
@@ -1882,7 +2033,7 @@ function getLiveSelectionRect(): DOMRect | null {
 // The scroll listener is capturing, so it sees every scrollable element on the page.
 // Coalesce to one measurement per frame: getClientRects() forces layout.
 function scheduleSelectionToolbarSync(): void {
-  if (!selectionToolbar || selectionToolbar.hidden || toolbarSyncFrame !== undefined) {
+  if (!selectionToolbarNeedsSync() || toolbarSyncFrame !== undefined) {
     return;
   }
 
@@ -1893,7 +2044,7 @@ function scheduleSelectionToolbarSync(): void {
 }
 
 function syncSelectionToolbarToViewport(): void {
-  if (!selectionToolbar || selectionToolbar.hidden) {
+  if (!selectionToolbarNeedsSync()) {
     return;
   }
 
@@ -2016,6 +2167,10 @@ function installNativeLayoutObserver(): void {
       window.cancelAnimationFrame(layoutSyncFrame);
       layoutSyncFrame = undefined;
     }
+    if (occlusionRecheckFrame !== undefined) {
+      window.cancelAnimationFrame(occlusionRecheckFrame);
+      occlusionRecheckFrame = undefined;
+    }
   });
 }
 
@@ -2079,7 +2234,9 @@ function setCompactLauncherVisible(visible: boolean): void {
   const slot = findLeftGutterSlot({
     viewport: { width: window.innerWidth, height: window.innerHeight },
     readingColumn: readingColumnRect(),
-    reserved: collectReservedRegions(false),
+    // Including the selection toolbar's obstruction: the launcher is often shown
+    // *because* of it, so it must not be placed on top of it.
+    reserved: collectReservedRegions(true),
     size: { width: Math.max(size.width, 72), height: Math.max(size.height, 28) },
     minWidth: 64
   });
@@ -2096,7 +2253,7 @@ function setCompactLauncherVisible(visible: boolean): void {
   const corner = findFreeCorner({
     viewport: { width: window.innerWidth, height: window.innerHeight },
     size: { width: Math.max(size.width, 72), height: Math.max(size.height, 28) },
-    reserved: collectReservedRegions(false)
+    reserved: collectReservedRegions(true)
   });
 
   if (!corner) {

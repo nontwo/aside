@@ -412,21 +412,144 @@ async function selectAssistantText(page) {
   });
 }
 
-async function injectNativeAskButton(page) {
-  await page.evaluate(() => {
-    const range = getSelection()?.getRangeAt(0);
-    if (!range) {
-      throw new Error('No selection range was available.');
+/**
+ * A stand-in for the provider's own selection popup.
+ *
+ * The first version of this was a bare <button> parked to the RIGHT of the
+ * selection. That made the non-overlap assertion pass for a reason the harness
+ * authored itself: Aside's preferred slot is centred ABOVE the anchor, so the two
+ * rects could never collide whatever Aside did, and the test stayed green even
+ * though the selectors meant to reserve the stand-in matched nothing.
+ *
+ * On the real site the popup is a pill of two actions, centred above the
+ * selection — exactly where Aside wants to be — and it mounts a moment AFTER the
+ * selection settles.
+ *
+ * Options:
+ *   placement 'above' (default) reproduces the live collision; 'right' keeps the
+ *             original case, where a fallback side is the one blocked.
+ *   variant   'bare' carries no attributes at all, so only the paint-order
+ *             recheck can find it; 'attributed' carries a plausible test id, so
+ *             the selector layer is exercised too.
+ *   delayMs   mounts the popup that long after the call returns, without touching
+ *             the selection — the late-mount case, which only the MutationObserver
+ *             path can catch.
+ */
+async function injectNativeAskButton(page, options = {}) {
+  const { placement = 'right', variant = 'attributed', delayMs = 0 } = options;
+
+  await page.evaluate(
+    (placementMode, variantMode, delay) => {
+      const range = getSelection()?.getRangeAt(0);
+      if (!range) {
+        throw new Error('No selection range was available.');
+      }
+
+      // The first client rect, matching what root.ts anchors to. getBoundingClientRect
+      // spans every line of a multi-line selection and is a different box.
+      const rects = Array.from(range.getClientRects()).filter(
+        (candidate) => candidate.width > 0 || candidate.height > 0
+      );
+      const rect = rects[0] ?? range.getBoundingClientRect();
+
+      const POPUP_WIDTH = 430;
+      const POPUP_HEIGHT = 44;
+
+      const pill = document.createElement('div');
+      pill.dataset.nativeSelectionPopup = 'true';
+      if (variantMode === 'attributed') {
+        pill.setAttribute('data-testid', 'selection-toolbar');
+      }
+      pill.style.position = 'fixed';
+      pill.style.display = 'flex';
+      pill.style.alignItems = 'center';
+      pill.style.gap = '0px';
+      pill.style.height = `${POPUP_HEIGHT}px`;
+      pill.style.width = `${POPUP_WIDTH}px`;
+      pill.style.borderRadius = '999px';
+      pill.style.background = '#ffffff';
+      pill.style.boxShadow = '0 8px 24px rgba(0,0,0,0.18)';
+      pill.style.zIndex = '2147483646';
+
+      if (placementMode === 'above') {
+        pill.style.top = `${Math.max(8, rect.top - POPUP_HEIGHT - 8)}px`;
+        pill.style.left = `${Math.max(8, rect.left + rect.width / 2 - POPUP_WIDTH / 2)}px`;
+      } else {
+        pill.style.top = `${Math.max(16, rect.top - 40)}px`;
+        pill.style.left = `${Math.max(16, rect.right + 16)}px`;
+      }
+
+      ['Ask ChatGPT', 'Share highlighted'].forEach((label, index) => {
+        if (index > 0) {
+          const divider = document.createElement('span');
+          divider.style.width = '1px';
+          divider.style.height = '20px';
+          divider.style.background = 'rgba(0,0,0,0.12)';
+          pill.append(divider);
+        }
+        const button = document.createElement('button');
+        button.setAttribute('aria-label', label);
+        button.textContent = label;
+        button.style.flex = '1';
+        button.style.height = '100%';
+        button.style.border = 'none';
+        button.style.background = 'transparent';
+        pill.append(button);
+      });
+
+      const mount = () => document.body.append(pill);
+      if (delay > 0) {
+        // Deliberately no reselection: on a real page the popup appears on its own
+        // and Aside is told by nothing but its MutationObserver.
+        window.setTimeout(mount, delay);
+      } else {
+        mount();
+      }
+    },
+    placement,
+    variant,
+    delayMs
+  );
+
+  if (delayMs > 0) {
+    await sleep(delayMs + 400);
+  }
+}
+
+/**
+ * Is every one of Aside's own controls actually clickable?
+ *
+ * This is the exact property the live screenshot violated, and the one the
+ * rectangle comparison could not express: Aside's toolbar was placed, was
+ * visible, was the right size — and the provider's popup was painted on top of
+ * half of it.
+ */
+async function readAsideOcclusion(page) {
+  return page.evaluate(() => {
+    const toolbar = document.querySelector('#aside-selection-toolbar');
+    if (!(toolbar instanceof HTMLElement) || toolbar.hidden) {
+      return { applicable: false, covered: [], allReachable: true };
     }
-    const rect = range.getBoundingClientRect();
-    const button = document.createElement('button');
-    button.setAttribute('aria-label', 'Ask ChatGPT');
-    button.textContent = 'Ask ChatGPT';
-    button.style.position = 'fixed';
-    button.style.top = `${Math.max(16, rect.top - 40)}px`;
-    button.style.left = `${Math.max(16, rect.right + 16)}px`;
-    button.style.zIndex = '2147483646';
-    document.body.append(button);
+
+    const covered = [];
+    Array.from(toolbar.querySelectorAll('button')).forEach((button) => {
+      const rect = button.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        return;
+      }
+      const topmost = document.elementFromPoint(
+        rect.left + rect.width / 2,
+        rect.top + rect.height / 2
+      );
+      if (!topmost?.closest('#aside-root')) {
+        covered.push({
+          label: button.textContent?.trim() ?? '',
+          coveredBy: topmost instanceof HTMLElement ? topmost.tagName.toLowerCase() : null
+        });
+      }
+    });
+
+    return { applicable: true, covered, allReachable: covered.length === 0 };
   });
 }
 
@@ -591,8 +714,11 @@ async function runNonProjectScenario(browser) {
       const toolbar = document.querySelector('#aside-selection-toolbar');
       return toolbar instanceof HTMLElement && !toolbar.hidden;
     });
-    await injectNativeAskButton(page);
-    await selectAssistantText(page);
+    // The live case: the popup is centred above the selection, exactly where Aside
+    // wants to be, and carries nothing any selector was written for.
+    await injectNativeAskButton(page, { placement: 'above', variant: 'bare' });
+    await sleep(500);
+    const askOcclusion = await readAsideOcclusion(page);
 
     const askState = await page.evaluate(() => {
       const buttons = Array.from(
@@ -611,9 +737,12 @@ async function runNonProjectScenario(browser) {
       const nativeAsk = document.querySelector('button[aria-label="Ask ChatGPT"]');
       const nativeStyle = nativeAsk instanceof HTMLElement ? getComputedStyle(nativeAsk) : null;
       const nativeRect = nativeAsk?.getBoundingClientRect();
-      const toolbarRect = document
-        .querySelector('#aside-selection-toolbar')
-        ?.getBoundingClientRect();
+      // Only when the toolbar is actually showing. A hidden toolbar has a zero rect
+      // that overlaps nothing, so reading it unconditionally let "collapsed to the
+      // launcher" and "placed clear of the native pill" share one green signal.
+      const toolbarEl = document.querySelector('#aside-selection-toolbar');
+      const toolbarShown = toolbarEl instanceof HTMLElement && !toolbarEl.hidden;
+      const toolbarRect = toolbarShown ? toolbarEl.getBoundingClientRect() : null;
 
       // The provider's own action must stay fully usable, and Aside must sit beside
       // it rather than on top of it.
@@ -645,6 +774,7 @@ async function runNonProjectScenario(browser) {
           document.querySelector('#aside-selection-toolbar')?.getAttribute('aria-label') ??
           null,
         nativeAskUsable,
+        toolbarShown,
         nativeAskHitTargetIsNative: hitTarget === nativeAsk || Boolean(nativeAsk?.contains(hitTarget)),
         nativeAskClassList: nativeAsk instanceof HTMLElement ? nativeAsk.className : null,
         asideOverlapsNativeAsk: Boolean(
@@ -827,6 +957,7 @@ async function runNonProjectScenario(browser) {
 
     return {
       askState,
+      askOcclusion,
       darkThemeState,
       liveResult,
       minimizedState,
@@ -1744,13 +1875,17 @@ async function runLayoutMatrixScenario(browser) {
         try {
           await page.setViewport({ width: viewport.width, height: viewport.height });
           await selectAssistantText(page);
-          await injectNativeAskButton(page);
-          // Re-evaluate after the native action appears, as it would on a real page.
-          await selectAssistantText(page);
+          // Late mount, and no reselection: on a real page the popup appears on its
+          // own after the selection has settled, and only the MutationObserver tells
+          // Aside about it. Reselecting here re-ran the whole selection pipeline and
+          // hid the fact that the observer path had no coverage at all.
+          await injectNativeAskButton(page, { placement: 'right', delayMs: 200 });
           await page.waitForFunction(() => {
             const toolbar = document.querySelector('#aside-selection-toolbar');
             return toolbar instanceof HTMLElement && !toolbar.hidden;
           }, { timeout: 10_000 });
+
+          const occlusion = await readAsideOcclusion(page);
 
           await capture(page, `toolbar-${label}`);
 
@@ -1801,7 +1936,7 @@ async function runLayoutMatrixScenario(browser) {
             };
           });
 
-          results.push({ label, ...measured });
+          results.push({ label, ...measured, occlusion });
         } finally {
           await page.close();
         }
@@ -1923,6 +2058,9 @@ try {
       entry.overlapsColumn !== false ||
       entry.overlapsNativeAsk !== false ||
       entry.nativeAskHitTargetIsNative !== true ||
+      // And, for a popup that mounted after Aside had already placed itself:
+      // nothing of Aside's is painted over.
+      entry.occlusion?.allReachable !== true ||
       // The rail is either placed in the gutter or replaced by the compact launcher.
       !(entry.placement === 'left-gutter' || entry.launcherShown) ||
       entry.theme !== (entry.label.endsWith('dark') ? 'dark' : 'light')
@@ -1980,6 +2118,16 @@ try {
     crossTab.tabBStillShowsPanel !== false
   ) {
     throw new Error(`Cross-tab panel protocol failed: ${JSON.stringify(crossTab)}`);
+  }
+
+  // The live failure this exists for: Aside's toolbar was placed, was visible and
+  // was the right size, and the provider's popup was painted over half of it. A
+  // rectangle comparison cannot express that; asking the page what a click would
+  // actually reach can.
+  if (nonProject.askOcclusion?.allReachable !== true) {
+    throw new Error(
+      `Aside's own controls were covered by provider UI: ${JSON.stringify(nonProject.askOcclusion)}`
+    );
   }
 
   if (

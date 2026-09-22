@@ -235,6 +235,17 @@ export const chatgptAdapter: ProviderAdapter = {
   },
 
   layout: {
+    // UNVERIFIED against the live site. These are a best-effort first pass, and on
+    // 2026-09-22 a live run showed they do not match ChatGPT's real selection popup
+    // (the "Ask ChatGPT / Share highlighted" pill), which is how Aside came to be
+    // painted underneath it.
+    //
+    // They are deliberately NOT widened by guessing. A selector that over-matches
+    // reserves a band the size of the reading column and collapses Aside to the
+    // compact launcher for no reason, which is worse than missing: the real
+    // guarantee is the paint-order recheck in root.ts (findOccludingRects), which
+    // needs no knowledge of this markup at all. Narrow these further, or replace
+    // them, only with evidence from a live page.
     nativeSelectionToolbarSelectors: [
       '[data-testid="selection-toolbar"]',
       '[class*="selection-tooltip"]',
