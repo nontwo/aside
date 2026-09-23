@@ -147,9 +147,11 @@ describe('scope keys never collide across providers', () => {
 });
 
 describe('declared capabilities are explicit, not optimistic', () => {
-  it('explains what happens to a Claude branch, without claiming the surface works', () => {
+  it('explains what happens to a Claude branch, including the fallback', () => {
     expect(claudeAdapter.surfaces.detail).toMatch(/frame/i);
-    expect(surfaceIsAvailable(claudeAdapter.surfaces.embedded)).toBe(false);
+    // The detail must still promise the fallback, since a refusal is possible on
+    // an account or policy this evidence does not cover.
+    expect(claudeAdapter.surfaces.detail).toMatch(/falls back/i);
   });
 
   it('claims no surface as live-verified', () => {
@@ -162,12 +164,15 @@ describe('declared capabilities are explicit, not optimistic', () => {
     });
   });
 
-  it('still offers the surfaces it has fixture evidence for', () => {
-    // Honesty about evidence must not turn into refusing to run: `fixture-only`
-    // is offered, `unverified` is not *claimed*.
+  it('offers every surface it has evidence for, on both providers', () => {
+    // Honesty about evidence must not turn into refusing to run. Claude's panel
+    // frame is claimable now: a live run observed it load, and a fixture
+    // exercises it.
     expect(surfaceIsAvailable(claudeAdapter.surfaces.nativeWindow)).toBe(true);
-    expect(surfaceIsAvailable(claudeAdapter.surfaces.embedded)).toBe(false);
+    expect(surfaceIsAvailable(claudeAdapter.surfaces.embedded)).toBe(true);
     expect(surfaceIsAvailable(chatgptAdapter.surfaces.embedded)).toBe(true);
+    // Nothing is claimable that the provider genuinely does not expose.
+    expect(surfaceIsAvailable('unsupported')).toBe(false);
   });
 
   it('separates what may be attempted from what may be claimed', () => {
