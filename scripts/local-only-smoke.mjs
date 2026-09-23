@@ -2640,6 +2640,22 @@ async function runLibraryScenario(browser, { questionId = null } = {}) {
     // Search finds a word from a captured answer, across every source.
     await page.type('#search', 'uses only the selected passage');
     await page.waitForSelector('#content .q', { timeout: 10_000 });
+    // Every keystroke re-renders the results. On a slow runner the last of those
+    // renders landed AFTER the View click below and replaced the opened thread
+    // with the list again, so wait until the results have stopped changing.
+    await page.waitForFunction(
+      () => document.querySelector('#search')?.value === 'uses only the selected passage',
+      { timeout: 10_000 }
+    );
+    let previousResults = null;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await sleep(250);
+      const current = await page.evaluate(() => document.querySelector('#content')?.innerHTML ?? '');
+      if (current === previousResults) {
+        break;
+      }
+      previousResults = current;
+    }
     const searchHit = await page.evaluate(() => document.querySelector('#content .q small')?.textContent ?? '');
 
     // Open the first hit: the saved thread renders as text, read-only.
@@ -2648,6 +2664,13 @@ async function runLibraryScenario(browser, { questionId = null } = {}) {
       view?.click();
     });
     await page.waitForSelector('#content .msg[data-role="assistant"]', { timeout: 10_000 });
+    await page.waitForFunction(
+      () =>
+        Array.from(document.querySelectorAll('#content details summary')).some((el) =>
+          el.textContent?.includes('Exactly what was sent')
+        ),
+      { timeout: 10_000 }
+    );
     const bundle = await page.evaluate(() => ({
       assistantText: document.querySelector('#content .msg[data-role="assistant"]')?.textContent ?? null,
       assistantPartial: document.querySelector('#content .msg[data-role="assistant"]')?.getAttribute('data-partial') ?? null,
