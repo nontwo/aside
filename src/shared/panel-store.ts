@@ -302,6 +302,10 @@ export function mergePanelStateOnConflict(input: {
     ...theirs,
     // The text in this tab's box is what its user is looking at.
     initialQuestion: input.localQuestion,
+    // Presentation is per tab. Minimizing or closing a view in one tab must not
+    // force the Owner's view shut in another.
+    minimized: local.minimized,
+    closedView: local.closedView,
     // Privacy never resolves downwards. Re-marking a branch private costs a
     // click; a branch silently demoted to persistent has already written to disk.
     branchKind:

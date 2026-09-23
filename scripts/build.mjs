@@ -55,10 +55,14 @@ async function buildEntry(entry, name, fileName, formats = ['iife']) {
 
 async function copyManifest() {
   await cp(resolve(root, 'public/manifest.json'), resolve(dist, 'manifest.json'));
+  // The library is an extension-owned page: local resources only, no inline
+  // script, so it complies with the default extension CSP.
+  await cp(resolve(root, 'public/library.html'), resolve(dist, 'library.html'));
 }
 
 await rm(dist, { recursive: true, force: true });
 await buildEntry('src/content/root.ts', 'AsideRootContent', 'assets/root-content.js');
 await buildEntry('src/background/index.ts', 'AsideBackground', 'assets/background.js', ['es']);
+await buildEntry('src/ui/library.ts', 'AsideLibrary', 'assets/library.js');
 await copyManifest();
 console.log(`[aside] build id ${BUILD_ID}`);

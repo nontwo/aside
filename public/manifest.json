@@ -32,5 +32,8 @@
       "all_frames": true,
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "action": {
+    "default_title": "Aside library"
+  }
 }

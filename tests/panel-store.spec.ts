@@ -368,6 +368,18 @@ describe('merging a panel this tab lost a write for', () => {
     expect(merged.context).toEqual(context);
   });
 
+  it('keeps presentation per tab: another tab closing its view does not close this one', () => {
+    const merged = mergePanelStateOnConflict({
+      local: makeState({ minimized: false, closedView: false }),
+      theirs: makeState({ minimized: true, closedView: true }),
+      localQuestion: 'q',
+      localDrivesBranch: false
+    });
+
+    expect(merged.minimized).toBe(false);
+    expect(merged.closedView).toBe(false);
+  });
+
   it('always keeps the text in this tab-s box', () => {
     const merged = mergePanelStateOnConflict({
       local: makeState({ initialQuestion: 'half a sentence' }),

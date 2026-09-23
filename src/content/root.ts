@@ -23,12 +23,16 @@ import type {
   PanelChangedMessage,
   PanelListResponse,
   PanelListedRecord,
-  PanelWriteResponse
+  PanelWriteResponse,
+  BranchSurfaceMode,
+  BranchCapturedEvent
 } from '../shared/types';
 import {
   buildSelectionPayloadFromDraft,
   captureSelectionDraftFromRange,
   countTranscriptTurns,
+  extractStructuredNodeText,
+  extractTranscript,
   findQuotedTextRangeInElement,
   findTurnElementByAnchor,
   getRecentAssistantTexts,
@@ -39,10 +43,10 @@ import {
 import type { SelectionDraft } from '../shared/dom';
 import {
   buildBranchPrompt,
-  buildNativeBootstrapPromptFromContext,
   stripHiddenTitle
 } from '../shared/prompts';
 import {
+  DEFAULT_MAX_CONTEXT_CHARS,
   createContext,
   describeContextSize,
   freezeContext,
@@ -57,6 +61,38 @@ import { attachElementToHost, ensureExtensionHostElement } from './ui-host';
 import { findFreeCorner, findLeftGutterSlot, findSafePlacement } from '../shared/placement';
 import { surfaceMayBeAttempted } from '../shared/providers/types';
 import type { SurfaceObservation } from '../shared/providers/types';
+import {
+  COMPILER_VERSION,
+  buildContextPlan,
+  describePlan,
+  renderContextText as renderPlanText
+} from '../context/plan';
+import type { ContextPlan, PlanInput, SourceTurn } from '../context/plan';
+import { TEMPLATE_VERSION, buildPrompt } from '../context/template';
+import {
+  blockIdFor,
+  fnv1a,
+  newAnchorId,
+  newLinkId,
+  newQuestionId,
+  newSnapshotId,
+  sourceIdFor
+} from '../domain/ids';
+import { autoTitle } from '../domain/commands';
+import type { CapturedMessage } from '../shared/types';
+import {
+  exportSourceMarkdown,
+  fetchBundle,
+  listQuestionsForScope,
+  runCommand
+} from '../ui/question-client';
+import { renderQuestionList } from '../ui/question-list';
+import type { ListFilter } from '../ui/question-list';
+import { BUILD_ID } from '../shared/build-info';
+import { TranscriptCaptureWatcher } from '../providers/capture';
+import type { ObservedTurn } from '../providers/capture';
+import type { QuestionBundle, QuestionListEntry } from '../storage/repository';
+import type { QuestionChangedMessage } from '../storage/protocol';
 import type { Rect } from '../shared/placement';
 import {
   composerSizePenalty,
@@ -124,6 +160,9 @@ interface PanelRuntime {
   contextBackground: HTMLTextAreaElement;
   contextSizeEl: HTMLParagraphElement;
   contextPreview: HTMLPreElement;
+  archiveEl: HTMLDivElement;
+  /** Fingerprint of the last capture written per ordinal, to bound writes. */
+  writtenCapture: Map<number, string>;
   debugLogShell: HTMLDivElement;
   debugLogTextarea: HTMLTextAreaElement;
   copyLogButton: HTMLButtonElement;
@@ -225,6 +264,20 @@ let selectionTimer: number | undefined;
 let lastKnownUrl = normalizeChatUrl(window.location.href);
 let cleanupFns: Array<() => void> = [];
 const panelRuntimes = new Map<string, PanelRuntime>();
+
+/* ---------------------------------------------------------------- *
+ * Canonical question records live in the worker's database. The panel is a
+ * view/run projection; these maps hold the revisions this tab last saw.
+ * ---------------------------------------------------------------- */
+const questionRevs = new Map<string, number>();
+const draftRevs = new Map<string, number>();
+const linkRevs = new Map<string, number>();
+
+let questionListEl: HTMLDivElement | null = null;
+let questionListFilter: ListFilter = 'active';
+let questionListEntries: QuestionListEntry[] = [];
+let questionListSourceId: string | null = null;
+let questionListOpen = false;
 let nativeLayoutObserver: MutationObserver | null = null;
 let layoutSyncFrame: number | undefined;
 let asideLauncher: HTMLButtonElement | null = null;
@@ -1449,6 +1502,116 @@ function ensureStyles(): void {
       white-space: pre-wrap;
     }
 
+    .aside-notice {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      max-width: 360px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: var(--sb-panel-bg, rgba(255, 255, 255, 0.98));
+      color: var(--sb-text, #111827);
+      border: 1px solid var(--sb-border-strong, rgba(15, 23, 42, 0.14));
+      box-shadow: 0 12px 32px rgba(15, 23, 42, 0.22);
+      font-size: 12px;
+      z-index: 2147483647;
+    }
+    .aside-archive {
+      margin: 8px 0 4px;
+      padding: 8px 10px;
+      border: 1px solid var(--sb-border, rgba(15, 23, 42, 0.1));
+      border-radius: 12px;
+      background: var(--sb-subtle-bg, rgba(15, 23, 42, 0.03));
+      font-size: 12px;
+      display: grid;
+      gap: 6px;
+      max-height: 40vh;
+      overflow: auto;
+    }
+    .aside-archive-status {
+      color: var(--sb-muted, #6b7280);
+    }
+    .aside-archive-message {
+      white-space: pre-wrap;
+      word-break: break-word;
+      padding: 6px 8px;
+      border-left: 3px solid var(--sb-border-strong, rgba(15, 23, 42, 0.14));
+    }
+    .aside-archive-message[data-role="user"] {
+      border-left-color: var(--sb-text, #111827);
+    }
+    .aside-archive-message[data-partial="true"]::after {
+      content: ' (partial)';
+      color: var(--sb-muted, #6b7280);
+    }
+    .aside-qlist-panel {
+      padding: 12px 14px;
+      display: grid;
+      gap: 8px;
+      font-size: 12px;
+    }
+    .aside-qlist-header {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .aside-qlist-filters {
+      display: inline-flex;
+      gap: 4px;
+    }
+    .aside-qlist-filters button,
+    .aside-qlist-actions button,
+    .aside-qlist-footer button {
+      font: inherit;
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--sb-border, rgba(15, 23, 42, 0.1));
+      background: var(--sb-surface-bg, rgba(248, 250, 252, 0.96));
+      color: var(--sb-text, #111827);
+      cursor: pointer;
+    }
+    .aside-qlist-filters button[data-selected="true"] {
+      background: var(--sb-text, #111827);
+      color: var(--sb-primary-text, #ffffff);
+    }
+    .aside-qlist-row {
+      display: grid;
+      gap: 4px;
+      padding: 8px 10px;
+      border: 1px solid var(--sb-border, rgba(15, 23, 42, 0.1));
+      border-radius: 10px;
+      background: var(--sb-subtle-bg, rgba(15, 23, 42, 0.03));
+    }
+    .aside-qlist-open {
+      font: inherit;
+      font-weight: 600;
+      text-align: left;
+      background: none;
+      border: 0;
+      padding: 0;
+      color: var(--sb-text, #111827);
+      cursor: pointer;
+    }
+    .aside-qlist-meta {
+      color: var(--sb-muted, #6b7280);
+    }
+    .aside-qlist-actions,
+    .aside-qlist-footer {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .aside-qlist-empty {
+      color: var(--sb-muted, #6b7280);
+      margin: 0;
+    }
+    .aside-tab-questions button[data-selected="true"] {
+      background: var(--sb-text, #111827);
+      color: var(--sb-primary-text, #ffffff);
+    }
     .aside-context {
       margin: 8px 0 4px;
       padding: 8px 10px;
@@ -2682,6 +2845,7 @@ interface CreateDraftOptions {
   initialQuestion?: string;
   autoStart?: boolean;
   hostChatUrl?: string;
+  preferredSurface?: BranchSurfaceMode;
 }
 
 /**
@@ -2739,7 +2903,8 @@ function createDraftState(selection: SelectionPayload, options: CreateDraftOptio
     focusPreview: clipText(selection.selectedText, 280),
     branchKind: options.branchKind,
     entryAction: options.entryAction,
-    surfaceMode: 'embedded',
+    surfaceMode: options.preferredSurface ?? 'embedded',
+    preferredSurface: options.preferredSurface,
     launchUrl: undefined,
     creationMode: 'pending',
     title: DEFAULT_BRANCH_TITLE,
@@ -2848,8 +3013,13 @@ function createBranchDraft(selection: SelectionPayload, options: CreateDraftOpti
     syncPanelUI(runtime);
   }
 
+  // An ordinary question gets its canonical record the moment it exists. A
+  // private one never does: session-only material is never staged on disk.
+  const registration =
+    state.branchKind === 'temporary' ? Promise.resolve() : registerQuestionForPanel(runtime);
+
   if (options.autoStart && options.initialQuestion?.trim()) {
-    void startBranch(state.panelId, options.initialQuestion.trim());
+    void registration.then(() => startBranch(state.panelId, options.initialQuestion!.trim()));
   }
 
   return runtime;
@@ -3039,6 +3209,12 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     contextPreview
   );
 
+  // Saved thread: what was read back from the branch conversation. Read-only
+  // evidence; opening it never opens a provider tab or sends anything.
+  const archiveEl = document.createElement('div');
+  archiveEl.className = 'aside-archive';
+  archiveEl.hidden = true;
+
   const debugLogShell = document.createElement('div');
   debugLogShell.className = 'aside-debug-log';
   debugLogShell.hidden = true;
@@ -3064,7 +3240,7 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   debugLogActions.append(selectDebugLogButton, closeDebugLogButton);
   debugLogShell.append(debugLogTitle, debugLogHelp, debugLogTextarea, debugLogActions);
 
-  body.append(focus, contextShell, formEl, iframeShell, debugLogShell);
+  body.append(focus, contextShell, archiveEl, formEl, iframeShell, debugLogShell);
   element.append(header, body);
   mountInExtensionHost(element);
 
@@ -3094,6 +3270,8 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     contextBackground,
     contextSizeEl,
     contextPreview,
+    archiveEl,
+    writtenCapture: new Map<number, string>(),
     debugLogShell,
     debugLogTextarea,
     copyLogButton,
@@ -3114,6 +3292,9 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     runtime.state.updatedAt = Date.now();
     renderContextSection(runtime);
     persistPanelsSoon();
+  });
+  contextBackground.addEventListener('blur', () => {
+    void syncDraftToStore(runtime);
   });
 
   jumpButton.addEventListener('click', () => {
@@ -3178,6 +3359,10 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     persistLastUsedBranchKind('persistent');
     syncPanelUI(runtime);
     persistPanels();
+    // Back to ordinary retention: the question gets its durable record now.
+    if (!runtime.state.questionId) {
+      void registerQuestionForPanel(runtime);
+    }
   });
   temporaryKindButton.addEventListener('click', () => {
     runtime.state.branchKind = 'temporary';
@@ -3185,6 +3370,18 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     persistLastUsedBranchKind('temporary');
     syncPanelUI(runtime);
     persistPanels();
+    // A draft that turns private must leave nothing on disk. Only an unsent
+    // draft can do this silently; a sent question keeps its history and the
+    // Owner is told to continue as a new private question instead.
+    if (runtime.state.questionId && !runtime.state.snapshotId) {
+      const questionId = runtime.state.questionId;
+      runtime.state.questionId = undefined;
+      questionRevs.delete(questionId);
+      draftRevs.delete(questionId);
+      void runCommand({ type: 'DeleteQuestion', questionId, descendants: 'reparent' }).then(() =>
+        refreshQuestionList()
+      );
+    }
   });
   questionInput.addEventListener('input', () => {
     runtime.state.initialQuestion = questionInput.value;
@@ -3195,6 +3392,7 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   // Leaving the box is a deliberate save point, which is also how a panel that went
   // unsaved because another tab wrote first gets reconciled.
   questionInput.addEventListener('blur', () => {
+    void syncDraftToStore(runtime);
     runtime.state.initialQuestion = questionInput.value;
     runtime.state.updatedAt = Date.now();
     persistPanels(runtime.state.panelId);
@@ -3258,7 +3456,7 @@ function canShowBranchKindToggle(state: BranchPanelState): boolean {
 }
 
 function canShowFrame(state: BranchPanelState): boolean {
-  if (state.surfaceMode === 'native_window') {
+  if (state.surfaceMode === 'native_window' || state.archiveOnly) {
     return false;
   }
   return state.status !== 'draft' || Boolean(state.branchChatUrl) || Boolean(state.launchUrl);
@@ -3269,9 +3467,62 @@ function canShowFrame(state: BranchPanelState): boolean {
  * the exact string the prompt will carry, produced by the same function that builds
  * it, so the two cannot drift.
  */
+function sourceTurnsForState(state: BranchPanelState): SourceTurn[] {
+  const turns: SourceTurn[] = state.selection.selectedBlocks.map((block) => ({
+    id: block.messageId,
+    role: block.role,
+    turnIndex: block.turnIndex,
+    text: block.structuredText || block.text
+  }));
+  const preceding = state.selection.precedingQuestion;
+  if (preceding && !turns.some((turn) => turn.id === preceding.messageId)) {
+    turns.push({
+      id: preceding.messageId,
+      role: preceding.role,
+      turnIndex: preceding.turnIndex,
+      text: preceding.structuredText || preceding.text
+    });
+  }
+  return turns.sort((left, right) => left.turnIndex - right.turnIndex);
+}
+
+/** The plan for a panel, from its selection, exclusions, background and history. */
+function buildPlanForPanel(runtime: PanelRuntime, question?: string): ContextPlan {
+  const { state } = runtime;
+  const turns = sourceTurnsForState(state);
+  const anchorTurn =
+    turns.find((turn) => turn.id === state.selection.branchBaseMessageId) ??
+    [...turns].reverse().find((turn) => turn.role === 'assistant') ??
+    turns[0] ?? {
+      id: state.selection.branchBaseMessageId,
+      role: 'assistant' as const,
+      turnIndex: 0,
+      text: state.selection.structuredSelectedText || state.selection.selectedText
+    };
+  const input: PlanInput = {
+    focusText: state.selection.structuredSelectedText || state.selection.selectedText,
+    anchorTurn,
+    turns,
+    question: question ?? runtime.questionInput.value.trim() ?? '',
+    background: state.context?.userBackground ?? '',
+    excludedIds: state.excludedPlanIds ?? [],
+    history: (state.archive?.messages ?? [])
+      .filter((message) => !message.partial)
+      .map((message) => ({ role: message.role, text: message.text })),
+    unavailableReferences: [],
+    maxChars: DEFAULT_MAX_CONTEXT_CHARS
+  };
+  return buildContextPlan(input);
+}
+
+/**
+ * Render the Context section from the plan. The preview is the complete prompt
+ * — instructions, material and question — produced by the same functions that
+ * build the submission, so the two cannot drift.
+ */
 function renderContextSection(runtime: PanelRuntime): void {
-  const context = runtime.state.context;
-  if (!context) {
+  const { state } = runtime;
+  if (!state.selection) {
     runtime.contextShell.hidden = true;
     return;
   }
@@ -3279,49 +3530,107 @@ function renderContextSection(runtime: PanelRuntime): void {
   runtime.contextShell.hidden = false;
   runtime.contextBlockList.replaceChildren();
 
-  context.blocks.forEach((block) => {
+  const plan = buildPlanForPanel(runtime);
+  const summary = runtime.contextShell.querySelector<HTMLElement>('.aside-context-source');
+  if (summary) {
+    summary.textContent = describePlan(plan);
+  }
+
+  plan.blocks.forEach((block) => {
     const row = document.createElement('label');
     row.className = 'aside-context-block';
+    row.dataset.planRole = block.role;
 
     const toggle = document.createElement('input');
     toggle.type = 'checkbox';
     toggle.checked = block.included;
+    // The focus is what the question is about; background is what the Owner
+    // typed. Neither is something to untick — remove the text instead.
+    toggle.disabled = block.role === 'focus' || block.role === 'background';
     toggle.addEventListener('change', () => {
-      if (!runtime.state.context) {
-        return;
+      const excluded = new Set(runtime.state.excludedPlanIds ?? []);
+      if (toggle.checked) {
+        excluded.delete(block.id);
+      } else {
+        excluded.add(block.id);
       }
-      runtime.state.context = withBlockIncluded(runtime.state.context, block.id, toggle.checked);
+      runtime.state.excludedPlanIds = [...excluded];
       runtime.state.updatedAt = Date.now();
       renderContextSection(runtime);
       syncPanelUI(runtime);
-      persistPanels();
+      persistPanels(runtime.state.panelId);
+      void syncDraftToStore(runtime);
     });
 
     const label = document.createElement('span');
-    const origin =
-      block.origin === 'preceding-question'
-        ? 'preceding question'
-        : block.origin === 'user-added'
-          ? 'added by you'
-          : `${block.role} answer you selected in`;
-    label.textContent = `${origin}: ${clipText(block.excerpt, 90)}`;
-
+    const omitted = !block.included && block.omitReason === 'budget' ? ' (left out to fit the size limit)' : '';
+    label.textContent = `${block.reason}: ${clipText(compactWhitespace(block.text), 90)}${omitted}`;
     row.append(toggle, label);
-
-    if (block.limitation) {
-      const limitation = document.createElement('small');
-      limitation.className = 'aside-context-limitation';
-      limitation.textContent = block.limitation;
-      row.append(limitation);
-    }
-
     runtime.contextBlockList.append(row);
   });
 
-  const limits = measureContext(context);
-  runtime.contextSizeEl.textContent = describeContextSize(limits);
-  runtime.contextSizeEl.dataset.overBudget = String(limits.overBudget);
-  runtime.contextPreview.textContent = renderContextText(context);
+  if (plan.missing.length) {
+    const missing = document.createElement('small');
+    missing.className = 'aside-context-limitation';
+    missing.textContent = `Known gaps: ${plan.missing.join('; ')}`;
+    runtime.contextBlockList.append(missing);
+  }
+
+  runtime.contextSizeEl.textContent = plan.overBudget
+    ? `The passage and question alone are about ${plan.charCount.toLocaleString()} characters, over Aside's ${plan.maxChars.toLocaleString()}-character limit. Select a smaller passage.`
+    : `About ${plan.charCount.toLocaleString()} characters of material (limit ${plan.maxChars.toLocaleString()}; characters, not tokens).`;
+  runtime.contextSizeEl.dataset.overBudget = String(plan.overBudget);
+  runtime.contextPreview.textContent = buildPrompt({
+    contextText: renderPlanText(plan),
+    question: runtime.questionInput.value.trim() || '(your question)'
+  });
+}
+
+function captureLabelForState(state: BranchPanelState): string {
+  const archive = state.archive;
+  if (!archive || !archive.messages.length) {
+    return state.branchChatUrl ? 'Link only — nothing captured yet.' : '';
+  }
+  const complete = archive.messages.filter((message) => !message.partial);
+  const last = complete.at(-1);
+  if (archive.capture === 'captured-through' && last) {
+    return `Captured through message ${last.ordinal + 1} of ${archive.messages.length}. Later changes at the provider are not guaranteed.`;
+  }
+  return `Partially captured: ${complete.length} complete of ${archive.messages.length} read.`;
+}
+
+/** The saved thread, read-only. */
+function renderArchiveSection(runtime: PanelRuntime): void {
+  const { state } = runtime;
+  const archive = state.archive;
+  const show = Boolean(archive && archive.messages.length) || Boolean(state.archiveOnly);
+  runtime.archiveEl.hidden = !show;
+  if (!show) {
+    return;
+  }
+  runtime.archiveEl.replaceChildren();
+  const heading = document.createElement('strong');
+  heading.textContent = state.archiveOnly ? 'Saved thread' : 'Saved so far';
+  runtime.archiveEl.append(heading);
+  const status = document.createElement('small');
+  status.className = 'aside-archive-status';
+  status.textContent = captureLabelForState(state);
+  runtime.archiveEl.append(status);
+  (archive?.messages ?? []).forEach((message) => {
+    const node = document.createElement('div');
+    node.className = 'aside-archive-message';
+    node.dataset.role = message.role;
+    node.dataset.partial = String(message.partial);
+    node.textContent = message.text;
+    runtime.archiveEl.append(node);
+  });
+  if (state.archiveOnly && !(archive?.messages.length)) {
+    const empty = document.createElement('p');
+    empty.textContent = state.branchChatUrl
+      ? 'No messages were captured for this question; only the provider conversation link was kept.'
+      : 'This question was never sent.';
+    runtime.archiveEl.append(empty);
+  }
 }
 
 function syncPanelUI(runtime: PanelRuntime): void {
@@ -3344,11 +3653,11 @@ function syncPanelUI(runtime: PanelRuntime): void {
   runtime.errorEl.style.display = runtime.errorEl.textContent ? 'block' : 'none';
   runtime.focusTextEl.textContent = state.focusPreview;
   renderContextSection(runtime);
+  renderArchiveSection(runtime);
 
   // Over budget is a decision for the user, not a silent truncation, so the send
   // is blocked until they remove something.
-  const contextLimits = state.context ? measureContext(state.context) : null;
-  const contextOverBudget = Boolean(contextLimits?.overBudget);
+  const contextOverBudget = runtime.contextSizeEl.dataset.overBudget === 'true';
 
   runtime.formEl.style.display = showForm ? 'flex' : 'none';
   runtime.branchKindField.style.display = canShowBranchKindToggle(state) ? 'inline-flex' : 'none';
@@ -3378,7 +3687,7 @@ function syncPanelUI(runtime: PanelRuntime): void {
     state.status === 'creating_branch' ||
     state.status === 'opening_branch';
   runtime.submitButton.title = contextOverBudget
-    ? `The context is ${describeContextSize(contextLimits!)}. Open Context and remove some material.`
+    ? 'The passage and question alone exceed the size limit. Select a smaller passage.'
     : '';
   runtime.submitButton.textContent = state.status === 'failed' ? 'Try again' : 'Start branch';
   runtime.iframeShell.hidden = !showFrame;
@@ -3409,8 +3718,22 @@ function renderTabs(): void {
   const container = ensureTabBar();
   container.innerHTML = '';
 
-  const minimized = sortPanels().filter((runtime) => runtime.state.minimized);
-  container.hidden = minimized.length === 0;
+  const minimized = sortPanels().filter((runtime) => runtime.state.minimized && !runtime.state.closedView);
+  const questionCount = questionListCount();
+  container.hidden = minimized.length === 0 && questionCount === 0;
+
+  if (questionCount > 0 || questionListEntries.length > 0) {
+    const listTab = document.createElement('div');
+    listTab.className = 'aside-tab aside-tab-questions';
+    const listButton = document.createElement('button');
+    listButton.type = 'button';
+    listButton.textContent = `Questions (${questionCount})`;
+    listButton.title = 'Questions asked from this page';
+    listButton.dataset.selected = String(questionListOpen);
+    listButton.addEventListener('click', () => toggleQuestionList());
+    listTab.append(listButton);
+    container.append(listTab);
+  }
 
   minimized.forEach((runtime) => {
     const tab = document.createElement('div');
@@ -3546,6 +3869,14 @@ function createStateFromRestore(raw: BranchPanelState): BranchPanelState | null 
     // after a reload and the prompt is silently rebuilt from defaults, putting
     // back every block the user unticked.
     context: sanitizeStoredContext(raw.context),
+    questionId: typeof raw.questionId === 'string' ? raw.questionId : undefined,
+    linkId: typeof raw.linkId === 'string' ? raw.linkId : undefined,
+    snapshotId: typeof raw.snapshotId === 'string' ? raw.snapshotId : undefined,
+    preferredSurface: raw.preferredSurface === 'native_window' ? 'native_window' : undefined,
+    excludedPlanIds: Array.isArray(raw.excludedPlanIds) ? raw.excludedPlanIds.filter((id) => typeof id === 'string') : undefined,
+    closedView: raw.closedView === true,
+    archiveOnly: raw.archiveOnly === true,
+    archive: sanitizeArchive(raw.archive),
     focusPreview: raw.focusPreview || clipText(raw.selection.selectedText, 280),
     branchKind,
     entryAction,
@@ -3587,6 +3918,8 @@ async function restorePanels(): Promise<void> {
     // Another tab can write a panel back after this page closed it; do not bring it
     // back into a page the user already dismissed it from.
     .filter((record) => !closedPanelIds.has(record.panelId))
+    // A closed view stays closed until the Owner reopens the question from the list.
+    .filter((record) => !record.state?.closedView)
     // A panel belongs to this page if it shares the scope; otherwise only a
     // minimized one is offered, and only as a rail tab.
     .filter((record) => record.scopeKey === currentScopeKey || Boolean(record.state?.minimized))
@@ -3613,6 +3946,7 @@ async function restorePanels(): Promise<void> {
 
   syncMountedUi();
   drainPendingPanelChanges();
+  void refreshQuestionList();
 }
 
 function minimizePanel(panelId: string): void {
@@ -3643,40 +3977,29 @@ function expandPanel(panelId: string): void {
   scrollToOrigin(runtime.state.selection);
 }
 
+/**
+ * Close hides the view. It deletes nothing and cancels nothing: the question
+ * record, its saved thread and any run in flight are untouched, and the question
+ * is still listed for this page. Deletion is a separate, explicit action.
+ */
 function closePanel(panelId: string): void {
   const runtime = panelRuntimes.get(panelId);
   if (!runtime) {
     return;
   }
 
-  clearPanelWatchdog(runtime);
-  closedPanelIds.add(panelId);
+  runtime.state.closedView = true;
+  runtime.state.minimized = true;
+  runtime.state.updatedAt = Date.now();
   runtime.iframeEl.src = 'about:blank';
   runtime.element.remove();
   panelRuntimes.delete(panelId);
   renderTabs();
+  void refreshQuestionList();
 
-  // A close is a deletion with a tombstone, not the absence of a write: another
-  // tab that still has this panel mounted must not write it back. If the tombstone
-  // cannot be written, the branch is not closed — say so instead of letting it
-  // reappear later with no explanation.
-  void deletePanelRecord(panelId).then((deleted) => {
-    if (deleted) {
-      return;
-    }
-
-    closedPanelIds.delete(panelId);
-    runtime.state.status = 'failed';
-    runtime.state.creationMode = 'failed';
-    runtime.state.statusLabel = 'This branch could not be closed.';
-    runtime.state.errorMessage =
-      'Aside could not record the deletion, so this branch would come back on the next reload. Try Close again.';
-    runtime.state.updatedAt = Date.now();
-    panelRuntimes.set(panelId, runtime);
-    mountInExtensionHost(runtime.element);
-    syncPanelUI(runtime);
-    renderTabs();
-  });
+  // The view record is kept, marked closed, so a reload does not reopen it and
+  // a private (session-only) question is not lost merely by closing its view.
+  void writePanelRecord(runtime);
 }
 
 // Navigating away is not the same as closing: these panels stay in storage so the user
@@ -3792,74 +4115,20 @@ async function promotePersistentBranchToNativeWindow(runtime: PanelRuntime): Pro
   persistPanels();
 }
 
+/**
+ * New-tab is a presentation choice, not a different pipeline: the same draft,
+ * the same context plan, the same question — started in a window of its own.
+ * Nothing is sent to initialise the branch; the actual question is sent once.
+ */
 async function openSelectionInNewTab(
   selection: SelectionPayload,
   branchKind: BranchKind
 ): Promise<void> {
-  const launchUrl = provider.normalizeUrl(
-    resolveLaunchUrl(currentIdentity(selection.rootChatUrl), branchKind)
-  );
-
-  // New-tab assembles its prompt exactly as Ask and Why do, from the structured
-  // context rather than the normalized anchor text.
-  const frozen = freezeContext(createContextForSelection(selection));
-  if (frozen.limits.overBudget) {
-    // Nothing is shown before a New-tab branch opens, so there is no preview in
-    // which to trim. Fall back to an in-page draft, where the Context section is.
-    const runtime = createBranchDraft(selection, { entryAction: 'ask', branchKind });
-    runtime.state.status = 'failed';
-    runtime.state.creationMode = 'failed';
-    runtime.state.statusLabel = 'This branch was not sent.';
-    runtime.state.errorMessage = `The context is ${describeContextSize(
-      frozen.limits
-    )}. Open Context, remove some material, then start the branch here.`;
-    runtime.state.updatedAt = Date.now();
-    syncPanelUI(runtime);
-    renderTabs();
-    persistPanels();
-    return;
-  }
-
-  const prompt = buildNativeBootstrapPromptFromContext(frozen.text).prompt;
-  const panelId = randomId('native');
-  const newTabAttempt = {
-    providerId: provider.id,
-    panelId,
-    attemptId: createAttemptId()
-  };
-  startedAttemptIds.add(newTabAttempt.attemptId);
-  persistLastUsedBranchKind(branchKind);
-  const response = await createNativeBranchWindow({
-    attempt: newTabAttempt,
-    prompt,
-    launchUrl,
+  createBranchDraft(selection, {
+    entryAction: 'new_tab',
     branchKind,
-    focusWindow: true,
-    arrangeSideBySide: true
+    preferredSurface: 'native_window'
   });
-
-  if (!response.ok) {
-    console.warn('[Aside] Failed to open native New-tab window', response.reason);
-    // The selection has already been cleared by this point, so falling back to an
-    // in-page draft is the only way the user keeps the passage they picked.
-    const runtime = createBranchDraft(selection, {
-      entryAction: 'ask',
-      branchKind
-    });
-    runtime.state.status = 'failed';
-    runtime.state.creationMode = 'failed';
-    runtime.state.statusLabel = `New-tab could not open a ${provider.label} window.`;
-    runtime.state.errorMessage = `${
-      response.reason ?? 'The branch window could not be opened.'
-    } Ask here instead, or try New-tab again.`;
-    runtime.state.updatedAt = Date.now();
-    appendPanelLog(runtime, 'New-tab branch window could not be opened', {
-      reason: response.reason
-    });
-    syncPanelUI(runtime);
-    renderTabs();
-    persistPanels();
-  }
 }
 
 const REDACTED = '(redacted — use "Copy log + text" to include it)';
@@ -3879,6 +4148,7 @@ function buildBranchDebugLogText(runtime: PanelRuntime, includeContent = false):
     includeContent
       ? 'CONTAINS YOUR CONTENT: the selected text and the first prompt are included below.'
       : 'Content is redacted. Use "Copy log + text" if a maintainer needs the selected text and prompt.',
+    `build: ${BUILD_ID}`,
     `provider: ${provider.id}`,
     `branchPrivacy: ${state.branchKind === 'temporary' ? provider.privacy.label : 'persistent'}`,
     `generatedAt: ${new Date().toISOString()}`,
@@ -4361,7 +4631,7 @@ function installRuntimeMessageListener(): void {
   }
 
   const runtimeMessageListener = (
-    message: RunBranchPromptInTabMessage | ForwardBranchPanelEventMessage | PanelChangedMessage,
+    message: RunBranchPromptInTabMessage | ForwardBranchPanelEventMessage | PanelChangedMessage | QuestionChangedMessage,
     _sender: chrome.runtime.MessageSender,
     sendResponse: (response?: unknown) => void
   ) => {
@@ -4371,6 +4641,12 @@ function installRuntimeMessageListener(): void {
 
     if (message.type === 'PANEL_CHANGED') {
       handlePanelChanged(message);
+      sendResponse({ ok: true });
+      return false;
+    }
+
+    if (message.type === 'QUESTION_CHANGED') {
+      void refreshQuestionList();
       sendResponse({ ok: true });
       return false;
     }
@@ -4418,26 +4694,25 @@ async function startBranch(panelId: string, question: string): Promise<void> {
     return;
   }
 
-  // Freeze the context now: a later edit, or the source answer still streaming,
-  // must not change a prompt that is already in flight.
-  // A context rebuilt here must be kept, or the preview the user is told to open
-  // stays empty and the same error repeats with nothing they can do about it.
-  const context = runtime.state.context ?? createContextForSelection(runtime.state.selection);
-  runtime.state.context = context;
-  const limits = measureContext(context);
-  if (limits.overBudget) {
+  // Build the plan and freeze it now: a later edit, or the source answer still
+  // streaming, must not change a prompt that is already in flight.
+  const plan = buildPlanForPanel(runtime, question);
+  if (plan.overBudget) {
     runtime.state.status = 'failed';
     runtime.state.creationMode = 'failed';
     runtime.state.statusLabel = 'This branch was not sent.';
-    runtime.state.errorMessage = `The context is ${describeContextSize(limits)}. Open Context and remove some material, then try again.`;
+    runtime.state.errorMessage = `The passage and question alone are about ${plan.charCount.toLocaleString()} characters, over the ${plan.maxChars.toLocaleString()}-character limit. Select a smaller passage and try again.`;
     runtime.state.updatedAt = Date.now();
     syncPanelUI(runtime);
     persistPanels();
     return;
   }
 
-  const frozen = freezeContext(context);
-  const prompt = buildBranchPrompt({ contextText: frozen.text, question }).prompt;
+  const contextText = renderPlanText(plan);
+  const prompt = buildPrompt({ contextText, question });
+  // Titles are local: from the question, never from the model.
+  runtime.state.title = autoTitle(question, runtime.state.selection.selectedText);
+  runtime.state.titleStatus = 'ready';
   const launchUrl = provider.normalizeUrl(
     resolveLaunchUrl(currentIdentity(runtime.state.rootChatUrl), runtime.state.branchKind)
   );
@@ -4485,7 +4760,9 @@ async function startBranch(panelId: string, question: string): Promise<void> {
   // "May we try?" is a different question from "can we claim it works?". Tying
   // them together is how Claude ended up opening every branch in its own window
   // on an unchecked assumption about framing headers.
-  const canEmbed = surfaceMayBeAttempted(provider.surfaces.embedded, embeddedSurfaceObservation);
+  const canEmbed =
+    runtime.state.preferredSurface !== 'native_window' &&
+    surfaceMayBeAttempted(provider.surfaces.embedded, embeddedSurfaceObservation);
   if (!canEmbed && !surfaceMayBeAttempted(provider.surfaces.nativeWindow)) {
     // Neither surface is available: say so rather than opening a window that
     // cannot be driven and timing out on the watchdog.
@@ -4508,8 +4785,9 @@ async function startBranch(panelId: string, question: string): Promise<void> {
   runtime.state.launchWindowId = undefined;
   runtime.state.creationMode =
     runtime.state.branchKind === 'temporary' ? 'local_temporary' : 'local_persistent';
-  runtime.state.title = DEFAULT_BRANCH_TITLE;
-  runtime.state.titleStatus = 'pending';
+  runtime.state.archiveOnly = false;
+  runtime.state.archive = undefined;
+  runtime.writtenCapture.clear();
   runtime.state.status = 'creating_branch';
   runtime.state.statusLabel = canEmbed
     ? `Loading the embedded ${provider.label} branch window...`
@@ -4520,6 +4798,11 @@ async function startBranch(panelId: string, question: string): Promise<void> {
   runtime.pendingFramePrompt = canEmbed ? prompt : undefined;
   runtime.frameReady = false;
   runtime.frameStartSent = false;
+
+  // Persist the intent before the external action: the exact prompt is frozen
+  // as a snapshot and the run recorded as submitting. Private questions have no
+  // durable record and skip this.
+  await freezeSnapshotForPanel(runtime, plan, prompt, question);
 
   minimizeOtherPanels(panelId);
   if (canEmbed) {
@@ -4606,13 +4889,9 @@ function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): 
       return;
 
     case 'title':
-      appendPanelLog(runtime, 'Branch title detected', event.title);
-      runtime.state.title = event.title;
-      runtime.state.titleStatus = 'ready';
-      runtime.state.updatedAt = Date.now();
-      syncPanelUI(runtime);
-      renderTabs();
-      persistPanels();
+      // Titles are local now. A legacy answer that still carries the old marker
+      // is logged and otherwise ignored, so the Owner's title is never replaced.
+      appendPanelLog(runtime, 'Ignored a model-emitted title; titles are local', event.title);
       return;
 
     case 'live':
@@ -4641,7 +4920,21 @@ function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): 
       syncPanelUI(runtime);
       renderTabs();
       persistPanels();
+      void recordRunForPanel(runtime, {
+        run: 'submitted',
+        conversationUrl: runtime.state.branchChatUrl ?? null,
+        acknowledgement: 'branch reported live'
+      });
       return;
+
+    case 'captured': {
+      runtime.state.archive = { messages: event.messages, capture: event.capture };
+      runtime.state.updatedAt = Date.now();
+      renderArchiveSection(runtime);
+      persistPanelsSoon(runtime.state.panelId);
+      void recordCaptureForPanel(runtime, event);
+      return;
+    }
 
     case 'failed':
       clearPanelWatchdog(runtime);
@@ -4690,6 +4983,7 @@ function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): 
       runtime.state.updatedAt = Date.now();
       syncPanelUI(runtime);
       persistPanels();
+      void recordRunForPanel(runtime, { run: 'failed' });
   }
 }
 
@@ -6698,6 +6992,7 @@ async function runBranchPromptAutomation(
       // window would tax every temporary branch that works fine.
       await sendAutomationEvent({ kind: 'live' });
       startTitleWatcher();
+      startCaptureWatcher();
       void (async () => {
         const leakedUrl = await watchForPersistentConversationUrl(TEMPORARY_LEAK_WATCH_MS);
         if (leakedUrl) {
@@ -6732,6 +7027,7 @@ async function runBranchPromptAutomation(
     );
     await sendAutomationEvent({ kind: 'live', branchChatUrl });
     startTitleWatcher();
+    startCaptureWatcher();
     if (transport === 'background') {
       try {
         await focusComposerForFollowUp();
@@ -6764,10 +7060,661 @@ async function runBranchPromptAutomation(
   }
 }
 
+
+
+/**
+ * A non-blocking notice in Aside's own host. Never window.alert on a provider
+ * page: a modal dialog freezes the provider's UI and the Owner's other work.
+ */
+let noticeTimer: number | undefined;
+function notifyAside(message: string): void {
+  console.warn(`[Aside] ${message}`);
+  const host = ensureExtensionHost();
+  let notice = host.querySelector<HTMLDivElement>('.aside-notice');
+  if (!notice) {
+    notice = document.createElement('div');
+    notice.className = 'aside-notice';
+    notice.setAttribute('role', 'status');
+    host.append(notice);
+  }
+  notice.textContent = message;
+  notice.hidden = false;
+  window.clearTimeout(noticeTimer);
+  noticeTimer = window.setTimeout(() => {
+    if (notice) {
+      notice.hidden = true;
+    }
+  }, 6_000);
+}
+
+/* ================================================================== *
+ * Question records: the panel as a view of the canonical database.
+ * ================================================================== */
+
+function sanitizeArchive(raw: unknown): BranchPanelState['archive'] {
+  if (!raw || typeof raw !== 'object') {
+    return undefined;
+  }
+  const candidate = raw as { messages?: unknown; capture?: unknown };
+  if (!Array.isArray(candidate.messages)) {
+    return undefined;
+  }
+  const messages: CapturedMessage[] = candidate.messages
+    .filter((message): message is CapturedMessage => {
+      const entry = message as Partial<CapturedMessage> | null;
+      return (
+        Boolean(entry) &&
+        (entry!.role === 'user' || entry!.role === 'assistant') &&
+        typeof entry!.text === 'string' &&
+        typeof entry!.ordinal === 'number'
+      );
+    })
+    .map((message) => ({
+      role: message.role,
+      text: message.text,
+      partial: message.partial === true,
+      providerMessageId: typeof message.providerMessageId === 'string' ? message.providerMessageId : null,
+      ordinal: message.ordinal
+    }));
+  const capture =
+    candidate.capture === 'captured-through' || candidate.capture === 'partial' ? candidate.capture : 'link-only';
+  return { messages, capture };
+}
+
+function scopeKeyForState(state: BranchPanelState): string {
+  return state.rootConversationId || currentIdentity(state.rootChatUrl).scopeKey;
+}
+
+/** Create the canonical question for an ordinary draft. */
+async function registerQuestionForPanel(runtime: PanelRuntime): Promise<void> {
+  const { state } = runtime;
+  if (state.questionId || state.branchKind === 'temporary') {
+    return;
+  }
+  const identity = currentIdentity(state.rootChatUrl);
+  const scopeKey = scopeKeyForState(state);
+  const sourceId = sourceIdFor(provider.id, scopeKey);
+  const selection = state.selection;
+  const anchorBlock =
+    selection.selectedBlocks.find((block) => block.messageId === selection.branchBaseMessageId) ??
+    selection.selectedBlocks[0];
+  const turns = sourceTurnsForState(state);
+  const blocks = turns.map((turn) => {
+    const contentHash = fnv1a(turn.text);
+    return {
+      id: blockIdFor(sourceId, contentHash),
+      sourceId,
+      role: turn.role,
+      kind: 'unknown' as const,
+      text: turn.text,
+      anchorText: compactWhitespace(turn.text),
+      messageId: turn.id,
+      turnIndex: turn.turnIndex,
+      contentHash
+    };
+  });
+  const questionId = newQuestionId();
+  const anchorId = newAnchorId();
+  const focus = selection.structuredSelectedText || selection.selectedText;
+
+  const outcome = await runCommand({
+    type: 'CreateQuestion',
+    source: {
+      id: sourceId,
+      providerId: provider.id,
+      scopeKey,
+      conversationId: identity.conversationId,
+      containerId: identity.containerId,
+      url: state.rootChatUrl,
+      title:
+        compactWhitespace(selection.precedingQuestion?.excerpt || anchorBlock?.excerpt || document.title || '').slice(0, 120) ||
+        `${provider.label} conversation`,
+      kind: 'assistant-answer',
+      acquisition: 'selected-fragment',
+      messageId: anchorBlock?.messageId ?? null
+    },
+    blocks,
+    anchor: {
+      id: anchorId,
+      sourceId,
+      selectedText: focus,
+      exact: selection.rangeQuotes.exact || selection.selectedText,
+      prefix: selection.rangeQuotes.prefix,
+      suffix: selection.rangeQuotes.suffix,
+      messageId: anchorBlock?.messageId ?? selection.branchBaseMessageId,
+      turnIndex: anchorBlock?.turnIndex ?? 0,
+      role: anchorBlock?.role ?? 'assistant',
+      contentHash: fnv1a(anchorBlock?.structuredText || anchorBlock?.text || focus),
+      scrollHint: selection.fallbackScrollY
+    },
+    question: {
+      id: questionId,
+      sourceId,
+      anchorId,
+      parentQuestionId: null,
+      parentMessageId: null,
+      title: autoTitle(state.initialQuestion ?? '', focus),
+      titleSource: 'auto',
+      retention: 'durable',
+      providerMode: 'normal',
+      entryAction: state.entryAction
+    },
+    draft: {
+      text: state.initialQuestion ?? '',
+      excludedBlockIds: state.excludedPlanIds ?? [],
+      background: state.context?.userBackground ?? ''
+    }
+  });
+
+  if (!outcome || outcome.status !== 'applied') {
+    appendPanelLog(runtime, 'Question record could not be created', {
+      reason: outcome ? (outcome.status === 'error' || outcome.status === 'rejected' ? outcome.reason : outcome.status) : 'no response'
+    });
+    unsavedPanelIds.add(state.panelId);
+    syncPanelUI(runtime);
+    return;
+  }
+  state.questionId = questionId;
+  questionRevs.set(questionId, outcome.rev);
+  draftRevs.set(questionId, 1);
+  state.updatedAt = Date.now();
+  persistPanels(state.panelId);
+  void refreshQuestionList();
+}
+
+/** Deliberate save points write the draft to the canonical record. */
+async function syncDraftToStore(runtime: PanelRuntime): Promise<void> {
+  const { state } = runtime;
+  if (!state.questionId || state.snapshotId) {
+    return;
+  }
+  const questionId = state.questionId;
+  const attempt = async (baseRev: number): Promise<void> => {
+    const outcome = await runCommand({
+      type: 'UpdateDraft',
+      questionId,
+      baseRev,
+      text: runtime.questionInput.value,
+      excludedBlockIds: state.excludedPlanIds ?? [],
+      background: state.context?.userBackground ?? ''
+    });
+    if (!outcome) {
+      return;
+    }
+    if (outcome.status === 'applied') {
+      draftRevs.set(questionId, outcome.rev);
+      return;
+    }
+    if (outcome.status === 'conflict') {
+      // Another tab saved a different draft. Keep this tab's text visible and
+      // say so; the Owner decides which version wins by editing again.
+      draftRevs.set(questionId, outcome.current.rev);
+      if (outcome.current.text !== undefined && outcome.current.text !== runtime.questionInput.value) {
+        state.statusLabel = 'Another tab saved a different draft; this box still shows yours. Edit to save it over theirs.';
+        syncPanelUI(runtime);
+        return;
+      }
+      await attempt(outcome.current.rev);
+    }
+  };
+  await attempt(draftRevs.get(questionId) ?? 1);
+}
+
+/** The exact prompt becomes an immutable snapshot, and a run is recorded. */
+async function freezeSnapshotForPanel(
+  runtime: PanelRuntime,
+  plan: ContextPlan,
+  prompt: string,
+  question: string
+): Promise<void> {
+  const { state } = runtime;
+  if (!state.questionId || !state.attemptId) {
+    return;
+  }
+  const snapshotId = newSnapshotId();
+  const linkId = newLinkId();
+  const scopeKey = scopeKeyForState(state);
+  const sourceId = sourceIdFor(provider.id, scopeKey);
+  const outcome = await runCommand({
+    type: 'FreezeSnapshot',
+    questionId: state.questionId,
+    snapshot: {
+      id: snapshotId,
+      questionId: state.questionId,
+      prompt,
+      question,
+      blocks: plan.blocks.map((block) => ({
+        blockId: blockIdFor(sourceId, fnv1a(block.text)),
+        contentHash: fnv1a(block.text),
+        role: block.role,
+        included: block.included,
+        omitReason: block.omitReason
+      })),
+      missing: plan.missing,
+      compilerVersion: COMPILER_VERSION,
+      templateVersion: TEMPLATE_VERSION,
+      charCount: prompt.length
+    },
+    link: {
+      id: linkId,
+      questionId: state.questionId,
+      providerId: provider.id,
+      conversationUrl: null,
+      attemptId: state.attemptId,
+      snapshotId,
+      run: 'submitting',
+      acknowledgement: null,
+      capture: 'link-only',
+      capturedThroughMessageId: null,
+      lastCaptureAt: null,
+      model: null
+    }
+  });
+  if (!outcome || outcome.status !== 'applied') {
+    appendPanelLog(runtime, 'Snapshot could not be frozen in the question database', {
+      reason: outcome ? outcome.status : 'no response'
+    });
+    unsavedPanelIds.add(state.panelId);
+    return;
+  }
+  state.snapshotId = snapshotId;
+  state.linkId = linkId;
+  linkRevs.set(linkId, 1);
+  runtime.writtenCapture.clear();
+  persistPanels(state.panelId);
+  void refreshQuestionList();
+}
+
+async function recordRunForPanel(
+  runtime: PanelRuntime,
+  patch: { run?: 'submitted' | 'streaming' | 'completed' | 'failed' | 'submission-unknown'; conversationUrl?: string | null; acknowledgement?: string | null }
+): Promise<void> {
+  const { state } = runtime;
+  if (!state.linkId || !state.attemptId) {
+    return;
+  }
+  const linkId = state.linkId;
+  const attempt = async (baseRev: number, retry: boolean): Promise<void> => {
+    const outcome = await runCommand({ type: 'UpdateRun', linkId, baseRev, attemptId: state.attemptId!, ...patch });
+    if (!outcome) {
+      return;
+    }
+    if (outcome.status === 'applied') {
+      linkRevs.set(linkId, outcome.rev);
+    } else if (outcome.status === 'conflict' && retry) {
+      linkRevs.set(linkId, outcome.current.rev);
+      await attempt(outcome.current.rev, false);
+    }
+  };
+  await attempt(linkRevs.get(linkId) ?? 1, true);
+}
+
+/** Bounded, incremental capture writes: only ordinals whose text changed. */
+async function recordCaptureForPanel(runtime: PanelRuntime, event: BranchCapturedEvent): Promise<void> {
+  const { state } = runtime;
+  if (!state.questionId || !state.linkId || !state.attemptId) {
+    return;
+  }
+  for (const message of event.messages) {
+    const fingerprint = `${message.partial ? 'p' : 'c'}:${fnv1a(message.text)}`;
+    if (runtime.writtenCapture.get(message.ordinal) === fingerprint) {
+      continue;
+    }
+    const outcome = await runCommand({
+      type: 'AppendOrReviseCapturedMessage',
+      questionId: state.questionId,
+      linkId: state.linkId,
+      attemptId: state.attemptId,
+      message: {
+        role: message.role,
+        text: message.text,
+        partial: message.partial,
+        providerMessageId: message.providerMessageId,
+        ordinal: message.ordinal,
+        snapshotId: state.snapshotId ?? null,
+        attemptId: state.attemptId
+      },
+      capture: event.capture,
+      capturedThroughMessageId: event.capturedThroughMessageId
+    });
+    if (outcome?.status === 'applied') {
+      runtime.writtenCapture.set(message.ordinal, fingerprint);
+    } else if (outcome && outcome.status === 'rejected') {
+      appendPanelLog(runtime, 'Capture write rejected', { reason: outcome.reason, ordinal: message.ordinal });
+      return;
+    }
+  }
+  if (state.linkId) {
+    const link = state.linkId;
+    void link;
+  }
+}
+
+/* ---------------- capture watcher (runs in the branch page) ---------------- */
+
+let captureWatcher: TranscriptCaptureWatcher | null = null;
+
+function readObservedTurns(): ObservedTurn[] {
+  return extractTranscript(document).map((turn) => ({
+    role: turn.role,
+    text: extractStructuredNodeText(turn.element) || turn.text,
+    providerMessageId:
+      turn.element.getAttribute('data-message-id') ??
+      turn.element.querySelector('[data-message-id]')?.getAttribute('data-message-id') ??
+      null,
+    streaming:
+      turn.element.hasAttribute('data-is-streaming') ||
+      turn.element.getAttribute('data-is-streaming') === 'true' ||
+      Boolean(turn.element.querySelector('[data-is-streaming="true"]'))
+  }));
+}
+
+function startCaptureWatcher(): void {
+  captureWatcher?.stop();
+  const turns = readObservedTurns();
+  let firstUserTurnIndex = 0;
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    if (turns[index].role === 'user') {
+      firstUserTurnIndex = index;
+      break;
+    }
+  }
+  captureWatcher = new TranscriptCaptureWatcher({
+    read: readObservedTurns,
+    stopControlVisible: () => Boolean(findStopButton()),
+    observeTarget: () => provider.layout.getConversationScrollContainer(document) ?? document.body,
+    emit: (snapshot) => {
+      void sendAutomationEvent({
+        kind: 'captured',
+        messages: snapshot.messages,
+        capture: snapshot.capture,
+        capturedThroughMessageId: snapshot.capturedThroughMessageId
+      });
+    }
+  });
+  captureWatcher.start(firstUserTurnIndex);
+}
+
+/* ---------------- source-scoped question list ---------------- */
+
+function ensureQuestionList(): HTMLDivElement {
+  if (!questionListEl) {
+    questionListEl = document.createElement('div');
+    questionListEl.id = 'aside-qlist';
+    questionListEl.className = 'aside-panel aside-qlist-panel';
+    questionListEl.hidden = true;
+  }
+  return mountInExtensionHost(questionListEl);
+}
+
+function questionListCount(): number {
+  return questionListEntries.filter((entry) => entry.question.lifecycle === 'active').length;
+}
+
+async function refreshQuestionList(): Promise<void> {
+  if (!hasRuntimeAccess()) {
+    return;
+  }
+  const scopeKey = currentIdentity(lastKnownUrl).scopeKey;
+  const result = await listQuestionsForScope(scopeKey);
+  questionListEntries = result?.questions ?? [];
+  questionListSourceId = result?.sourceId ?? null;
+  renderQuestionListPanel();
+  renderTabs();
+}
+
+function renderQuestionListPanel(): void {
+  const container = ensureQuestionList();
+  container.hidden = !questionListOpen;
+  if (!questionListOpen) {
+    return;
+  }
+  renderQuestionList(
+    container,
+    questionListEntries,
+    questionListSourceId,
+    questionListFilter,
+    {
+      open: (questionId) => {
+        void openQuestionFromRecord(questionId);
+      },
+      resolve: (entry) => void applyLifecycle(entry, 'ResolveQuestion'),
+      reopen: (entry) => void applyLifecycle(entry, 'ReopenQuestion'),
+      archive: (entry) => void applyLifecycle(entry, 'ArchiveQuestion'),
+      rename: (entry, title) => {
+        void runCommand({ type: 'RenameQuestion', questionId: entry.question.id, baseRev: entry.question.rev, title }).then(
+          () => {
+            const runtime = [...panelRuntimes.values()].find((candidate) => candidate.state.questionId === entry.question.id);
+            if (runtime) {
+              runtime.state.title = title;
+              runtime.state.titleStatus = 'ready';
+              syncPanelUI(runtime);
+              persistPanels(runtime.state.panelId);
+            }
+            return refreshQuestionList();
+          }
+        );
+      },
+      remove: (entry) => void deleteQuestionEverywhere(entry.question.id),
+      exportSource: (sourceId) => void exportSourceAsMarkdown(sourceId),
+      openLibrary: () => {
+        void sendStoreMessage({ type: 'OPEN_LIBRARY' });
+      }
+    },
+    (filter) => {
+      questionListFilter = filter;
+      renderQuestionListPanel();
+    }
+  );
+}
+
+function toggleQuestionList(): void {
+  questionListOpen = !questionListOpen;
+  renderQuestionListPanel();
+  if (questionListOpen) {
+    void refreshQuestionList();
+  }
+}
+
+async function applyLifecycle(entry: QuestionListEntry, type: 'ResolveQuestion' | 'ReopenQuestion' | 'ArchiveQuestion'): Promise<void> {
+  await runCommand({ type, questionId: entry.question.id, baseRev: entry.question.rev });
+  await refreshQuestionList();
+}
+
+/** Explicit deletion: the record, its owned rows, and any panel view of it. */
+async function deleteQuestionEverywhere(questionId: string): Promise<void> {
+  const outcome = await runCommand({ type: 'DeleteQuestion', questionId, descendants: 'reparent' });
+  if (!outcome || outcome.status === 'error') {
+    notifyAside('Aside could not record the deletion; nothing was removed.');
+    return;
+  }
+  const runtime = [...panelRuntimes.values()].find((candidate) => candidate.state.questionId === questionId);
+  if (runtime) {
+    clearPanelWatchdog(runtime);
+    closedPanelIds.add(runtime.state.panelId);
+    runtime.iframeEl.src = 'about:blank';
+    runtime.element.remove();
+    panelRuntimes.delete(runtime.state.panelId);
+    void deletePanelRecord(runtime.state.panelId);
+  }
+  // A closed view of this question may still be stored; remove it too.
+  const records = await listPanelRecords();
+  for (const record of records) {
+    if (record.state?.questionId === questionId && !panelRuntimes.has(record.panelId)) {
+      panelRevisions.set(record.panelId, record.rev);
+      void deletePanelRecord(record.panelId);
+    }
+  }
+  questionRevs.delete(questionId);
+  draftRevs.delete(questionId);
+  renderTabs();
+  await refreshQuestionList();
+}
+
+async function exportSourceAsMarkdown(sourceId: string): Promise<void> {
+  const result = await exportSourceMarkdown(sourceId);
+  if (!result) {
+    notifyAside('Export failed: the question database was unreachable.');
+    return;
+  }
+  try {
+    const blob = new Blob([result.markdown], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = result.filename;
+    anchor.style.display = 'none';
+    mountInExtensionHost(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  } catch {
+    try {
+      await navigator.clipboard.writeText(result.markdown);
+      notifyAside('Download was blocked here; the Markdown was copied to your clipboard instead.');
+    } catch {
+      notifyAside('Export could not be downloaded or copied on this page. Use the library page instead.');
+    }
+  }
+}
+
+/** Reopen a question: an existing view if there is one, else a view of the record. */
+async function openQuestionFromRecord(questionId: string): Promise<void> {
+  const mounted = [...panelRuntimes.values()].find((runtime) => runtime.state.questionId === questionId);
+  if (mounted) {
+    expandPanel(mounted.state.panelId);
+    return;
+  }
+
+  const records = await listPanelRecords();
+  const record = records.find((entry) => entry.state?.questionId === questionId);
+  if (record) {
+    const restored = createStateFromRestore(record.state);
+    if (restored) {
+      restored.closedView = false;
+      restored.minimized = false;
+      // A stored live frame is not reloaded on reopen; the saved thread is shown
+      // and continuing is an explicit action.
+      if (restored.status === 'live' || restored.status === 'failed') {
+        restored.archiveOnly = true;
+      }
+      closedPanelIds.delete(record.panelId);
+      panelRevisions.set(record.panelId, record.rev);
+      minimizeOtherPanels(restored.panelId);
+      const runtime = createPanelRuntime(restored);
+      syncMountedUi();
+      persistPanels(runtime.state.panelId);
+      scrollToOrigin(runtime.state.selection);
+      return;
+    }
+  }
+
+  const bundle = await fetchBundle(questionId);
+  if (!bundle) {
+    notifyAside('This question no longer exists.');
+    await refreshQuestionList();
+    return;
+  }
+  const state = createStateFromBundle(bundle);
+  if (!state) {
+    notifyAside('This question cannot be shown here: its saved selection is incomplete.');
+    return;
+  }
+  minimizeOtherPanels(state.panelId);
+  const runtime = createPanelRuntime(state);
+  questionRevs.set(questionId, bundle.question.rev);
+  draftRevs.set(questionId, bundle.draft?.rev ?? 1);
+  const link = bundle.links.at(-1);
+  if (link) {
+    linkRevs.set(link.id, link.rev);
+  }
+  syncMountedUi();
+  persistPanels(state.panelId);
+  scrollToOrigin(state.selection);
+}
+
+/** A panel view built from the canonical record alone. */
+function createStateFromBundle(bundle: QuestionBundle): BranchPanelState | null {
+  const { question, anchor, source } = bundle;
+  if (!anchor || !source) {
+    return null;
+  }
+  const link = bundle.links.at(-1);
+  const snapshot = bundle.snapshots.at(-1);
+  const rootChatUrl = normalizeChatUrl(source.url);
+  const selection: SelectionPayload = {
+    rootConversationId: source.scopeKey,
+    rootChatUrl,
+    selectedText: anchor.exact,
+    structuredSelectedText: anchor.selectedText,
+    selectedBlocks: [
+      {
+        messageId: anchor.messageId,
+        role: anchor.role,
+        turnIndex: anchor.turnIndex,
+        text: anchor.exact,
+        structuredText: anchor.selectedText,
+        excerpt: anchor.selectedText.slice(0, 160)
+      }
+    ],
+    branchBaseMessageId: anchor.messageId,
+    rangeQuotes: { exact: anchor.exact, prefix: anchor.prefix, suffix: anchor.suffix },
+    fallbackScrollY: anchor.scrollHint
+  };
+  const sent = Boolean(snapshot);
+  return {
+    panelId: randomId('panel'),
+    rootConversationId: source.scopeKey,
+    rootChatUrl,
+    rootProjectUrl: getNonRootContainerUrl(rootChatUrl),
+    selection,
+    context: createContextForSelection(selection),
+    questionId: question.id,
+    linkId: link?.id,
+    snapshotId: snapshot?.id,
+    excludedPlanIds: bundle.draft?.excludedBlockIds,
+    focusPreview: clipText(anchor.selectedText, 280),
+    branchKind: 'persistent',
+    entryAction: question.entryAction,
+    surfaceMode: 'embedded',
+    launchUrl: undefined,
+    branchChatUrl: link?.conversationUrl ?? undefined,
+    creationMode: sent ? 'local_persistent' : 'pending',
+    title: question.title,
+    titleStatus: 'ready',
+    minimized: false,
+    status: sent ? (link?.run === 'failed' ? 'failed' : 'live') : 'draft',
+    statusLabel: sent
+      ? link?.conversationUrl
+        ? 'Saved thread. Continue at the provider when you need more.'
+        : 'Saved thread.'
+      : 'Ask a focused follow-up about this selected passage.',
+    errorMessage: link?.run === 'failed' ? 'The last attempt failed. You can try again.' : undefined,
+    archiveOnly: sent,
+    archive: {
+      messages: bundle.messages.map((message) => ({
+        role: message.role,
+        text: message.text,
+        partial: message.partial,
+        providerMessageId: message.providerMessageId,
+        ordinal: message.ordinal
+      })),
+      capture: link?.capture ?? 'link-only'
+    },
+    initialQuestion: bundle.draft?.text ?? snapshot?.question,
+    initialPrompt: snapshot?.prompt,
+    debugLog: [formatDebugLogEntry('Panel view opened from the question record', { questionId: question.id })],
+    createdAt: question.createdAt,
+    updatedAt: Date.now()
+  };
+}
+
 function cleanup(): void {
   cleanupFns.forEach((fn) => fn());
   cleanupFns = [];
   stopTitleWatcher();
+  captureWatcher?.stop();
+  captureWatcher = null;
 
   // Everything Aside put on the page goes, including the iframes inside the host:
   // an in-place extension update runs this and then a new content script, and a

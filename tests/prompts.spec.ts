@@ -1,8 +1,4 @@
-import {
-  buildLocalInitialPrompt,
-  buildNativeBootstrapPrompt,
-  stripHiddenTitle
-} from '../src/shared/prompts';
+import { buildLocalInitialPrompt, stripHiddenTitle } from '../src/shared/prompts';
 import type { SelectionPayload } from '../src/shared/types';
 import {
   getBranchLaunchUrl,
@@ -64,18 +60,6 @@ describe('prompt builders', () => {
 
     expect(localPrompt.prompt).toContain(selection.selectedBlocks[0].text);
     expect(localPrompt.prompt).not.toContain('This user turn should not be copied');
-  });
-
-  it('builds a native bootstrap prompt that only stages the branch', () => {
-    const selection = makeSelection();
-    const bootstrapPrompt = buildNativeBootstrapPrompt(selection);
-
-    expect(bootstrapPrompt.prompt).toContain('Ready for your question.');
-    expect(bootstrapPrompt.prompt).toContain('BRANCH TASK');
-    expect(bootstrapPrompt.prompt).toContain(selection.selectedText);
-    expect(bootstrapPrompt.prompt).toContain(selection.selectedBlocks[0].text);
-    expect(bootstrapPrompt.prompt).not.toContain('USER QUESTION');
-    expect(bootstrapPrompt.prompt).not.toContain('full conversation history');
   });
 
   it('removes the hidden title envelope from assistant text', () => {
@@ -194,14 +178,13 @@ describe('prompt semantics', () => {
     expect(prompt).not.toMatch(/chain[- ]of[- ]thought|show your reasoning steps/i);
   });
 
-  it('makes the title line optional so a missing title cannot fail a branch', () => {
+  it('never asks the model for a title marker or a bootstrap acknowledgement', () => {
+    // Titles are local now. The old protocol made the model emit
+    // [[BRANCH_TITLE: ...]] and, for New-tab, a "Ready for your question." line
+    // that sent a message purely to initialise a branch.
     const prompt = buildLocalInitialPrompt(selection, 'Why?').prompt;
-    expect(prompt).toMatch(/skip this line and answer anyway/i);
-  });
-
-  it('uses the same reading instructions for the New-tab bootstrap', () => {
-    const bootstrap = buildNativeBootstrapPrompt(selection).prompt;
-    expect(bootstrap).toMatch(/fallible excerpt/i);
-    expect(bootstrap).toMatch(/Ready for your question\./);
+    expect(prompt).not.toMatch(/BRANCH_TITLE/);
+    expect(prompt).not.toMatch(/Ready for your question/);
+    expect(prompt).toMatch(/begin with the answer/i);
   });
 });

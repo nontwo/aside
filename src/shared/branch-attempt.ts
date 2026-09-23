@@ -8,7 +8,7 @@ import type { BranchAttemptRef, BranchPanelEvent } from './types';
  * rather than trusted because of their shape at compile time.
  */
 
-const EVENT_KINDS = new Set(['status', 'debug-log', 'title', 'live', 'failed']);
+const EVENT_KINDS = new Set(['status', 'debug-log', 'title', 'live', 'failed', 'captured']);
 
 export function isBranchAttemptRef(value: unknown): value is BranchAttemptRef {
   if (!value || typeof value !== 'object') {
@@ -30,7 +30,29 @@ export function isBranchPanelEvent(value: unknown): value is BranchPanelEvent {
     return false;
   }
   const candidate = value as Record<string, unknown>;
-  return typeof candidate.kind === 'string' && EVENT_KINDS.has(candidate.kind);
+  if (typeof candidate.kind !== 'string' || !EVENT_KINDS.has(candidate.kind)) {
+    return false;
+  }
+  if (candidate.kind === 'captured') {
+    // Captured text crosses a trust boundary as data; every field is checked.
+    if (!Array.isArray(candidate.messages)) {
+      return false;
+    }
+    if (candidate.capture !== 'partial' && candidate.capture !== 'captured-through') {
+      return false;
+    }
+    return candidate.messages.every((message) => {
+      const entry = message as Record<string, unknown> | null;
+      return (
+        Boolean(entry) &&
+        (entry!.role === 'user' || entry!.role === 'assistant') &&
+        typeof entry!.text === 'string' &&
+        typeof entry!.partial === 'boolean' &&
+        typeof entry!.ordinal === 'number'
+      );
+    });
+  }
+  return true;
 }
 
 /**

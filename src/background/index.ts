@@ -659,3 +659,37 @@ async function handleBranchTabRemoved(tabId: number): Promise<void> {
 chrome.tabs.onRemoved.addListener((tabId) => {
   void handleBranchTabRemoved(tabId);
 });
+
+/**
+ * The library is Aside's own page: saved questions, search, export, backup. It
+ * opens in a normal tab from the toolbar action or from a panel; it never embeds
+ * a provider site.
+ */
+async function openLibraryPage(): Promise<void> {
+  const url = chrome.runtime.getURL('library.html');
+  const existing = await chrome.tabs.query({ url });
+  const tab = existing[0];
+  if (tab && typeof tab.id === 'number') {
+    await chrome.tabs.update(tab.id, { active: true });
+    if (typeof tab.windowId === 'number') {
+      await chrome.windows.update(tab.windowId, { focused: true });
+    }
+    return;
+  }
+  await chrome.tabs.create({ url });
+}
+
+chrome.action?.onClicked.addListener(() => {
+  void openLibraryPage();
+});
+
+chrome.runtime.onMessage.addListener((message: { type?: string } | null, sender, sendResponse) => {
+  if (!message || message.type !== 'OPEN_LIBRARY' || sender.id !== chrome.runtime.id) {
+    return false;
+  }
+  void openLibraryPage().then(
+    () => sendResponse({ ok: true }),
+    (error: unknown) => sendResponse({ ok: false, reason: describeError(error) })
+  );
+  return true;
+});

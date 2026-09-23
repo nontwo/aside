@@ -74,6 +74,27 @@ export interface BranchPanelState {
   context?: import('./context').BranchContext;
   /** Identifies the current attempt; events from an older attempt are rejected. */
   attemptId?: string;
+  /**
+   * References into the canonical question database. The panel is a view/run
+   * projection; these say which durable records it is a view of. Absent on a
+   * session-only (private) panel, which is never written to that database.
+   */
+  questionId?: string;
+  linkId?: string;
+  snapshotId?: string;
+  /** New-tab prefers its own window; everything else prefers the in-page frame. */
+  preferredSurface?: BranchSurfaceMode;
+  /** Plan block ids the Owner unticked in the Context section. */
+  excludedPlanIds?: string[];
+  /** The view was closed: presentation only. The question record is untouched. */
+  closedView?: boolean;
+  /** Messages read back from the branch conversation, for display in the panel. */
+  archive?: { messages: CapturedMessage[]; capture: 'link-only' | 'partial' | 'captured-through' };
+  /**
+   * Opened from a saved record: show the archive and offer continuation, but do
+   * not load a provider frame or send anything until the Owner asks.
+   */
+  archiveOnly?: boolean;
   initialQuestion?: string;
   initialPrompt?: string;
   status: BranchPanelStatus;
@@ -123,12 +144,37 @@ export interface BranchFailedEvent {
   launchWindowId?: number;
 }
 
+/** One exposed message of the branch conversation, as read from its page. */
+export interface CapturedMessage {
+  role: ChatRole;
+  /** Structure-preserving visible text. */
+  text: string;
+  /** True while the provider was still generating when the text was read. */
+  partial: boolean;
+  /** Provider message identity when observable; a synthetic id otherwise. */
+  providerMessageId: string | null;
+  ordinal: number;
+}
+
+/**
+ * Messages read from the branch conversation. `capture` is decided by the reader
+ * from evidence — a stop control still present, a streaming marker, text still
+ * changing — and never from a timeout alone.
+ */
+export interface BranchCapturedEvent {
+  kind: 'captured';
+  messages: CapturedMessage[];
+  capture: 'partial' | 'captured-through';
+  capturedThroughMessageId: string | null;
+}
+
 export type BranchPanelEvent =
   | BranchStatusEvent
   | BranchDebugLogEvent
   | BranchTitleEvent
   | BranchLiveEvent
-  | BranchFailedEvent;
+  | BranchFailedEvent
+  | BranchCapturedEvent;
 
 /**
  * Identity every branch message must carry.

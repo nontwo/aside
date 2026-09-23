@@ -93,7 +93,7 @@ function buildSuccessComposerHtml({
   realSendMode = 'explicit',
   enterOnlySubmit = false,
   sendInShadowRoot = false,
-  assistantReplyText = '[[BRANCH_TITLE: local convexity]]\nThis uses only the selected passage.'
+  assistantReplyText = 'This uses only the selected passage.'
 }) {
   const htmlClass = dark ? ' class="dark" data-theme="dark"' : '';
   const fakeAnswerMarkup = `
@@ -381,8 +381,15 @@ async function readExtensionStorage(browser) {
 async function createSourcePage(browser, pathName) {
   const page = await browser.newPage();
   page.__consoleMessages = [];
+  page.__dialogs = [];
   page.on('console', (message) => {
     page.__consoleMessages.push(message.text());
+  });
+  // A modal dialog would freeze the page and time out every later evaluate.
+  // Record it and move on; the product must never open one on a provider page.
+  page.on('dialog', (dialog) => {
+    page.__dialogs.push({ type: dialog.type(), message: dialog.message() });
+    void dialog.accept();
   });
   await page.goto(`https://chatgpt.com${pathName}`, {
     waitUntil: 'domcontentloaded',
@@ -884,8 +891,8 @@ async function runNonProjectScenario(browser) {
     await clickSelectionAction(page, '#aside-ask-button');
     await page.waitForSelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', { timeout: 10_000 });
 
-    // The Context section must show exactly what will be submitted, and must not
-    // include the preceding question until the user asks for it.
+    // The Context section must show exactly what will be submitted. The question
+    // that produced the source answer is included by default and can be unticked.
     const contextBefore = await page.evaluate(() => {
       const panel = document.querySelector('.aside-panel:not([hidden])');
       const rows = Array.from(panel?.querySelectorAll('.aside-context-block') ?? []);
@@ -894,16 +901,16 @@ async function runNonProjectScenario(browser) {
         source: panel?.querySelector('.aside-context-source')?.textContent ?? '',
         blockLabels: rows.map((row) => row.querySelector('span')?.textContent ?? ''),
         precedingIncluded: rows
-          .filter((row) => row.textContent?.includes('preceding question'))
+          .filter((row) => row.textContent?.includes('question that produced'))
           .map((row) => row.querySelector('input')?.checked ?? null)
       };
     });
 
-    // Opt in to the preceding question and confirm it enters the preview.
+    // Untick the preceding question and confirm it leaves the preview.
     await page.evaluate(() => {
       const row = Array.from(
         document.querySelectorAll('.aside-panel:not([hidden]) .aside-context-block')
-      ).find((candidate) => candidate.textContent?.includes('preceding question'));
+      ).find((candidate) => candidate.textContent?.includes('question that produced'));
       row?.querySelector('input')?.click();
     });
     const contextAfterOptIn = await page.evaluate(
@@ -914,16 +921,17 @@ async function runNonProjectScenario(browser) {
     await page.evaluate(() => {
       const row = Array.from(
         document.querySelectorAll('.aside-panel:not([hidden]) .aside-context-block')
-      ).find((candidate) => candidate.textContent?.includes('preceding question'));
+      ).find((candidate) => candidate.textContent?.includes('question that produced'));
       row?.querySelector('input')?.click();
     });
 
+    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
+    // Captured after the question is typed: the preview is the complete prompt,
+    // instructions and question included, and must equal what is submitted.
     const contextPreview = await page.evaluate(
       () =>
         document.querySelector('.aside-panel:not([hidden]) .aside-context-preview')?.textContent ?? ''
     );
-
-    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
 
     const darkThemeState = await page.evaluate(() => ({
       theme: document.documentElement.dataset.asideTheme ?? null,
@@ -940,7 +948,34 @@ async function runNonProjectScenario(browser) {
     });
     const branchFrame = await waitForBranchFrame(page);
     await waitForPanelStatus(page, /Branch answer is ready in this window\./);
-    await waitForPanelTitle(page, 'local convexity');
+    // Titles are local: derived from the question, never from the model.
+    await waitForPanelTitle(page, 'Why this assumption?');
+
+    // The answer is read back from the branch conversation and shown, read-only,
+    // in the panel — and its capture state is stated, not assumed.
+    // Wait for the capture to SETTLE: the watcher promotes a message to complete
+    // only after a second identical read with no generating evidence, so a
+    // "partial" sample a moment earlier is expected, not a failure.
+    await page.waitForFunction(
+      () =>
+        Array.from(
+          document.querySelectorAll('.aside-panel:not([hidden]) .aside-archive-message[data-role="assistant"]')
+        ).some(
+          (node) =>
+            node.textContent?.includes('This uses only the selected passage.') &&
+            node.getAttribute('data-partial') === 'false'
+        ),
+      { timeout: 25_000 }
+    );
+    const captureState = await page.evaluate(() => ({
+      archiveStatus:
+        document.querySelector('.aside-panel:not([hidden]) .aside-archive-status')?.textContent ?? null,
+      assistantPartial:
+        document
+          .querySelector('.aside-panel:not([hidden]) .aside-archive-message[data-role="assistant"]')
+          ?.getAttribute('data-partial') ?? null,
+      dialogs: []
+    }));
 
     const pageCountAfter = (await browser.pages()).length;
     const liveResult = await Promise.all([
@@ -964,20 +999,23 @@ async function runNonProjectScenario(browser) {
       ...branch,
       pageCountBefore,
       pageCountAfter,
+      captureState,
       promptContainsSelectedPassage: Boolean(
         branch.prompt?.includes('convexity assumption guarantees the relaxation stays tight')
       ),
       promptContainsLocalSourceAnswer: Boolean(
         branch.prompt?.includes('The convexity assumption guarantees the relaxation stays tight')
       ),
-      contextPreviewMatchesPrompt: Boolean(contextPreview && branch.prompt?.includes(contextPreview)),
+      contextPreviewMatchesPrompt: Boolean(contextPreview && branch.prompt === contextPreview),
       contextSource: contextBefore.source,
       precedingQuestionOffered: contextBefore.blockLabels.some((label) =>
         label.includes('preceding question')
       ),
-      precedingQuestionDefaultOff: contextBefore.precedingIncluded.every((checked) => checked === false),
-      precedingQuestionAbsentByDefault: !contextBefore.preview.includes('Tell me about convexity'),
-      precedingQuestionAppearsWhenOptedIn: contextAfterOptIn.includes('Tell me about convexity')
+      // The question that produced the source answer is part of the default
+      // plan now; unticking it removes it from the preview.
+      precedingQuestionDefaultOn: contextBefore.precedingIncluded.every((checked) => checked === true),
+      precedingQuestionPresentByDefault: contextBefore.preview.includes('Tell me about convexity'),
+      precedingQuestionGoneWhenUnticked: !contextAfterOptIn.includes('Tell me about convexity')
     }));
 
     await clickPanelAction(page, 'Minimize');
@@ -1197,7 +1235,7 @@ async function runNewTabScenario(browser) {
     '/c/source-new-tab': buildSourceHtml(),
     '/': buildSuccessComposerHtml({
       conversationPath: '/c/generated-new-window',
-      assistantReplyText: '[[BRANCH_TITLE: local convexity]]\nReady for your question.'
+      assistantReplyText: 'This answers the question in its own window.'
     })
   };
 
@@ -1208,6 +1246,14 @@ async function runNewTabScenario(browser) {
     await page.waitForSelector('#aside-selection-toolbar', { timeout: 10_000 });
     const existingPages = await browser.pages();
     await clickSelectionAction(page, '#aside-new-tab-button');
+    // New-tab opens a draft: nothing is sent merely because the button was
+    // pressed. The real question is typed and sent once, in its own window.
+    await page.waitForSelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', { timeout: 10_000 });
+    const pageCountAfterClick = (await browser.pages()).length;
+    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
+    await page.evaluate(() => {
+      document.querySelector('.aside-panel:not([hidden]) button[type="submit"]')?.click();
+    });
     const newPage = await waitForAdditionalPage(browser, existingPages);
     await newPage.waitForFunction(() => window.location.href.includes('/c/generated-new-window'), {
       timeout: 45_000
@@ -1227,7 +1273,9 @@ async function runNewTabScenario(browser) {
     return await Promise.all([
       page.evaluate(() => ({
         sourceLocation: window.location.href,
-        panelVisible: Boolean(document.querySelector('.aside-panel:not([hidden])'))
+        panelVisible: Boolean(document.querySelector('.aside-panel:not([hidden])')),
+        panelStatus:
+          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ?? null
       })),
       newPage.evaluate(() => {
         const composer =
@@ -1244,7 +1292,7 @@ async function runNewTabScenario(browser) {
           composerFocused: document.activeElement === composer
         };
       })
-    ]).then(([source, branch]) => ({ ...source, ...branch }));
+    ]).then(([source, branch]) => ({ ...source, ...branch, noWindowBeforeQuestion: pageCountAfterClick === existingPages.length }));
   } finally {
     const pages = await browser.pages();
     const extraPages = pages.filter((candidate) => candidate !== page);
@@ -1618,9 +1666,42 @@ async function runCrossTabScenario(browser) {
 
     const afterEdit = await readExtensionStorage(browser);
 
-    // Tab A closes the panel. That is a deletion with a tombstone.
+    // Tab A closes its VIEW. That deletes nothing: the record stays, no
+    // tombstone is written, and tab B's own view is not forced shut.
     await clickPanelAction(tabA, 'Close');
     await sleep(900);
+    const afterCloseOnly = await readExtensionStorage(browser);
+    const tabBAfterClose = await tabB.evaluate(
+      (id) => {
+        const panel = document.querySelector(`.aside-panel[data-panel-id="${id}"]`);
+        return { mounted: Boolean(panel), hidden: panel instanceof HTMLElement ? panel.hidden : null };
+      },
+      panelId
+    );
+
+    // Now tab A deletes the question explicitly, from the question list. That is
+    // the action that leaves a tombstone.
+    await tabA.evaluate(() => {
+      window.confirm = () => true;
+      const button = Array.from(document.querySelectorAll('#aside-tabbar button')).find((candidate) =>
+        candidate.textContent?.startsWith('Questions')
+      );
+      if (!(button instanceof HTMLElement)) {
+        throw new Error('Questions list entry not found in the rail');
+      }
+      button.click();
+    });
+    await tabA.waitForSelector('#aside-qlist:not([hidden]) .aside-qlist-row', { timeout: 10_000 });
+    const listRowCount = await tabA.evaluate(() => document.querySelectorAll('#aside-qlist .aside-qlist-row').length);
+    await tabA.evaluate(() => {
+      const row = document.querySelector('#aside-qlist .aside-qlist-row');
+      const del = Array.from(row?.querySelectorAll('button') ?? []).find((b) => b.textContent === 'Delete');
+      if (!(del instanceof HTMLElement)) {
+        throw new Error('Delete action not found in the question list');
+      }
+      del.click();
+    });
+    await sleep(1200);
 
     // Tab B, which still had it mounted a moment ago, writes again. A stale
     // whole-store write would bring the panel straight back.
@@ -1645,6 +1726,12 @@ async function runCrossTabScenario(browser) {
       storedRevAfterEdit: JSON.parse(afterEdit.local)[`aside:panel:${panelId}`]?.rev ?? null,
       tabBWriteState: tabBWriteState,
       panelStoredAfterEdit: afterEdit.local.includes(`aside:panel:${panelId}`),
+      // Close is presentation only.
+      panelKeptAfterClose: afterCloseOnly.local.includes(`aside:panel:${panelId}`),
+      tombstoneAfterCloseOnly: afterCloseOnly.local.includes(`aside:gone:${panelId}`),
+      tabBViewSurvivedClose: tabBAfterClose.mounted && tabBAfterClose.hidden === false,
+      listRowCount,
+      // Delete is explicit and leaves a tombstone.
       panelResurrectedAfterClose: afterClose.local.includes(`aside:panel:${panelId}`),
       tombstoneWritten: afterClose.local.includes(`aside:gone:${panelId}`),
       lateWriteLanded: afterClose.local.includes('late write from tab B'),
@@ -1775,8 +1862,15 @@ function buildClaudeComposerHtml({ conversationPath = '/chat/generated-claude', 
 async function createClaudePage(browser, pathName) {
   const page = await browser.newPage();
   page.__consoleMessages = [];
+  page.__dialogs = [];
   page.on('console', (message) => {
     page.__consoleMessages.push(message.text());
+  });
+  // A modal dialog would freeze the page and time out every later evaluate.
+  // Record it and move on; the product must never open one on a provider page.
+  page.on('dialog', (dialog) => {
+    page.__dialogs.push({ type: dialog.type(), message: dialog.message() });
+    void dialog.accept();
   });
   await page.goto(`https://claude.ai${pathName}`, {
     waitUntil: 'domcontentloaded',
@@ -2304,7 +2398,13 @@ try {
       crossTab.editVisibleInStore === true ||
       crossTab.tabBWriteState?.textareaValue === 'edited in tab B'
     ) ||
-    // A close in tab A must leave a tombstone and must not be undone by tab B.
+    // Close is presentation only: the record survives, no tombstone, and tab B's
+    // own view is not forced shut by tab A's close.
+    crossTab.panelKeptAfterClose !== true ||
+    crossTab.tombstoneAfterCloseOnly !== false ||
+    crossTab.tabBViewSurvivedClose !== true ||
+    (crossTab.listRowCount ?? 0) < 1 ||
+    // An explicit delete in tab A must leave a tombstone and must not be undone by tab B.
     crossTab.tombstoneWritten !== true ||
     crossTab.panelResurrectedAfterClose !== false ||
     crossTab.lateWriteLanded !== false ||
@@ -2364,13 +2464,22 @@ try {
 
   if (
     nonProject.liveResult.status !== 'Branch answer is ready in this window.' ||
-    nonProject.liveResult.title !== 'local convexity' ||
+    nonProject.liveResult.title !== 'Why this assumption?' ||
+    // Preview equals submission, byte for byte.
+    nonProject.liveResult.contextPreviewMatchesPrompt !== true ||
+    nonProject.liveResult.precedingQuestionDefaultOn !== true ||
+    nonProject.liveResult.precedingQuestionPresentByDefault !== true ||
+    nonProject.liveResult.precedingQuestionGoneWhenUnticked !== true ||
     nonProject.liveResult.branchLocation !== 'https://chatgpt.com/c/generated-local' ||
     !nonProject.liveResult.openBranchVisible ||
     nonProject.liveResult.pageCountBefore !== nonProject.liveResult.pageCountAfter ||
     !nonProject.liveResult.promptContainsSelectedPassage ||
     !nonProject.liveResult.promptContainsLocalSourceAnswer ||
-    !nonProject.liveResult.assistantText?.includes('This uses only the selected passage.')
+    !nonProject.liveResult.assistantText?.includes('This uses only the selected passage.') ||
+    // Captured, and said so: the fixture stops generating immediately, so the
+    // answer must settle to a complete message with a "captured through" label.
+    nonProject.liveResult.captureState?.assistantPartial !== 'false' ||
+    !/Captured through/.test(nonProject.liveResult.captureState?.archiveStatus ?? '')
   ) {
     throw new Error(`Non-project embedded branch scenario failed: ${JSON.stringify(nonProject.liveResult)}`);
   }
@@ -2428,14 +2537,20 @@ try {
     newTab &&
     (
       newTab.sourceLocation !== 'https://chatgpt.com/c/source-new-tab' ||
-      newTab.panelVisible !== false ||
+      // The draft panel stays on the source page, reporting the branch's status.
+      newTab.panelVisible !== true ||
+      // No window opened merely because New-tab was pressed.
+      newTab.noWindowBeforeQuestion !== true ||
       newTab.location !== 'https://chatgpt.com/c/generated-new-window' ||
       newTab.branchPanelVisible !== false ||
       newTab.composerVisible !== true ||
       newTab.composerFocused !== true ||
       !newTab.userPrompt?.includes('SELECTED PASSAGE') ||
       !newTab.userPrompt?.includes('convexity assumption guarantees the relaxation stays tight') ||
-      !newTab.assistantText?.includes('Ready for your question.')
+      // The actual question was sent, once — no bootstrap message.
+      !newTab.userPrompt?.includes('Why this assumption?') ||
+      /Ready for your question/.test(newTab.userPrompt ?? '') ||
+      !newTab.assistantText?.includes('This answers the question in its own window.')
     )
   ) {
     throw new Error(`New-tab scenario failed: ${JSON.stringify(newTab)}`);
