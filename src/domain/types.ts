@@ -124,7 +124,14 @@ export interface QuestionDraft {
 export interface SnapshotBlockRef {
   blockId: string;
   contentHash: string;
-  role: 'focus' | 'enclosing' | 'preceding-question' | 'dependency' | 'background' | 'history';
+  role:
+    | 'focus'
+    | 'enclosing'
+    | 'enclosing-equation'
+    | 'preceding-question'
+    | 'dependency'
+    | 'background'
+    | 'history';
   included: boolean;
   /** Why an excluded block was left out, when it was left out by the compiler. */
   omitReason?: 'budget' | 'user' | 'unavailable';

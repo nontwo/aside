@@ -10,9 +10,12 @@ import type {
   FocusBranchWindowMessage,
   FocusBranchWindowResponse,
   ForwardBranchPanelEventMessage,
+  RecheckBranchInTabMessage,
+  RecheckBranchInTabResponse,
   RunBranchPromptInTabMessage,
   RunBranchPromptInTabResponse
 } from '../shared/types';
+import { BUILD_ID } from '../shared/build-info';
 import { providerHostnames } from '../shared/providers/origins';
 import { isBranchAttemptRef, isBranchPanelEvent, ownsAttempt } from '../shared/branch-attempt';
 import { handlePanelDelete, handlePanelList, handlePanelUpsert } from './panel-authority';
@@ -38,6 +41,18 @@ interface BranchWindowSession {
   launchWindowId?: number;
   branchChatUrl?: string;
   live: boolean;
+  /**
+   * The run request as delivered, kept so the SAME tab can be asked to check a
+   * private mode again, or resume after the provider navigated mid-preparation.
+   * Session storage only: a private prompt never reaches disk from here.
+   */
+  pendingRun?: RunBranchPromptInTabMessage;
+  /** True once the tab accepted the run at least once. */
+  runDelivered?: boolean;
+  /** Last private-mode preparation step the tab reported. */
+  lastStep?: string;
+  /** Build of the content script in the branch tab, from its run response. */
+  tabBuildId?: string;
 }
 
 // MV3 service workers are torn down after ~30s idle, which can easily happen while a
@@ -370,7 +385,7 @@ async function handleCreateBranchWindow(
     });
     await waitForTabComplete(createdTabId);
 
-    const response = await sendRunMessageToTab(createdTabId, {
+    const run: RunBranchPromptInTabMessage = {
       type: 'RUN_BRANCH_PROMPT_IN_TAB',
       providerId: message.providerId,
       panelId: message.panelId,
@@ -378,10 +393,25 @@ async function handleCreateBranchWindow(
       prompt: message.prompt,
       launchUrl: message.launchUrl,
       branchKind: message.branchKind
-    });
+    };
+    session.pendingRun = run;
+    await persistSessions();
+    const response = await sendRunMessageToTab(createdTabId, run);
 
     if (!response.ok) {
       throw new Error(response.reason || 'The created tab rejected the branch automation.');
+    }
+
+    session.runDelivered = true;
+    session.tabBuildId = response.buildId;
+    await persistSessions();
+    if (response.buildId && response.buildId !== BUILD_ID) {
+      // Two builds are talking: the branch tab's content script predates this
+      // worker (or the reverse). Said in the log rather than guessed at later.
+      await forwardPanelEvent(message.panelId, {
+        kind: 'debug-log',
+        message: `[${new Date().toISOString()}] stale-client: branch tab build ${response.buildId} differs from worker build ${BUILD_ID}`
+      });
     }
 
     return {
@@ -398,6 +428,87 @@ async function handleCreateBranchWindow(
     };
   }
 }
+
+/**
+ * Check a private mode again in the SAME branch tab. The stored run request is
+ * redelivered under its own attempt id; the tab re-observes and, only if the mode
+ * verifies, continues the pending prompt. Nothing is navigated or reopened.
+ */
+async function handleRecheckBranchInTab(
+  message: RecheckBranchInTabMessage
+): Promise<RecheckBranchInTabResponse> {
+  const session = (await hydrateSessions()).get(message.panelId);
+  if (!session || !ownsAttempt(message, session)) {
+    return {
+      ok: false,
+      reason: 'The branch window for this attempt is no longer known. Use Try again.',
+      buildId: BUILD_ID
+    };
+  }
+  if (session.live) {
+    return { ok: false, reason: 'This branch is already live.', buildId: BUILD_ID };
+  }
+  if (!session.pendingRun || session.launchTabId < 0) {
+    return {
+      ok: false,
+      reason: 'The branch window was closed. Use Try again.',
+      buildId: BUILD_ID
+    };
+  }
+
+  const response = await sendRunMessageToTab(session.launchTabId, session.pendingRun, 8_000);
+  if (response.ok) {
+    session.runDelivered = true;
+    session.tabBuildId = response.buildId ?? session.tabBuildId;
+    await persistSessions();
+  }
+  return { ok: response.ok, reason: response.reason, buildId: response.buildId ?? BUILD_ID };
+}
+
+/**
+ * A provider can navigate its own tab while a private mode is being prepared
+ * (Claude opens incognito as a new page). The new document has no memory of the
+ * run, so the stored request is delivered again — only while the last reported
+ * step was before anything was typed, so a resume can never resend.
+ */
+async function handleBranchTabUpdated(
+  tabId: number,
+  changeInfo: chrome.tabs.TabChangeInfo
+): Promise<void> {
+  if (changeInfo.status !== 'complete') {
+    return;
+  }
+  const session = [...(await hydrateSessions()).values()].find(
+    (candidate) => candidate.launchTabId === tabId
+  );
+  if (
+    !session ||
+    session.live ||
+    !session.pendingRun ||
+    !session.runDelivered ||
+    !session.lastStep ||
+    session.lastStep === 'ready' ||
+    session.lastStep === 'failed'
+  ) {
+    return;
+  }
+
+  await forwardPanelEvent(session.panelId, {
+    kind: 'debug-log',
+    message: `[${new Date().toISOString()}] Branch tab navigated during private-mode preparation (last step ${session.lastStep}); delivering the run to the new document`
+  });
+  const response = await sendRunMessageToTab(tabId, session.pendingRun, 8_000);
+  if (!response.ok) {
+    await forwardPanelEvent(session.panelId, {
+      kind: 'debug-log',
+      message: `[${new Date().toISOString()}] The navigated branch tab did not accept the run: ${response.reason ?? 'unknown'}`
+    });
+  }
+}
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  void handleBranchTabUpdated(tabId, changeInfo);
+});
 
 async function handleFocusBranchWindow(
   message: FocusBranchWindowMessage
@@ -491,6 +602,13 @@ async function handleAutomationEvent(
     session.launchWindowId = sender.tab.windowId;
   }
 
+  if (message.event.kind === 'preparation') {
+    session.lastStep = message.event.recovery.step;
+    await persistSessions();
+    await forwardPanelEvent(message.panelId, message.event);
+    return;
+  }
+
   if (message.event.kind === 'live') {
     session.live = true;
     session.branchChatUrl = message.event.branchChatUrl;
@@ -505,6 +623,12 @@ async function handleAutomationEvent(
   }
 
   if (message.event.kind === 'failed') {
+    // A failure that left a recovery behind keeps the run for Check again; any
+    // other failure ends this attempt's claim on the tab.
+    session.lastStep = 'failed';
+    if (!message.event.recovery) {
+      session.pendingRun = undefined;
+    }
     const event: BranchFailedEvent = {
       ...message.event,
       launchTabId: session.launchTabId,
@@ -572,9 +696,8 @@ chrome.runtime.onMessage.addListener((message: WorkerMessage, sender, sendRespon
   // Every branch message is validated as data on arrival, not trusted by shape.
   if (
     (message.type === 'CREATE_BRANCH_WINDOW' ||
-      message.type === 'FOCUS_BRANCH_WINDOW' ||
+      message.type === 'RECHECK_BRANCH_IN_TAB' ||
       message.type === 'BRANCH_AUTOMATION_EVENT') &&
-    message.type !== 'FOCUS_BRANCH_WINDOW' &&
     !isBranchAttemptRef(message)
   ) {
     return false;
@@ -594,6 +717,12 @@ chrome.runtime.onMessage.addListener((message: WorkerMessage, sender, sendRespon
     case 'FOCUS_BRANCH_WINDOW':
       void handleFocusBranchWindow(message).then(sendResponse, (error: unknown) => {
         sendResponse({ ok: false, reason: describeError(error) });
+      });
+      return true;
+
+    case 'RECHECK_BRANCH_IN_TAB':
+      void handleRecheckBranchInTab(message).then(sendResponse, (error: unknown) => {
+        sendResponse({ ok: false, reason: describeError(error), buildId: BUILD_ID });
       });
       return true;
 
@@ -617,8 +746,12 @@ chrome.runtime.onMessage.addListener((message: WorkerMessage, sender, sendRespon
       return true;
 
     case 'PANEL_LIST':
-      void handlePanelList().then(sendResponse, (error: unknown) =>
-        sendResponse({ ok: false, records: [], reason: describeError(error) })
+      // The worker's build travels with every list so a content script left over
+      // from a previous install can tell it is talking to a newer worker.
+      void handlePanelList().then(
+        (response) => sendResponse({ ...response, buildId: BUILD_ID }),
+        (error: unknown) =>
+          sendResponse({ ok: false, records: [], reason: describeError(error), buildId: BUILD_ID })
       );
       return true;
 

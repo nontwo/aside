@@ -95,7 +95,50 @@ view shut in another. What tabs do share is the record.
 
 `scripts/build.mjs` injects `<short sha>[-dirty]+<timestamp>` as `__ASIDE_BUILD__`;
 it appears in the panel's Copy-log header and the library footer so an installed
-candidate can be matched to a commit.
+candidate can be matched to a commit. The id also travels in every handshake —
+the worker's `PANEL_LIST` answer, the frame's `SB_FRAME_READY`, the branch tab's
+run and re-check responses, and every preparation/failure event — and a
+mismatch is logged as `stale-client` and surfaced as a reload notice. "It does
+nothing" reports that were really two builds talking are now visible as such.
+
+## D9. Private mode is a typed observation; preparation is a workflow
+
+`src/runtime/private-mode.ts` observes the branch document and returns three
+separate facts — capability (`available` / `not-observed-yet` /
+`unavailable-in-this-context` / `unknown`), observed mode (`normal` / `private`
+/ `unknown`) and preparation step (`page-loading` … `awaiting-choice` …
+`ready` / `blocked`) — with the evidence kind and the next action. It clicks
+and types nothing; the frame-side workflow in `root.ts` acts on `nextAction`
+under bounded budgets: open a menu opener identified by `aria-haspopup`,
+activate an inactive control once, stop at a chooser dialog, re-observe after
+remounts, verify before insert and before every submit. Only provider-owned
+state counts — a pressed control, or the provider's own active-mode interface
+marker — never Aside's UI, a quoted passage, a URL hint or a class substring.
+
+Rejected: treating "no selector matched" as "unsupported". That was the dead end
+behind both owner reports: the ChatGPT control existed inside a closed menu, and
+the Claude interface shows the active state as a label rather than a button.
+Also rejected: a silent switch to persistent when verification fails. Ordinary
+mode is offered only where the observation supports it, as an explicit two-step
+choice in the panel; the failure event carries the observation so **Check again**
+can re-observe the *same* document and continue the pending prompt (embedded:
+the start is re-posted to the existing frame; driven window: the worker
+redelivers the stored run to the same tab). A provider navigation during
+preparation is resumed only while the last reported step was before insertion,
+so a resume can never resend.
+
+## D10. Selection fidelity for mathematics
+
+`extractStructuredSelection` (`src/shared/dom.ts`) resolves equations against the
+live `Range`, not against `cloneContents()`: a selection made inside KaTeX's
+visual subtree carries only glyphs and position spans, and the TeX annotation is
+outside the cloned fragment — which is how `$S_2 \ne S^2$` became `S2≠S2` in
+both the preview and the submitted prompt. Wrappers the range touches are widened
+to the whole equation; coverage is judged by rendered text; a partial selection
+keeps the selected part as the selection and supplies the whole equation as a
+separately labelled context block (`enclosing-equation`); an equation without a
+readable source is disclosed as a limitation. The plan and the snapshot carry the
+fidelity record. No model or regex "cleanup" is applied anywhere.
 
 ## Verification levels
 

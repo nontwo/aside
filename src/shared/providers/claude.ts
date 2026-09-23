@@ -353,6 +353,23 @@ export const claudeAdapter: ProviderAdapter = {
       'button[title*="无痕"]'
     ],
     privacyControlLabelPattern: /incognito|无痕/i,
+    // Claude documents the launch control as a ghost icon in the upper right of a
+    // new chat outside projects. If it sits behind a menu, these openers are tried.
+    privacyMenuTriggerSelectors: [
+      'header button[aria-haspopup="menu"]',
+      'form button[aria-haspopup="menu"]',
+      'form button[aria-haspopup="true"]'
+    ],
+    // Claude documents the ACTIVE interface as a black border with an
+    // "Incognito chat" label in the upper left. Candidates for that label; matched
+    // only in provider chrome, never in message text.
+    privacyActiveInterfaceSelectors: [
+      '[data-testid*="incognito" i]',
+      'header [aria-label*="incognito" i]',
+      '[aria-label="Incognito chat" i]',
+      '[role="status"][aria-label*="incognito" i]',
+      'header [title*="incognito" i]'
+    ],
     privacyInactiveLabelPattern:
       /start incognito|new incognito|turn on incognito|enable incognito|incognito off|开启无痕|启用无痕/i,
     privacyActiveLabelPattern:
@@ -386,9 +403,9 @@ export const claudeAdapter: ProviderAdapter = {
   privacy: {
     label: 'Incognito chat',
     constraints: [
-      'Claude documents Incognito as unavailable inside projects. Starting one from a project leaves the project, so its files and instructions do not travel with the branch.',
-      'A closed Incognito chat cannot be reopened or converted into regular history, so a minimized Incognito branch is not recoverable after its window closes.',
-      'Incognito is documented as part of the previous Claude experience, so the control may be absent on accounts already moved to the newer interface.',
+      'Claude starts an incognito chat from the ghost icon in the upper right of a new chat outside a project; the ghost icon is not shown inside a project, so a private branch from a project conversation starts outside it and its files and instructions do not travel with the branch.',
+      'Incognito chats open in Claude\'s previous chat experience, so Claude cannot create files or run code in them. Once on, the interface shows a black border and an "Incognito chat" label; Aside verifies that, it does not assume it.',
+      'An incognito chat is not saved to your chat history and is not used for training; Anthropic still retains it for a period (30 days by default, or your organisation\'s setting). A closed Incognito chat cannot be reopened.',
       'Aside can only observe the page. It cannot prove anything about server-side retention.'
     ],
     leavesContainer: true

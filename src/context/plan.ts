@@ -45,10 +45,21 @@ export interface PlanInput {
   history: Array<{ role: ChatRole; text: string }>;
   /** Attachments / links mentioned in the source that were never read. */
   unavailableReferences: string[];
+  /** Source of equations the selection only partly covers, labelled as context. */
+  enclosingEquations?: string[];
+  /** Extraction limitations to disclose (e.g. an equation with no readable source). */
+  fidelityLimitations?: string[];
   maxChars: number;
 }
 
-export type PlanRole = 'focus' | 'enclosing' | 'preceding-question' | 'dependency' | 'background' | 'history';
+export type PlanRole =
+  | 'focus'
+  | 'enclosing'
+  | 'enclosing-equation'
+  | 'preceding-question'
+  | 'dependency'
+  | 'background'
+  | 'history';
 
 export interface PlanBlock {
   id: string;
@@ -224,6 +235,22 @@ export function buildContextPlan(input: PlanInput): ContextPlan {
     included: true
   });
 
+  // A selection that covers only part of a displayed equation: the focus stays
+  // what was selected, and the whole equation's source is supplied separately,
+  // labelled as such — never presented as if the whole equation had been chosen.
+  (input.enclosingEquations ?? []).forEach((source, index) => {
+    blocks.push({
+      id: `${input.anchorTurn.id}#equation-${index}`,
+      role: 'enclosing-equation',
+      sourceRole: input.anchorTurn.role,
+      text: `$${source}$`,
+      reason: 'the whole equation the selection is part of',
+      included: !excluded.has(`${input.anchorTurn.id}#equation-${index}`),
+      omitReason: excluded.has(`${input.anchorTurn.id}#equation-${index}`) ? 'user' : undefined
+    });
+  });
+  (input.fidelityLimitations ?? []).forEach((limitation) => missing.push(limitation));
+
   const units = enclosingUnits(input.anchorTurn.text, focus);
   const enclosingText = units.join('\n\n');
   if (normalize(enclosingText) !== normalize(focus)) {
@@ -375,6 +402,7 @@ export function chooseDelimiter(texts: string[]): string {
 const ROLE_HEADINGS: Record<PlanRole, string> = {
   focus: 'SELECTED PASSAGE (focus)',
   enclosing: 'ENCLOSING UNIT',
+  'enclosing-equation': 'WHOLE EQUATION THE SELECTION IS PART OF (context, not the selection)',
   'preceding-question': 'QUESTION THAT PRODUCED THE SOURCE ANSWER',
   dependency: 'SOURCE MATERIAL THIS PASSAGE SEEMS TO DEPEND ON',
   background: 'BACKGROUND THE USER ADDED',
@@ -421,6 +449,9 @@ export function describePlan(plan: ContextPlan): string {
   const pieces: string[] = ['the selected passage'];
   if (counts.get('enclosing')) {
     pieces.push('its enclosing unit');
+  }
+  if (counts.get('enclosing-equation')) {
+    pieces.push('the whole equation it is part of');
   }
   if (counts.get('preceding-question')) {
     pieces.push('the question before it');

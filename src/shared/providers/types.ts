@@ -162,6 +162,20 @@ export interface ComposerAdapter {
   privacyInactiveLabelPattern: RegExp;
   /** Label patterns that mean "private mode is currently ON". */
   privacyActiveLabelPattern: RegExp;
+  /**
+   * Menu openers near the composer that may reveal the private-mode control when
+   * it is not rendered. Opening a menu is reversible and identifiable
+   * (aria-haspopup); it is the only provider click made before verification.
+   */
+  privacyMenuTriggerSelectors?: string[];
+  /**
+   * Provider-owned markers of the ACTIVE private interface — the label or badge
+   * the provider itself renders once the mode is on. Matched only outside message
+   * content and outside Aside's UI. Candidates until observed live.
+   */
+  privacyActiveInterfaceSelectors?: string[];
+  /** Dialogs the provider shows to ask a choice before the first private send. */
+  privacyChooserSelectors?: string[];
 }
 
 export interface SurfaceSupport {

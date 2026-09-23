@@ -4,6 +4,7 @@ import {
   createAttemptId,
   isBranchAttemptRef,
   isBranchPanelEvent,
+  isPrivacyRecovery,
   isRunBranchPromptRequest,
   ownsAttempt
 } from '../src/shared/branch-attempt';
@@ -30,6 +31,36 @@ describe('branch message validation', () => {
     expect(isBranchPanelEvent({ kind: 'take-over' })).toBe(false);
     expect(isBranchPanelEvent({})).toBe(false);
     expect(isBranchPanelEvent(undefined)).toBe(false);
+  });
+
+  it('validates a private-mode preparation record as data', () => {
+    const recovery = {
+      step: 'awaiting-choice',
+      availability: 'available',
+      mode: 'unknown',
+      evidence: 'chooser-dialog',
+      nextAction: 'choose-personalization',
+      reason: 'Temporary Chat is asking for a choice in the branch window.',
+      control: null,
+      offerCheckAgain: true,
+      offerShowTarget: true,
+      offerOrdinaryMode: false,
+      observedAt: 1,
+      buildId: 'abc'
+    };
+    expect(isPrivacyRecovery(recovery)).toBe(true);
+    expect(isBranchPanelEvent({ kind: 'preparation', recovery })).toBe(true);
+    expect(isBranchPanelEvent({ kind: 'failed', reason: 'x', recovery })).toBe(true);
+
+    // Every enum is closed: a step or action the panel does not know is rejected,
+    // not rendered as a button.
+    expect(isPrivacyRecovery({ ...recovery, step: 'take-over' })).toBe(false);
+    expect(isPrivacyRecovery({ ...recovery, nextAction: 'run-script' })).toBe(false);
+    expect(isPrivacyRecovery({ ...recovery, offerOrdinaryMode: 'yes' })).toBe(false);
+    expect(isPrivacyRecovery({ ...recovery, reason: 'x'.repeat(601) })).toBe(false);
+    expect(isPrivacyRecovery({ ...recovery, control: { tag: 'BUTTON' } })).toBe(false);
+    expect(isBranchPanelEvent({ kind: 'preparation' })).toBe(false);
+    expect(isBranchPanelEvent({ kind: 'failed', reason: 'x', recovery: { step: 'ready' } })).toBe(false);
   });
 });
 

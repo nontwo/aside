@@ -25,8 +25,17 @@ import type {
   PanelListedRecord,
   PanelWriteResponse,
   BranchSurfaceMode,
-  BranchCapturedEvent
+  BranchCapturedEvent,
+  PrivacyRecovery,
+  RecheckBranchInTabMessage,
+  RecheckBranchInTabResponse
 } from '../shared/types';
+import {
+  describePreparationStep,
+  observePrivateMode,
+  summarizeObservation
+} from '../runtime/private-mode';
+import type { PrivacyObservation } from '../runtime/private-mode';
 import {
   buildSelectionPayloadFromDraft,
   captureSelectionDraftFromRange,
@@ -120,6 +129,7 @@ import type {
 import {
   createAttemptId,
   isBranchAttemptRef,
+  isPrivacyRecovery,
   isBranchPanelEvent,
   isRunBranchPromptRequest,
   ownsAttempt
@@ -167,10 +177,23 @@ interface PanelRuntime {
   debugLogTextarea: HTMLTextAreaElement;
   copyLogButton: HTMLButtonElement;
   openTabHeaderButton: HTMLButtonElement;
+  moreDetails: HTMLDetailsElement;
+  recoveryEl: HTMLDivElement;
+  recoveryText: HTMLParagraphElement;
+  showTargetButton: HTMLButtonElement;
+  checkAgainButton: HTMLButtonElement;
+  ordinaryButton: HTMLButtonElement;
+  ordinaryConfirmEl: HTMLDivElement;
   pendingFramePrompt?: string;
   frameReady: boolean;
   frameStartSent: boolean;
   watchdogId?: number;
+  /** The Owner asked to see the branch document behind a failed private preparation. */
+  showTargetWhileFailed: boolean;
+  /** Last preparation step the branch document reported for the current attempt. */
+  lastPreparationStep?: string;
+  /** Build of the content script inside the embedded frame, from its ready handshake. */
+  frameBuildId?: string;
 }
 
 /**
@@ -213,6 +236,8 @@ interface FrameReadyMessage {
   target: 'parent';
   type: 'SB_FRAME_READY';
   currentUrl: string;
+  /** Build of the content script in the frame, compared by the parent. */
+  buildId?: string;
 }
 
 interface FrameBranchEventMessage extends BranchAttemptRef {
@@ -349,11 +374,36 @@ let toolbarSyncFrame: number | undefined;
  */
 class PrivacyNotVerifiedError extends Error {
   readonly privacyBlocked = true;
+  /** Where preparation stopped, so the panel can offer Check again on the same target. */
+  readonly recovery?: PrivacyRecovery;
 
-  constructor(message: string) {
+  constructor(message: string, recovery?: PrivacyRecovery) {
     super(message);
     this.name = 'PrivacyNotVerifiedError';
+    this.recovery = recovery;
   }
+}
+
+/**
+ * Two builds talking to each other — a content script left over from a previous
+ * install, a frame loaded before an update — explain a whole class of "it does
+ * nothing" reports. Said once per pair, in the log and on screen.
+ */
+const staleClientReports = new Set<string>();
+let workerBuildId: string | undefined;
+
+function reportStaleClient(runtime: PanelRuntime | null, source: string, otherBuild: string): void {
+  const key = `${source}:${otherBuild}`;
+  if (staleClientReports.has(key)) {
+    return;
+  }
+  staleClientReports.add(key);
+  const entry = `stale-client: ${source} build ${otherBuild} differs from this page's build ${BUILD_ID}`;
+  console.warn('[Aside]', entry);
+  if (runtime) {
+    appendPanelLog(runtime, entry);
+  }
+  notifyAside('Aside was updated. Reload this page so it runs the current build.');
 }
 
 function hasRuntimeAccess(): boolean {
@@ -730,6 +780,12 @@ async function listPanelRecords(): Promise<PanelListedRecord[]> {
   }
   if (response.sessionUnavailable) {
     sessionStorageUsable = false;
+  }
+  if (response.buildId) {
+    workerBuildId = response.buildId;
+    if (response.buildId !== BUILD_ID) {
+      reportStaleClient(null, 'service worker', response.buildId);
+    }
   }
   return response.records;
 }
@@ -1307,14 +1363,14 @@ function ensureStyles(): void {
       align-items: flex-start;
       justify-content: space-between;
       gap: 12px;
-      padding: 18px 18px 14px;
+      padding: 12px 16px 10px;
       border-bottom: 1px solid var(--sb-border, rgba(15, 23, 42, 0.08));
       background: var(--sb-panel-header-bg, rgba(249, 250, 251, 0.95));
     }
 
     .aside-panel-heading h2 {
       margin: 0;
-      font: 700 18px/1.18 ui-sans-serif, system-ui, sans-serif;
+      font: 700 16px/1.2 ui-sans-serif, system-ui, sans-serif;
       color: var(--sb-text, #111827);
     }
 
@@ -1333,9 +1389,80 @@ function ensureStyles(): void {
     .aside-panel-actions {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       flex-wrap: wrap;
       justify-content: flex-end;
+    }
+
+    /* Diagnostics live behind one disclosure so a failed panel is not a wall of buttons. */
+    .aside-panel-more {
+      position: relative;
+    }
+    .aside-panel-more summary {
+      list-style: none;
+      cursor: pointer;
+      border-radius: 999px;
+      padding: 9px 12px;
+      font: 600 13px/1 ui-sans-serif, system-ui, sans-serif;
+      border: 1px solid var(--sb-border, rgba(15, 23, 42, 0.08));
+      background: var(--sb-surface-bg, rgba(248, 250, 252, 0.96));
+      color: var(--sb-text, #111827);
+      user-select: none;
+    }
+    .aside-panel-more summary::-webkit-details-marker {
+      display: none;
+    }
+    .aside-panel-more-menu {
+      position: absolute;
+      right: 0;
+      top: calc(100% + 6px);
+      z-index: 2;
+      display: grid;
+      gap: 6px;
+      min-width: 170px;
+      padding: 8px;
+      border-radius: 12px;
+      border: 1px solid var(--sb-border, rgba(15, 23, 42, 0.08));
+      background: var(--sb-panel-bg, rgba(255, 255, 255, 0.98));
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.14);
+    }
+    .aside-panel-more-menu button {
+      width: 100%;
+      text-align: left;
+    }
+
+    /* Recovery for a private mode that could not be verified: near the question, short. */
+    .aside-recovery {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px 18px 0;
+    }
+    .aside-recovery[hidden],
+    .aside-recovery-confirm[hidden] {
+      display: none !important;
+    }
+    .aside-recovery p {
+      margin: 0;
+      font: 500 13px/1.45 ui-sans-serif, system-ui, sans-serif;
+      color: var(--sb-muted, #6b7280);
+    }
+    .aside-recovery-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .aside-recovery-confirm {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px;
+      border-radius: 12px;
+      border: 1px solid var(--sb-border, rgba(15, 23, 42, 0.08));
+      background: var(--sb-surface-bg, rgba(248, 250, 252, 0.96));
+    }
+    .aside-recovery-confirm p {
+      color: var(--sb-text, #111827);
     }
 
     .aside-panel-actions button,
@@ -1386,10 +1513,20 @@ function ensureStyles(): void {
       margin: 0;
       color: var(--sb-text, #111827);
       font: 500 14px/1.45 ui-sans-serif, system-ui, sans-serif;
+      /* Structured text: equation source and code keep their line breaks. */
+      white-space: pre-wrap;
+      word-break: break-word;
       display: -webkit-box;
       -webkit-box-orient: vertical;
       -webkit-line-clamp: 5;
       overflow: hidden;
+      cursor: pointer;
+    }
+    .aside-focus p[data-expanded="true"] {
+      display: block;
+      -webkit-line-clamp: unset;
+      max-height: 40vh;
+      overflow: auto;
     }
 
     .aside-launcher {
@@ -2900,7 +3037,10 @@ function createDraftState(selection: SelectionPayload, options: CreateDraftOptio
     rootProjectUrl: getNonRootContainerUrl(hostChatUrl),
     selection,
     context: createContextForSelection(selection),
-    focusPreview: clipText(selection.selectedText, 280),
+    // The preview is the structured selection — equation source, code, lists —
+    // never the whitespace-normalized anchor text, which exists only to find the
+    // passage again and flattens sub/superscripts and operators.
+    focusPreview: clipText(selection.structuredSelectedText || selection.selectedText, 400),
     branchKind: options.branchKind,
     entryAction: options.entryAction,
     surfaceMode: options.preferredSurface ?? 'embedded',
@@ -3049,6 +3189,15 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   const openTabHeaderButton = document.createElement('button');
   openTabHeaderButton.type = 'button';
   openTabHeaderButton.textContent = 'Open branch';
+  // Diagnostics sit behind one "More" disclosure: they are for a maintainer, and a
+  // failed panel should read as one error and a way forward, not six buttons.
+  const moreDetails = document.createElement('details');
+  moreDetails.className = 'aside-panel-more';
+  const moreSummary = document.createElement('summary');
+  moreSummary.textContent = 'More';
+  moreSummary.title = 'Diagnostics';
+  const moreMenu = document.createElement('div');
+  moreMenu.className = 'aside-panel-more-menu';
   const copyLogButton = document.createElement('button');
   copyLogButton.type = 'button';
   copyLogButton.textContent = 'Copy log';
@@ -3059,21 +3208,66 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   copyLogWithContentButton.textContent = 'Copy log + text';
   copyLogWithContentButton.title =
     'Copy the diagnostic report including your selected text and the generated prompt.';
+  const selectLogMenuButton = document.createElement('button');
+  selectLogMenuButton.type = 'button';
+  selectLogMenuButton.textContent = 'Select log';
+  selectLogMenuButton.title = 'Show the redacted diagnostic report in the panel, selected for copying.';
+  moreMenu.append(copyLogButton, copyLogWithContentButton, selectLogMenuButton);
+  moreDetails.append(moreSummary, moreMenu);
   const minimizeButton = document.createElement('button');
   minimizeButton.type = 'button';
   minimizeButton.textContent = 'Minimize';
   const closeButton = document.createElement('button');
   closeButton.type = 'button';
   closeButton.textContent = 'Close';
-  actions.append(
-    jumpButton,
-    openTabHeaderButton,
-    copyLogButton,
-    copyLogWithContentButton,
-    minimizeButton,
-    closeButton
-  );
+  actions.append(jumpButton, openTabHeaderButton, minimizeButton, moreDetails, closeButton);
   header.append(headingWrap, actions);
+
+  // Recovery for a private mode that stopped short: what to do in the branch
+  // window, and the three ways forward. Ordinary mode is a deliberate two-step
+  // choice, never a fallback Aside takes on its own.
+  const recoveryEl = document.createElement('div');
+  recoveryEl.className = 'aside-recovery';
+  recoveryEl.hidden = true;
+  const recoveryText = document.createElement('p');
+  const recoveryActions = document.createElement('div');
+  recoveryActions.className = 'aside-recovery-actions';
+  const showTargetButton = document.createElement('button');
+  showTargetButton.type = 'button';
+  showTargetButton.className = 'aside-panel-secondary';
+  showTargetButton.textContent = 'Show branch window';
+  showTargetButton.dataset.asideRole = 'recovery-show-target';
+  const checkAgainButton = document.createElement('button');
+  checkAgainButton.type = 'button';
+  checkAgainButton.className = 'aside-panel-primary';
+  checkAgainButton.textContent = 'Check again';
+  checkAgainButton.dataset.asideRole = 'recovery-check-again';
+  checkAgainButton.title = `Look at the same branch window again and, if ${provider.privacy.label} is on, send the question there.`;
+  const ordinaryButton = document.createElement('button');
+  ordinaryButton.type = 'button';
+  ordinaryButton.className = 'aside-panel-secondary';
+  ordinaryButton.textContent = 'Use ordinary mode…';
+  ordinaryButton.dataset.asideRole = 'recovery-ordinary';
+  recoveryActions.append(showTargetButton, checkAgainButton, ordinaryButton);
+  const ordinaryConfirmEl = document.createElement('div');
+  ordinaryConfirmEl.className = 'aside-recovery-confirm';
+  ordinaryConfirmEl.hidden = true;
+  const ordinaryConfirmText = document.createElement('p');
+  ordinaryConfirmText.textContent = `Send this question as an ordinary ${provider.label} chat instead? It will not use ${provider.privacy.label}: ${provider.label} keeps it in your history and Aside keeps a saved record.`;
+  const ordinaryConfirmActions = document.createElement('div');
+  ordinaryConfirmActions.className = 'aside-recovery-actions';
+  const ordinaryConfirmButton = document.createElement('button');
+  ordinaryConfirmButton.type = 'button';
+  ordinaryConfirmButton.className = 'aside-panel-primary';
+  ordinaryConfirmButton.textContent = 'Send as ordinary chat';
+  ordinaryConfirmButton.dataset.asideRole = 'recovery-ordinary-confirm';
+  const ordinaryCancelButton = document.createElement('button');
+  ordinaryCancelButton.type = 'button';
+  ordinaryCancelButton.className = 'aside-panel-secondary';
+  ordinaryCancelButton.textContent = `Keep ${provider.privacy.label}`;
+  ordinaryConfirmActions.append(ordinaryConfirmButton, ordinaryCancelButton);
+  ordinaryConfirmEl.append(ordinaryConfirmText, ordinaryConfirmActions);
+  recoveryEl.append(recoveryText, recoveryActions, ordinaryConfirmEl);
 
   const body = document.createElement('div');
   body.className = 'aside-panel-body';
@@ -3083,6 +3277,10 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   const focusLabel = document.createElement('small');
   focusLabel.textContent = 'Selected local focus';
   const focusTextEl = document.createElement('p');
+  focusTextEl.title = 'Click to expand or collapse the selected passage';
+  focusTextEl.addEventListener('click', () => {
+    focusTextEl.dataset.expanded = focusTextEl.dataset.expanded === 'true' ? 'false' : 'true';
+  });
   focus.append(focusLabel, focusTextEl);
 
   const formEl = document.createElement('form');
@@ -3128,6 +3326,11 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   provider.privacy.constraints.forEach((constraint) => {
     const item = document.createElement('li');
     item.textContent = constraint;
+    // The container warning above says this in one bold line when it applies;
+    // the bullet is then hidden rather than said twice.
+    if (/project/i.test(constraint)) {
+      item.dataset.topic = 'project';
+    }
     privacyNoteList.append(item);
   });
   privacyNoteEl.append(
@@ -3240,7 +3443,7 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   debugLogActions.append(selectDebugLogButton, closeDebugLogButton);
   debugLogShell.append(debugLogTitle, debugLogHelp, debugLogTextarea, debugLogActions);
 
-  body.append(focus, contextShell, archiveEl, formEl, iframeShell, debugLogShell);
+  body.append(focus, contextShell, archiveEl, recoveryEl, formEl, iframeShell, debugLogShell);
   element.append(header, body);
   mountInExtensionHost(element);
 
@@ -3276,8 +3479,16 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     debugLogTextarea,
     copyLogButton,
     openTabHeaderButton,
+    moreDetails,
+    recoveryEl,
+    recoveryText,
+    showTargetButton,
+    checkAgainButton,
+    ordinaryButton,
+    ordinaryConfirmEl,
     frameReady: false,
-    frameStartSent: false
+    frameStartSent: false,
+    showTargetWhileFailed: false
   };
 
   questionInput.value = state.initialQuestion ?? '';
@@ -3304,10 +3515,33 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     void openBranchInNewTab(runtime.state.panelId);
   });
   copyLogButton.addEventListener('click', () => {
+    moreDetails.open = false;
     void copyBranchDebugLog(runtime.state.panelId, false);
   });
   copyLogWithContentButton.addEventListener('click', () => {
+    moreDetails.open = false;
     void copyBranchDebugLog(runtime.state.panelId, true);
+  });
+  selectLogMenuButton.addEventListener('click', () => {
+    moreDetails.open = false;
+    showCopyableDebugLog(runtime, buildBranchDebugLogText(runtime, false));
+  });
+  showTargetButton.addEventListener('click', () => {
+    void showBranchTarget(runtime.state.panelId);
+  });
+  checkAgainButton.addEventListener('click', () => {
+    void checkPrivateModeAgain(runtime.state.panelId);
+  });
+  ordinaryButton.addEventListener('click', () => {
+    ordinaryConfirmEl.hidden = false;
+    ordinaryConfirmButton.focus();
+  });
+  ordinaryCancelButton.addEventListener('click', () => {
+    ordinaryConfirmEl.hidden = true;
+  });
+  ordinaryConfirmButton.addEventListener('click', () => {
+    ordinaryConfirmEl.hidden = true;
+    void useOrdinaryModeInstead(runtime.state.panelId);
   });
   selectDebugLogButton.addEventListener('click', () => {
     debugLogTextarea.focus();
@@ -3510,6 +3744,8 @@ function buildPlanForPanel(runtime: PanelRuntime, question?: string): ContextPla
       .filter((message) => !message.partial)
       .map((message) => ({ role: message.role, text: message.text })),
     unavailableReferences: [],
+    enclosingEquations: state.selection.enclosingEquations ?? [],
+    fidelityLimitations: state.selection.fidelity?.limitations ?? [],
     maxChars: DEFAULT_MAX_CONTEXT_CHARS
   };
   return buildContextPlan(input);
@@ -3640,7 +3876,10 @@ function syncPanelUI(runtime: PanelRuntime): void {
   const showOpenBranch = Boolean(
     state.branchChatUrl || state.launchTabId || state.launchWindowId
   );
-  const overlayVisible = state.status !== 'live';
+  // A private preparation that stopped short is recoverable on the same target,
+  // so its frame is kept alive but not shown as a blank "live" surface.
+  const recovery = state.status === 'failed' ? state.recovery : undefined;
+  const overlayVisible = state.status !== 'live' && !recovery;
 
   runtime.element.hidden = state.minimized;
   runtime.titleEl.textContent = getDisplayTitle(state);
@@ -3665,17 +3904,16 @@ function syncPanelUI(runtime: PanelRuntime): void {
   runtime.privacyNoteEl.hidden = !privacyNoteVisible;
 
   // Losing the project's files and instructions is a real change to what the
-  // branch can see. Say it before the branch is sent, not after.
+  // branch can see. It is said once, as the summary line's own warning, and the
+  // note stays collapsed: the Owner opens it, Aside does not open it for them.
   const leavesContainer = privateBranchLeavesContainer(state);
   runtime.privacyContainerWarning.hidden = !(privacyNoteVisible && leavesContainer);
-  if (privacyNoteVisible && leavesContainer) {
-    runtime.privacyNoteEl.open = true;
-  }
+  runtime.privacyNoteEl
+    .querySelectorAll<HTMLLIElement>('li[data-topic="project"]')
+    .forEach((item) => {
+      item.hidden = privacyNoteVisible && leavesContainer;
+    });
   runtime.privacyStorageWarning.hidden = sessionStorageUsable;
-  if (privacyNoteVisible && !sessionStorageUsable) {
-    // A limitation the user needs before choosing, not one they have to open.
-    runtime.privacyNoteEl.open = true;
-  }
   runtime.persistentKindButton.dataset.selected = String(state.branchKind === 'persistent');
   runtime.temporaryKindButton.dataset.selected = String(state.branchKind === 'temporary');
   runtime.questionInput.disabled = !showForm;
@@ -3690,8 +3928,21 @@ function syncPanelUI(runtime: PanelRuntime): void {
     ? 'The passage and question alone exceed the size limit. Select a smaller passage.'
     : '';
   runtime.submitButton.textContent = state.status === 'failed' ? 'Try again' : 'Start branch';
-  runtime.iframeShell.hidden = !showFrame;
+  runtime.iframeShell.hidden = !showFrame || (Boolean(recovery) && !runtime.showTargetWhileFailed);
   runtime.iframeOverlay.hidden = !overlayVisible;
+
+  runtime.recoveryEl.hidden = !recovery;
+  if (recovery) {
+    runtime.recoveryText.textContent = describeRecoveryHint(recovery);
+    runtime.showTargetButton.hidden = !recovery.offerShowTarget;
+    runtime.checkAgainButton.hidden = !recovery.offerCheckAgain;
+    runtime.ordinaryButton.hidden = !recovery.offerOrdinaryMode || state.branchKind !== 'temporary';
+    if (runtime.ordinaryButton.hidden) {
+      runtime.ordinaryConfirmEl.hidden = true;
+    }
+  } else {
+    runtime.ordinaryConfirmEl.hidden = true;
+  }
   runtime.iframeOverlayTitle.textContent =
     state.surfaceMode === 'native_window'
       ? state.status === 'failed'
@@ -3704,10 +3955,8 @@ function syncPanelUI(runtime: PanelRuntime): void {
       : state.status === 'live'
         ? ''
         : 'Opening branch in this window';
-  runtime.iframeOverlayText.textContent =
-    state.status === 'failed'
-      ? state.errorMessage ?? state.statusLabel
-      : state.statusLabel;
+  // The error is said once, by the heading; the overlay carries only the status.
+  runtime.iframeOverlayText.textContent = state.statusLabel;
   runtime.openTabHeaderButton.style.display = showOpenBranch ? 'inline-flex' : 'none';
   if (state.status === 'live') {
     ensureLiveFrameLocation(runtime);
@@ -3877,7 +4126,8 @@ function createStateFromRestore(raw: BranchPanelState): BranchPanelState | null 
     closedView: raw.closedView === true,
     archiveOnly: raw.archiveOnly === true,
     archive: sanitizeArchive(raw.archive),
-    focusPreview: raw.focusPreview || clipText(raw.selection.selectedText, 280),
+    focusPreview:
+      raw.focusPreview || clipText(raw.selection.structuredSelectedText || raw.selection.selectedText, 400),
     branchKind,
     entryAction,
     surfaceMode,
@@ -3891,6 +4141,8 @@ function createStateFromRestore(raw: BranchPanelState): BranchPanelState | null 
     minimized: Boolean(raw.minimized),
     initialQuestion: raw.initialQuestion,
     initialPrompt: raw.initialPrompt,
+    // Validated as data: a stored record is no more trusted than a message.
+    recovery: status === 'failed' && isPrivacyRecovery(raw.recovery) ? raw.recovery : undefined,
     status,
     statusLabel:
       raw.statusLabel ||
@@ -4149,8 +4401,23 @@ function buildBranchDebugLogText(runtime: PanelRuntime, includeContent = false):
       ? 'CONTAINS YOUR CONTENT: the selected text and the first prompt are included below.'
       : 'Content is redacted. Use "Copy log + text" if a maintainer needs the selected text and prompt.',
     `build: ${BUILD_ID}`,
+    `workerBuild: ${workerBuildId ?? '(not reported)'}`,
+    `frameBuild: ${runtime.frameBuildId ?? '(none)'}`,
     `provider: ${provider.id}`,
     `branchPrivacy: ${state.branchKind === 'temporary' ? provider.privacy.label : 'persistent'}`,
+    `privateModeRecovery: ${
+      state.recovery
+        ? JSON.stringify({
+            step: state.recovery.step,
+            availability: state.recovery.availability,
+            mode: state.recovery.mode,
+            evidence: state.recovery.evidence,
+            nextAction: state.recovery.nextAction,
+            control: state.recovery.control,
+            reportedBy: state.recovery.buildId ?? null
+          })
+        : '(none)'
+    }`,
     `generatedAt: ${new Date().toISOString()}`,
     `panelId: ${state.panelId}`,
     `rootChatUrl: ${state.rootChatUrl}`,
@@ -4296,17 +4563,35 @@ function loadEmbeddedBranchFrame(runtime: PanelRuntime, launchUrl: string): void
   // Retrying reuses the same iframe, and the cache-busting differs only in the fragment.
   // A fragment-only src change is a same-document navigation: no load event, so the frame
   // never posts SB_FRAME_READY again and the retry would sit there until the watchdog.
-  // Going through about:blank forces a real document load.
-  if (previousSrc && previousSrc !== 'about:blank') {
-    runtime.iframeEl.src = 'about:blank';
-  }
-
-  window.setTimeout(() => {
+  // Going through about:blank forces a real document load — but only once about:blank
+  // has actually committed. Setting the new src on a zero timeout raced that commit:
+  // the provider document was still current, the change was fragment-only, and the
+  // switch from a private draft to an ordinary send sat on the handshake watchdog.
+  const setTarget = () => {
     if (panelRuntimes.get(runtime.state.panelId) !== runtime) {
       return;
     }
     runtime.iframeEl.src = iframeUrl;
-  }, 0);
+  };
+
+  if (previousSrc && previousSrc !== 'about:blank') {
+    let pending = true;
+    const proceed = () => {
+      if (!pending) {
+        return;
+      }
+      pending = false;
+      runtime.iframeEl.removeEventListener('load', proceed);
+      setTarget();
+    };
+    runtime.iframeEl.addEventListener('load', proceed);
+    runtime.iframeEl.src = 'about:blank';
+    // about:blank normally commits within a frame; if the load event never comes,
+    // proceed anyway rather than hang.
+    window.setTimeout(proceed, 600);
+  } else {
+    window.setTimeout(setTarget, 0);
+  }
 
   appendPanelLog(runtime, 'Loading embedded branch frame', {
     targetUrl: launchUrl,
@@ -4460,12 +4745,36 @@ function handleEmbeddedFrameMessage(event: MessageEvent<FrameIncomingMessage>): 
 
   if (data.type === 'SB_FRAME_READY') {
     runtime.frameReady = true;
+    runtime.frameBuildId = typeof data.buildId === 'string' ? data.buildId : undefined;
+    if (runtime.frameBuildId && runtime.frameBuildId !== BUILD_ID) {
+      reportStaleClient(runtime, 'branch frame', runtime.frameBuildId);
+    }
     appendPanelLog(runtime, 'Embedded branch frame ready', {
       currentUrl: data.currentUrl,
+      frameBuild: runtime.frameBuildId ?? null,
       panelStatus: runtime.state.status,
       hasPendingPrompt: Boolean(runtime.pendingFramePrompt),
+      lastPreparationStep: runtime.lastPreparationStep ?? null,
       iframeSrc: runtime.iframeEl.src
     });
+
+    // A new document under a start that was already delivered: the provider
+    // navigated while a private mode was being prepared (Claude opens incognito
+    // as a new page). Only while the last reported step was before anything was
+    // typed is the pending prompt delivered again — a resume can never resend.
+    if (
+      runtime.frameStartSent &&
+      runtime.pendingFramePrompt &&
+      runtime.state.status === 'opening_branch' &&
+      runtime.lastPreparationStep &&
+      runtime.lastPreparationStep !== 'ready' &&
+      runtime.lastPreparationStep !== 'failed'
+    ) {
+      appendPanelLog(runtime, 'Branch frame navigated during private-mode preparation; resuming on the new document', {
+        lastPreparationStep: runtime.lastPreparationStep
+      });
+      runtime.frameStartSent = false;
+    }
     tryDispatchPendingFrameStart(runtime);
     return;
   }
@@ -4661,7 +4970,8 @@ function installRuntimeMessageListener(): void {
       if (!isRunBranchPromptRequest(message)) {
         sendResponse({
           ok: false,
-          reason: 'The branch run request was malformed and was not started.'
+          reason: 'The branch run request was malformed and was not started.',
+          buildId: BUILD_ID
         });
         return false;
       }
@@ -4669,13 +4979,14 @@ function installRuntimeMessageListener(): void {
       if (automationTaskRunning) {
         sendResponse({
           ok: false,
-          reason: `Another branch automation is already running in this ${provider.label} window.`
+          reason: `Another branch automation is already running in this ${provider.label} window.`,
+          buildId: BUILD_ID
         });
         return false;
       }
 
       void runBranchPromptAutomation(message, 'background');
-      sendResponse({ ok: true });
+      sendResponse({ ok: true, buildId: BUILD_ID });
       return false;
     }
 
@@ -4763,6 +5074,15 @@ async function startBranch(panelId: string, question: string): Promise<void> {
   const canEmbed =
     runtime.state.preferredSurface !== 'native_window' &&
     surfaceMayBeAttempted(provider.surfaces.embedded, embeddedSurfaceObservation);
+  // Try again after a private preparation stopped short: the frame the Owner may
+  // just have fixed is the one to use. Same target, no navigation, new attempt.
+  const reuseFrame =
+    canEmbed &&
+    runtime.state.status === 'failed' &&
+    Boolean(runtime.state.recovery) &&
+    runtime.state.surfaceMode === 'embedded' &&
+    runtime.frameReady &&
+    runtime.state.launchUrl === launchUrl;
   if (!canEmbed && !surfaceMayBeAttempted(provider.surfaces.nativeWindow)) {
     // Neither surface is available: say so rather than opening a window that
     // cannot be driven and timing out on the watchdog.
@@ -4793,10 +5113,13 @@ async function startBranch(panelId: string, question: string): Promise<void> {
     ? `Loading the embedded ${provider.label} branch window...`
     : `Opening a ${provider.label} window for this branch...`;
   runtime.state.errorMessage = undefined;
+  runtime.state.recovery = undefined;
+  runtime.lastPreparationStep = undefined;
+  runtime.showTargetWhileFailed = false;
   runtime.state.updatedAt = Date.now();
   persistLastUsedBranchKind(runtime.state.branchKind);
   runtime.pendingFramePrompt = canEmbed ? prompt : undefined;
-  runtime.frameReady = false;
+  runtime.frameReady = reuseFrame ? runtime.frameReady : false;
   runtime.frameStartSent = false;
 
   // Persist the intent before the external action: the exact prompt is frozen
@@ -4805,16 +5128,184 @@ async function startBranch(panelId: string, question: string): Promise<void> {
   await freezeSnapshotForPanel(runtime, plan, prompt, question);
 
   minimizeOtherPanels(panelId);
-  if (canEmbed) {
+  if (canEmbed && !reuseFrame) {
     loadEmbeddedBranchFrame(runtime, launchUrl);
+  }
+  if (reuseFrame) {
+    appendPanelLog(runtime, 'Retrying in the existing branch frame', {
+      launchUrl,
+      frameBuild: runtime.frameBuildId ?? null
+    });
   }
   syncPanelUI(runtime);
   renderTabs();
   persistPanels();
 
+  if (reuseFrame) {
+    tryDispatchPendingFrameStart(runtime);
+    return;
+  }
+
   if (!canEmbed) {
     await openBranchInDrivenWindow(runtime, prompt, launchUrl);
   }
+}
+
+/** One line under the error: what to do in the branch window before Check again. */
+function describeRecoveryHint(recovery: PrivacyRecovery): string {
+  const label = provider.privacy.label;
+  switch (recovery.nextAction) {
+    case 'choose-personalization':
+      return 'Make the choice in the branch window, then Check again.';
+    case 'sign-in':
+      return 'Sign in inside the branch window, then Check again.';
+    case 'wait-for-page':
+      return 'Wait for the branch window to load, then Check again.';
+    default:
+      return recovery.step === 'blocked'
+        ? `Check again after moving to a chat where ${label} is allowed, or send as an ordinary chat.`
+        : `Turn on ${label} in the branch window, then Check again.`;
+  }
+}
+
+/**
+ * Re-observe the SAME branch document and, if the mode verifies, send the pending
+ * prompt there. The frame is not reloaded and no window is opened: the target the
+ * Owner may just have fixed is the target checked.
+ */
+async function checkPrivateModeAgain(panelId: string): Promise<void> {
+  const runtime = panelRuntimes.get(panelId);
+  if (!runtime || runtime.state.status !== 'failed' || !runtime.state.recovery) {
+    return;
+  }
+
+  const attempt = currentAttemptRef(runtime);
+  const prompt = runtime.pendingFramePrompt ?? runtime.state.initialPrompt;
+  const question = runtime.questionInput.value.trim() || runtime.state.initialQuestion?.trim() || '';
+  if (!attempt || !prompt || !runtime.state.launchUrl) {
+    // Nothing to resume on this target: run it as a fresh attempt instead.
+    appendPanelLog(runtime, 'Check again had no resumable attempt; starting the branch again');
+    if (question) {
+      await startBranch(panelId, question);
+    }
+    return;
+  }
+
+  appendPanelLog(runtime, 'Check again requested', {
+    previousStep: runtime.state.recovery.step,
+    surfaceMode: runtime.state.surfaceMode,
+    frameReady: runtime.frameReady
+  });
+  runtime.state.status = 'opening_branch';
+  runtime.state.creationMode =
+    runtime.state.branchKind === 'temporary' ? 'local_temporary' : 'local_persistent';
+  runtime.state.statusLabel = `Checking ${provider.privacy.label} again in the branch window…`;
+  runtime.state.errorMessage = undefined;
+  runtime.state.recovery = undefined;
+  runtime.lastPreparationStep = undefined;
+  runtime.showTargetWhileFailed = false;
+  runtime.state.updatedAt = Date.now();
+  syncPanelUI(runtime);
+  persistPanels();
+
+  if (runtime.state.surfaceMode === 'embedded') {
+    runtime.pendingFramePrompt = prompt;
+    runtime.frameStartSent = false;
+    if (runtime.frameReady) {
+      tryDispatchPendingFrameStart(runtime);
+    } else {
+      // The frame document is gone (page reload, or a navigation not finished
+      // yet): load the same target again and continue when it reports ready.
+      loadEmbeddedBranchFrame(runtime, runtime.state.launchUrl);
+    }
+    return;
+  }
+
+  startPanelWatchdog(
+    runtime,
+    BRANCH_RESPONSE_TIMEOUT_MS,
+    `The ${provider.label} branch window stopped reporting back. Use Open branch to check it directly, or try again.`
+  );
+  const response = await recheckBranchInTab(attempt);
+  if (response.buildId && response.buildId !== BUILD_ID) {
+    reportStaleClient(runtime, 'branch tab', response.buildId);
+  }
+  if (!response.ok) {
+    clearPanelWatchdog(runtime);
+    appendPanelLog(runtime, 'Check again could not reach the branch window', { reason: response.reason });
+    applyBranchPanelEvent(runtime, {
+      kind: 'failed',
+      reason: response.reason ?? `The ${provider.label} branch window could not be checked again. Use Try again.`
+    });
+  }
+}
+
+async function recheckBranchInTab(attempt: BranchAttemptRef): Promise<RecheckBranchInTabResponse> {
+  if (!hasRuntimeAccess()) {
+    return { ok: false, reason: 'Chrome extension runtime is unavailable.' };
+  }
+  try {
+    return (await chrome.runtime.sendMessage({
+      type: 'RECHECK_BRANCH_IN_TAB',
+      ...attempt
+    } satisfies RecheckBranchInTabMessage)) as RecheckBranchInTabResponse;
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** Bring the branch document into view so the Owner can act in it. */
+async function showBranchTarget(panelId: string): Promise<void> {
+  const runtime = panelRuntimes.get(panelId);
+  if (!runtime) {
+    return;
+  }
+  appendPanelLog(runtime, 'Show branch window requested', { surfaceMode: runtime.state.surfaceMode });
+  if (runtime.state.surfaceMode === 'embedded') {
+    runtime.showTargetWhileFailed = true;
+    syncPanelUI(runtime);
+    runtime.iframeShell.scrollIntoView({ block: 'nearest' });
+    runtime.iframeEl.focus();
+    return;
+  }
+  const response = await focusNativeBranchWindow({
+    panelId,
+    launchTabId: runtime.state.launchTabId,
+    launchWindowId: runtime.state.launchWindowId
+  });
+  if (!response.ok) {
+    runtime.state.statusLabel = response.reason ?? `The ${provider.label} branch window could not be shown.`;
+    runtime.state.updatedAt = Date.now();
+    syncPanelUI(runtime);
+  }
+}
+
+/**
+ * The Owner's explicit choice to send as an ordinary chat after a private mode
+ * could not be verified. Only reached through the confirmation step; the draft
+ * becomes durable here and only here.
+ */
+async function useOrdinaryModeInstead(panelId: string): Promise<void> {
+  const runtime = panelRuntimes.get(panelId);
+  if (!runtime || runtime.state.branchKind !== 'temporary') {
+    return;
+  }
+  const question = runtime.questionInput.value.trim() || runtime.state.initialQuestion?.trim() || '';
+  if (!question) {
+    return;
+  }
+  appendPanelLog(runtime, 'Owner chose ordinary mode after private-mode preparation stopped', {
+    previousStep: runtime.state.recovery?.step ?? null
+  });
+  runtime.state.branchKind = 'persistent';
+  runtime.state.recovery = undefined;
+  runtime.state.updatedAt = Date.now();
+  persistLastUsedBranchKind('persistent');
+  syncPanelUI(runtime);
+  if (!runtime.state.questionId) {
+    await registerQuestionForPanel(runtime);
+  }
+  await startBranch(panelId, question);
 }
 
 /**
@@ -4888,6 +5379,30 @@ function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): 
       persistPanelsSoon(runtime.state.panelId);
       return;
 
+    case 'preparation': {
+      const recovery = event.recovery;
+      runtime.lastPreparationStep = recovery.step;
+      if (recovery.buildId && recovery.buildId !== BUILD_ID) {
+        reportStaleClient(runtime, 'branch document', recovery.buildId);
+      }
+      appendPanelLog(runtime, 'Private-mode preparation', {
+        step: recovery.step,
+        availability: recovery.availability,
+        mode: recovery.mode,
+        evidence: recovery.evidence,
+        nextAction: recovery.nextAction,
+        control: recovery.control
+      });
+      if (runtime.state.status === 'opening_branch' || runtime.state.status === 'creating_branch') {
+        runtime.state.status = 'opening_branch';
+        runtime.state.statusLabel = describePreparationStep(recovery, provider.privacy.label);
+        runtime.state.updatedAt = Date.now();
+        syncPanelUI(runtime);
+        persistPanelsSoon(runtime.state.panelId);
+      }
+      return;
+    }
+
     case 'title':
       // Titles are local now. A legacy answer that still carries the old marker
       // is logged and otherwise ignored, so the Owner's title is never replaced.
@@ -4897,6 +5412,9 @@ function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): 
     case 'live':
       clearPanelWatchdog(runtime);
       runtime.pendingFramePrompt = undefined;
+      runtime.state.recovery = undefined;
+      runtime.showTargetWhileFailed = false;
+      runtime.lastPreparationStep = undefined;
       runtime.state.launchTabId = event.launchTabId ?? runtime.state.launchTabId;
       runtime.state.launchWindowId = event.launchWindowId ?? runtime.state.launchWindowId;
       runtime.state.branchChatUrl = event.branchChatUrl
@@ -4972,11 +5490,24 @@ function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): 
         return;
       }
 
-      runtime.pendingFramePrompt = undefined;
+      if (event.buildId && event.buildId !== BUILD_ID) {
+        reportStaleClient(runtime, 'branch document', event.buildId);
+      }
+      if (event.recovery) {
+        // Preparation stopped before anything was typed. The pending prompt and
+        // the target stay, so Check again can continue exactly there.
+        runtime.state.recovery = event.recovery;
+        runtime.lastPreparationStep = 'failed';
+      } else {
+        runtime.pendingFramePrompt = undefined;
+        runtime.state.recovery = undefined;
+      }
+      runtime.showTargetWhileFailed = false;
       runtime.state.status = 'failed';
       runtime.state.creationMode = 'failed';
-      runtime.state.statusLabel =
-        runtime.state.surfaceMode === 'native_window'
+      runtime.state.statusLabel = event.recovery
+        ? 'This branch was not sent.'
+        : runtime.state.surfaceMode === 'native_window'
           ? `${provider.label} branch creation failed.`
           : 'Local branch creation failed.';
       runtime.state.errorMessage = event.reason;
@@ -6155,105 +6686,161 @@ async function ensurePersistentChatMode(
   );
 }
 
+const PRIVATE_PREPARATION_BUDGET_MS = 12_000;
+const PRIVATE_VERIFY_BUDGET_MS = 4_000;
+
+function observePrivateModeHere(
+  composer?: HTMLElement | HTMLTextAreaElement | null
+): PrivacyObservation {
+  return observePrivateMode({
+    document,
+    composer: provider.composer,
+    transcript: provider.transcript,
+    composerElement: composer ?? null,
+    label: provider.privacy.label
+  });
+}
+
+function recoveryFromObservation(observation: PrivacyObservation): PrivacyRecovery {
+  return summarizeObservation(observation, provider.privacy.label, BUILD_ID);
+}
+
+/** Log the observation (attributes only) and tell the panel which step this is. */
+async function reportPreparation(observation: PrivacyObservation, note: string): Promise<PrivacyRecovery> {
+  const recovery = recoveryFromObservation(observation);
+  recordAutomationLog(note, {
+    step: recovery.step,
+    availability: recovery.availability,
+    mode: recovery.mode,
+    evidence: recovery.evidence,
+    nextAction: recovery.nextAction,
+    control: recovery.control
+  });
+  await sendAutomationEvent({ kind: 'preparation', recovery });
+  return recovery;
+}
+
+async function waitForPrivateObservation(
+  composer: HTMLElement | HTMLTextAreaElement | null | undefined,
+  budgetMs: number,
+  settled: (observation: PrivacyObservation) => boolean
+): Promise<PrivacyObservation> {
+  const deadline = Date.now() + budgetMs;
+  let latest = observePrivateModeHere(composer);
+  while (!settled(latest) && Date.now() < deadline) {
+    await sleep(200);
+    latest = observePrivateModeHere(composer);
+  }
+  return latest;
+}
+
+/**
+ * Prepare the provider's private mode as a bounded workflow over typed
+ * observations: open a menu when the control is behind one, activate the
+ * control when it reports inactive, stop at a chooser dialog, and count only
+ * provider-owned evidence as verification. Every stop is reported with where it
+ * stopped, and nothing is typed on any path that does not end in `ready`.
+ */
 async function ensureTemporaryChatMode(
   composer: HTMLElement | HTMLTextAreaElement
 ): Promise<void> {
   const label = provider.privacy.label;
-  const directActiveControl = findDirectTemporaryChatControl(composer, 'active');
-  const directAnyControl = directActiveControl ?? findDirectTemporaryChatControl(composer, 'any');
-  const candidates = getRankedTemporaryChatControls(composer);
-  recordAutomationLog('Detected private-mode controls for private branch', {
-    privacyLabel: label,
-    directActiveControl: directActiveControl
-      ? describeTemporaryChatCandidate(directActiveControl, composer)
-      : null,
-    directAnyControl: directAnyControl ? describeTemporaryChatCandidate(directAnyControl, composer) : null,
-    candidates: candidates
-      .slice(0, 8)
-      .map((entry) => describeTemporaryChatCandidate(entry.candidate, composer, entry.score))
-  });
+  const deadline = Date.now() + PRIVATE_PREPARATION_BUDGET_MS;
+  let menuOpenings = 0;
+  let activations = 0;
+  let lastReported = '';
 
-  const primaryCandidate = directActiveControl ?? directAnyControl ?? candidates[0]?.candidate ?? null;
-  const primaryScore = primaryCandidate ? scoreTemporaryChatCandidate(primaryCandidate, composer) : undefined;
-
-  if (!primaryCandidate) {
-    throw new PrivacyNotVerifiedError(
-      `Aside could not find ${provider.label}'s ${label} control, so nothing was typed or sent. Turn ${label} on yourself and try again, or switch this branch to Persistent.`
-    );
-  }
-
-  if (isDisabledElement(primaryCandidate)) {
-    throw new PrivacyNotVerifiedError(
-      `${provider.label}'s ${label} control is disabled here, so nothing was typed or sent. This often means the current project or workspace does not allow it.`
-    );
-  }
-
-  const primaryState = inferTemporaryChatState(primaryCandidate);
-  if (primaryState === 'active') {
-    recordAutomationLog('Private mode already active', {
-      control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore)
-    });
-    return;
-  }
-
-  if (primaryState === 'unknown') {
-    // Two different situations produce 'unknown', and they need different advice.
-    // Report what was MEASURED — a layout box, and the computed styles
-    // isElementVisible folds together — rather than naming a CSS cause the
-    // rounded rect in the log cannot actually support.
-    const controlRect = primaryCandidate.getBoundingClientRect();
-    const controlStyle = window.getComputedStyle(primaryCandidate);
-    const notRendered =
-      controlRect.width <= 0 ||
-      controlRect.height <= 0 ||
-      primaryCandidate.getClientRects().length === 0;
-
-    recordAutomationLog('Private mode state could not be read', {
-      notRendered,
-      rect: { width: Math.round(controlRect.width), height: Math.round(controlRect.height) },
-      clientRects: primaryCandidate.getClientRects().length,
-      display: controlStyle.display,
-      visibility: controlStyle.visibility,
-      opacity: controlStyle.opacity
-    });
-
-    if (notRendered) {
-      throw new PrivacyNotVerifiedError(
-        `${provider.label}'s ${label} control is on this page but is not being shown here, so nothing was typed or sent. This is usual inside a project. Turn ${label} on yourself and try again, or switch this branch to Persistent.`
-      );
+  for (;;) {
+    const observation = observePrivateModeHere(composer);
+    const key = `${observation.step}:${observation.nextAction}`;
+    if (key !== lastReported) {
+      lastReported = key;
+      await reportPreparation(observation, 'Private-mode observation');
     }
 
-    throw new PrivacyNotVerifiedError(
-      `${provider.label} did not report whether ${label} is on, so nothing was typed or sent. Turn ${label} on yourself and try again, or switch this branch to Persistent.`
-    );
-  }
-
-  recordAutomationLog('Private mode inactive; enabling it before anything is typed', {
-    control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore)
-  });
-  activateControl(primaryCandidate);
-
-  // Only a control we can still see, reporting active, counts as verification. A
-  // control that vanished, never flipped, or timed out is not evidence of anything,
-  // and this is the decision that determines whether private text is saved.
-  const deadline = Date.now() + 4_000;
-  while (Date.now() < deadline) {
-    const refreshedActive = findDirectTemporaryChatControl(composer, 'active');
-    const refreshedAny = refreshedActive ?? findDirectTemporaryChatControl(composer, 'any');
-
-    if (refreshedAny && inferTemporaryChatState(refreshedAny) === 'active') {
-      recordAutomationLog('Private mode verified active', {
-        control: describeTemporaryChatCandidate(refreshedAny, composer)
-      });
+    if (observation.step === 'ready' && observation.mode === 'private') {
       return;
     }
 
-    await sleep(200);
-  }
+    const stop = (message: string): PrivacyNotVerifiedError =>
+      new PrivacyNotVerifiedError(message, recoveryFromObservation(observation));
 
-  throw new PrivacyNotVerifiedError(
-    `Aside turned on ${provider.label}'s ${label} but ${provider.label} never confirmed it, so nothing was typed or sent. Check ${label} yourself and try again, or switch this branch to Persistent.`
-  );
+    switch (observation.nextAction) {
+      case 'wait-for-page':
+        if (Date.now() < deadline) {
+          await sleep(250);
+          continue;
+        }
+        throw stop('The branch window did not finish loading, so nothing was typed or sent.');
+
+      case 'open-menu':
+        if (observation.actionTarget && menuOpenings < 2 && Date.now() < deadline) {
+          menuOpenings += 1;
+          recordAutomationLog('Opening the provider menu that holds the private-mode control', {
+            control: observation.control
+          });
+          activateControl(observation.actionTarget);
+          await waitForPrivateObservation(composer, 1_500, (next) => next.nextAction !== 'open-menu');
+          continue;
+        }
+        throw stop(
+          `Aside opened ${provider.label}'s menu but could not reach its ${label} control, so nothing was typed or sent. Turn ${label} on in the branch window, then Check again.`
+        );
+
+      case 'activate-control': {
+        if (!observation.actionTarget || activations >= 1) {
+          throw stop(
+            `${label} did not turn on, so nothing was typed or sent. Turn it on in the branch window, then Check again.`
+          );
+        }
+        activations += 1;
+        recordAutomationLog('Private mode inactive; enabling it before anything is typed', {
+          control: observation.control
+        });
+        activateControl(observation.actionTarget);
+        // Only a provider-owned active state counts as verification. A control that
+        // vanished, never flipped, or timed out is not evidence of anything, and
+        // this is the decision that determines whether private text is saved.
+        const verified = await waitForPrivateObservation(
+          composer,
+          PRIVATE_VERIFY_BUDGET_MS,
+          (next) =>
+            (next.step === 'ready' && next.mode === 'private') ||
+            next.step === 'awaiting-choice' ||
+            next.step === 'awaiting-login'
+        );
+        if (verified.step === 'ready' && verified.mode === 'private') {
+          await reportPreparation(verified, 'Private mode verified after activation');
+          return;
+        }
+        if (verified.step === 'awaiting-choice' || verified.step === 'awaiting-login') {
+          await reportPreparation(verified, 'Private mode activation is waiting on the Owner');
+          throw new PrivacyNotVerifiedError(
+            `${verified.reason} Nothing was typed or sent.`,
+            recoveryFromObservation(verified)
+          );
+        }
+        await reportPreparation(verified, 'Private mode was not confirmed after activation');
+        throw new PrivacyNotVerifiedError(
+          `Aside turned on ${provider.label}'s ${label} but ${provider.label} never confirmed it, so nothing was typed or sent. Check ${label} in the branch window, then Check again.`,
+          recoveryFromObservation(verified)
+        );
+      }
+
+      case 'choose-personalization':
+      case 'sign-in':
+      case 'check-again':
+        throw stop(`${observation.reason} Nothing was typed or sent.`);
+
+      case 'none':
+      default:
+        throw stop(
+          observation.step === 'blocked'
+            ? `${provider.label}'s ${label} is disabled in this branch window, so nothing was typed or sent. This usually means a project or workspace rule.`
+            : `${provider.label} did not report whether ${label} is on, so nothing was typed or sent.`
+        );
+    }
+  }
 }
 
 /**
@@ -6265,31 +6852,30 @@ async function assertPrivateModeStillActive(
   prompt: string,
   options: { clearComposer?: boolean } = {}
 ): Promise<void> {
-  const control =
-    findDirectTemporaryChatControl(composer, 'active') ??
-    findDirectTemporaryChatControl(composer, 'any') ??
-    getRankedTemporaryChatControls(composer)[0]?.candidate ??
-    null;
-
-  const state = control ? inferTemporaryChatState(control) : 'missing';
-  if (state === 'active') {
+  const observation = observePrivateModeHere(composer);
+  if (observation.mode === 'private') {
     return;
   }
 
   recordAutomationLog('Private mode stopped being verifiable after the prompt was typed', {
-    state,
-    control: control ? describeTemporaryChatCandidate(control, composer) : null
+    step: observation.step,
+    mode: observation.mode,
+    evidence: observation.evidence,
+    control: observation.control
   });
+  const recovery = recoveryFromObservation(observation);
   if (options.clearComposer === false) {
     // Nothing has been typed yet, so there is nothing to take back.
     throw new PrivacyNotVerifiedError(
-      `${provider.label} stopped reporting ${provider.privacy.label} while the branch was being prepared, so nothing was typed or sent.`
+      `${provider.label} stopped reporting ${provider.privacy.label} while the branch was being prepared, so nothing was typed or sent.`,
+      recovery
     );
   }
 
   clearComposerAfterFailure(prompt);
   throw new PrivacyNotVerifiedError(
-    `${provider.label} stopped reporting ${provider.privacy.label} while the branch was being prepared, so it was not sent. The text was removed from the composer.`
+    `${provider.label} stopped reporting ${provider.privacy.label} while the branch was being prepared, so it was not sent. The text was removed from the composer.`,
+    recovery
   );
 }
 
@@ -6467,6 +7053,9 @@ async function submitComposer(
   // navigation.
   if (branchKind === 'temporary') {
     await assertPrivateModeStillActive(composer, prompt, { clearComposer: false });
+    // The panel learns the prompt is about to be typed: from here on a navigation
+    // must never be answered by delivering the prompt again.
+    await reportPreparation(observePrivateModeHere(composer), 'Private mode verified; inserting the prompt');
   }
 
   let composerSnapshot = describeComposerCandidate(composer);
@@ -7050,10 +7639,15 @@ async function runBranchPromptAutomation(
     // next thing they type appends to a 3KB machine prompt they never wrote.
     clearComposerAfterFailure(message.prompt);
 
+    // A private preparation that stopped short carries where it stopped, so the
+    // panel can offer Check again on this same document.
+    const recovery = error instanceof PrivacyNotVerifiedError ? error.recovery : undefined;
     await sendAutomationEvent({
       kind: 'failed',
       reason,
-      branchChatUrl
+      branchChatUrl,
+      recovery,
+      buildId: BUILD_ID
     });
   } finally {
     automationTaskRunning = false;
@@ -7752,7 +8346,8 @@ function initEmbeddedFrame(): void {
         source: 'aside',
         target: 'parent',
         type: 'SB_FRAME_READY',
-        currentUrl: normalizeChatUrl(window.location.href)
+        currentUrl: normalizeChatUrl(window.location.href),
+        buildId: BUILD_ID
       } satisfies FrameReadyMessage,
       window.location.origin
     );

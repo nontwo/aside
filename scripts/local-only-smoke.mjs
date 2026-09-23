@@ -86,6 +86,7 @@ function buildSuccessComposerHtml({
   temporaryChatDisableable = true,
   temporaryChatEnableable = true,
   temporaryChatActivationStyle = 'visible',
+  temporaryChatChooser = false,
   temporaryModeSkipsConversationUrl = false,
   conversationUrlMode = 'always',
   conversationUrlStorageKey = '__asideSubmitCount',
@@ -111,8 +112,24 @@ function buildSuccessComposerHtml({
   const confusingActionMarkup = includeConfusingAction
     ? `<button type="button" aria-label="开始群聊" style="position:fixed;right:32px;bottom:48px;">开始群聊</button>`
     : '';
+  // 'menu' models the live ChatGPT shape from the owner's log: the control exists,
+  // is enabled, and has a 0x0 box because it sits inside a closed composer menu.
+  // Once selected, the menu closes and the mode shows as an interface indicator.
   const temporaryChatMarkup = includeTemporaryChatToggle
-    ? `<button id="temporary-chat-toggle" type="submit" aria-label="开启临时聊天">开启临时聊天</button>`
+    ? temporaryChatActivationStyle === 'menu'
+      ? `<button id="composer-tools" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Tools">+</button>
+      <div id="composer-menu" role="menu" data-state="closed" style="display:none">
+        <button id="temporary-chat-toggle" type="button" role="menuitem" aria-label="开启临时聊天">开启临时聊天</button>
+      </div>
+      <div id="temporary-indicator" data-testid="temporary-chat-indicator" data-state="off" style="display:none">Temporary chat</div>`
+      : `<button id="temporary-chat-toggle" type="submit" aria-label="开启临时聊天">开启临时聊天</button>`
+    : '';
+  const chooserMarkup = temporaryChatChooser
+    ? `<div id="temporary-chooser" role="dialog" aria-modal="true" style="display:none;position:fixed;left:20%;top:30%;width:60%;background:#fff;border:1px solid #999;padding:16px;">
+        <p>Temporary chat: Personalized or Unpersonalized?</p>
+        <button id="chooser-personalized" type="button">Personalized</button>
+        <button id="chooser-unpersonalized" type="button">Unpersonalized</button>
+      </div>`
     : '';
   const sendButtonMarkup =
     sendInShadowRoot
@@ -137,16 +154,55 @@ function buildSuccessComposerHtml({
     </form>
     </main>
     ${confusingActionMarkup}
+    ${chooserMarkup}
     <script>
       const temporaryChatToggle = document.getElementById('temporary-chat-toggle');
       if (temporaryChatToggle) {
         let temporaryChatModeActive = ${temporaryChatInitiallyActive ? 'true' : 'false'};
         window.__temporaryChatModeActive = temporaryChatModeActive;
+        const composerTools = document.getElementById('composer-tools');
+        const composerMenu = document.getElementById('composer-menu');
+        const temporaryIndicator = document.getElementById('temporary-indicator');
+        const chooser = document.getElementById('temporary-chooser');
+        const setMenuOpen = (open) => {
+          if (!composerMenu) {
+            return;
+          }
+          composerMenu.dataset.state = open ? 'open' : 'closed';
+          composerMenu.style.display = open ? 'block' : 'none';
+          composerTools?.setAttribute('aria-expanded', open ? 'true' : 'false');
+        };
+        if (composerTools) {
+          composerTools.addEventListener('click', (event) => {
+            event.preventDefault();
+            window.__menuTriggerClicks = (window.__menuTriggerClicks || 0) + 1;
+            setMenuOpen(composerMenu.dataset.state !== 'open');
+          });
+        }
+        if (chooser) {
+          chooser.querySelectorAll('button').forEach((button) => {
+            button.addEventListener('click', () => {
+              window.__personalizationChoice = button.id;
+              chooser.style.display = 'none';
+            });
+          });
+        }
         const reflectTemporaryChatState = (active) => {
           temporaryChatToggle.dataset.temporaryChatState = active ? 'active' : 'inactive';
           temporaryChatToggle.setAttribute('aria-pressed', active ? 'true' : 'false');
           temporaryChatToggle.setAttribute('aria-label', active ? '关闭临时聊天' : '开启临时聊天');
           temporaryChatToggle.textContent = active ? '关闭临时聊天' : '开启临时聊天';
+          if (temporaryIndicator) {
+            temporaryIndicator.dataset.state = active ? 'on' : 'off';
+            temporaryIndicator.style.display = active ? 'block' : 'none';
+          }
+        };
+        // The owner fixing it by hand in the branch window: the harness's stand-in
+        // for a real click on the provider's own control.
+        window.__forceTemporaryChatState = (active) => {
+          temporaryChatModeActive = active;
+          window.__temporaryChatModeActive = active;
+          reflectTemporaryChatState(active);
         };
         const setTemporaryChatState = (active) => {
           temporaryChatModeActive = active;
@@ -168,6 +224,10 @@ function buildSuccessComposerHtml({
             return;
           }
           setTemporaryChatState(temporaryChatToggle.dataset.temporaryChatState !== 'active');
+          setMenuOpen(false);
+          if (chooser && temporaryChatModeActive) {
+            chooser.style.display = 'block';
+          }
         });
       }
 
@@ -201,6 +261,7 @@ function buildSuccessComposerHtml({
         const textarea = document.querySelector('#composer-form textarea');
         const prompt = textarea.value;
         window.__lastPrompt = prompt;
+        window.__submitCount = (window.__submitCount || 0) + 1;
         textarea.value = '';
         const temporaryModeActive = window.__temporaryChatModeActive === true;
         const nextSubmitCount = Number(localStorage.getItem(${JSON.stringify(conversationUrlStorageKey)}) || '0') + 1;
@@ -1385,9 +1446,10 @@ async function runTemporaryChatUnconfirmedScenario(browser) {
       button.click();
     });
     const branchFrame = await waitForBranchFrame(page);
-    await waitForPanelStatus(page, /Local branch creation failed\./);
+    await waitForPanelStatus(page, /This branch was not sent\./);
+    await capture(page, 'panel-chatgpt-private-not-verified');
 
-    return await Promise.all([
+    const failed = await Promise.all([
       page.evaluate(() => ({
         status:
           document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
@@ -1414,9 +1476,88 @@ async function runTemporaryChatUnconfirmedScenario(browser) {
         };
       })
     ]).then(([source, branch]) => ({ ...source, ...branch }));
+
+    const failedLayout = await readFailedPanelLayout(page);
+    // Show branch window reveals the same frame; it was hidden, not destroyed.
+    await page.evaluate(() => {
+      document
+        .querySelector('.aside-panel:not([hidden]) button[data-aside-role="recovery-show-target"]')
+        ?.click();
+    });
+    const shellVisibleAfterShow = await page.evaluate(() => {
+      const shell = document.querySelector('.aside-panel:not([hidden]) .aside-frame-shell');
+      return shell instanceof HTMLElement && !shell.hidden && getComputedStyle(shell).display !== 'none';
+    });
+
+    // The owner turns the mode on in the branch window by hand, then asks Aside to
+    // look again. The same document must be checked and the prompt sent there once.
+    await branchFrame.evaluate(() => {
+      window.__docToken = 'unconfirmed-doc';
+      window.__forceTemporaryChatState(true);
+    });
+    await page.evaluate(() => {
+      document
+        .querySelector('.aside-panel:not([hidden]) button[data-aside-role="recovery-check-again"]')
+        ?.click();
+    });
+    await waitForPanelStatus(page, /Branch answer is ready in this window\./);
+    const recheck = await branchFrame.evaluate(() => ({
+      docToken: window.__docToken ?? null,
+      submitCount: window.__submitCount ?? 0,
+      lastPrompt: window.__lastPrompt ?? null,
+      location: window.location.href,
+      temporaryChatToggleClicks: window.__temporaryChatToggleClicks ?? 0
+    }));
+    recheck.status = await page.evaluate(
+      () =>
+        document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
+        null
+    );
+
+    return { ...failed, failedLayout: { ...failedLayout, shellVisibleAfterShow }, recheck };
   } finally {
     await page.close();
   }
+}
+
+/** The failed-state layout the owner's screenshots objected to, measured. */
+async function readFailedPanelLayout(page) {
+  return page.evaluate(() => {
+    const panel = document.querySelector('.aside-panel:not([hidden])');
+    const shell = panel?.querySelector('.aside-frame-shell');
+    const errors = Array.from(panel?.querySelectorAll('.aside-error-copy') ?? []).filter((element) =>
+      (element.textContent || '').trim()
+    );
+    const visibleHeaderButtons = Array.from(panel?.querySelectorAll('.aside-panel-actions > button') ?? [])
+      .filter((button) => getComputedStyle(button).display !== 'none')
+      .map((button) => button.textContent?.trim());
+    const more = panel?.querySelector('details.aside-panel-more');
+    const moreButtons = Array.from(more?.querySelectorAll('button') ?? []).map((button) =>
+      button.textContent?.trim()
+    );
+    const recovery = panel?.querySelector('.aside-recovery');
+    const recoveryButtons = Array.from(recovery?.querySelectorAll(':scope > .aside-recovery-actions button') ?? [])
+      .filter((button) => !button.hidden && getComputedStyle(button).display !== 'none')
+      .map((button) => button.textContent?.trim());
+    const note = panel?.querySelector('.aside-privacy-note');
+    const text = panel?.innerText ?? '';
+    return {
+      frameShellHidden:
+        shell instanceof HTMLElement && (shell.hidden || getComputedStyle(shell).display === 'none'),
+      errorCount: errors.length,
+      errorTextOccurrences: errors.length
+        ? (text.match(new RegExp(errors[0].textContent.trim().slice(0, 40).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || [])
+            .length
+        : 0,
+      visibleHeaderButtons,
+      moreButtons,
+      moreOpen: more instanceof HTMLDetailsElement ? more.open : null,
+      recoveryVisible: recovery instanceof HTMLElement && !recovery.hidden,
+      recoveryButtons,
+      privacyNoteOpen: note instanceof HTMLDetailsElement ? note.open : null,
+      projectWarningCount: (text.match(/project/gi) || []).length
+    };
+  });
 }
 
 async function runTemporaryChatVerifiedScenario(browser) {
@@ -1507,9 +1648,9 @@ async function runTemporaryChatBlockedScenario(browser) {
       button.click();
     });
     const branchFrame = await waitForBranchFrame(page);
-    await waitForPanelStatus(page, /Local branch creation failed\./);
+    await waitForPanelStatus(page, /This branch was not sent\./);
 
-    return await Promise.all([
+    const blocked = await Promise.all([
       page.evaluate(() => ({
         status:
           document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
@@ -1540,6 +1681,138 @@ async function runTemporaryChatBlockedScenario(browser) {
         };
       })
     ]).then(([source, branch]) => ({ ...source, ...branch }));
+    const failedLayout = await readFailedPanelLayout(page);
+
+    // Ordinary mode is an explicit two-step choice: the first click only asks.
+    await page.evaluate(() => {
+      document.querySelector('.aside-panel:not([hidden]) button[data-aside-role="recovery-ordinary"]')?.click();
+    });
+    const afterFirstClick = await Promise.all([
+      page.evaluate(() => {
+        const confirm = document.querySelector('.aside-panel:not([hidden]) .aside-recovery-confirm');
+        return {
+          confirmVisible: confirm instanceof HTMLElement && !confirm.hidden,
+          confirmText: confirm?.textContent ?? '',
+          status:
+            document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
+            null
+        };
+      }),
+      branchFrame.evaluate(() => ({ lastPrompt: window.__lastPrompt ?? null }))
+    ]).then(([panel, branch]) => ({ ...panel, ...branch }));
+
+    await page.evaluate(() => {
+      document
+        .querySelector('.aside-panel:not([hidden]) button[data-aside-role="recovery-ordinary-confirm"]')
+        ?.click();
+    });
+    await waitForPanelStatus(page, /Branch answer is ready in this window\./);
+    const ordinaryFrame = await waitForBranchFrame(page);
+    const ordinary = await ordinaryFrame.evaluate(() => ({
+      location: window.location.href,
+      lastPrompt: window.__lastPrompt ?? null,
+      temporaryChatModeActive: window.__temporaryChatModeActive ?? false
+    }));
+    ordinary.selectedKind = await page.evaluate(
+      () =>
+        document.querySelector('.aside-panel:not([hidden]) .aside-kind-toggle button[data-selected="true"]')
+          ?.dataset.asideRole ?? null
+    );
+
+    return { ...blocked, failedLayout, afterFirstClick, ordinary };
+  } finally {
+    await page.close();
+  }
+}
+
+/**
+ * The live ChatGPT shape from the owner's log: the Temporary control is inside a
+ * closed composer menu (present, enabled, 0x0), and ChatGPT asks Personalized /
+ * Unpersonalized once it is selected. Aside opens the menu, selects the control,
+ * stops at the chooser without choosing, and continues on the same document after
+ * the owner chooses and presses Check again — with exactly one send.
+ */
+async function runTemporaryChatMenuChooserScenario(browser) {
+  routeMap = {
+    '/c/source-temp-menu': buildSourceHtml(),
+    '/': buildSuccessComposerHtml({
+      conversationPath: '/c/generated-temp-menu',
+      includeTemporaryChatToggle: true,
+      temporaryChatInitiallyActive: false,
+      temporaryChatActivationStyle: 'menu',
+      temporaryChatChooser: true,
+      temporaryModeSkipsConversationUrl: true,
+      realComposerId: ''
+    })
+  };
+
+  const page = await createSourcePage(browser, '/c/source-temp-menu');
+
+  try {
+    await openDraft(page);
+    await setPanelBranchKind(page, 'temporary');
+    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', PRIVATE_PROBE_QUESTION);
+    await page.evaluate(() => {
+      const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
+      if (!(button instanceof HTMLButtonElement)) {
+        throw new Error('Panel submit button not found');
+      }
+      button.click();
+    });
+    const branchFrame = await waitForBranchFrame(page);
+    await waitForPanelStatus(page, /This branch was not sent\./);
+    await capture(page, 'panel-chatgpt-private-awaiting-choice');
+
+    const awaiting = await page.evaluate(() => ({
+      status:
+        document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ?? null,
+      errorText:
+        document.querySelector('.aside-panel:not([hidden]) .aside-error-copy')?.textContent ?? null,
+      hint: document.querySelector('.aside-panel:not([hidden]) .aside-recovery > p')?.textContent ?? null
+    }));
+    Object.assign(awaiting, await readFailedPanelLayout(page));
+    const frameBefore = await branchFrame.evaluate(() => {
+      window.__docToken = 'menu-doc';
+      const composer = document.querySelector('#composer-form textarea');
+      const chooser = document.getElementById('temporary-chooser');
+      return {
+        menuTriggerClicks: window.__menuTriggerClicks ?? 0,
+        toggleClicks: window.__temporaryChatToggleClicks ?? 0,
+        chooserVisible: chooser instanceof HTMLElement && getComputedStyle(chooser).display !== 'none',
+        choice: window.__personalizationChoice ?? null,
+        composerValue: composer instanceof HTMLTextAreaElement ? composer.value : null,
+        lastPrompt: window.__lastPrompt ?? null,
+        submitCount: window.__submitCount ?? 0
+      };
+    });
+
+    // The owner answers ChatGPT's question in the branch window, then Check again.
+    await branchFrame.evaluate(() => document.getElementById('chooser-unpersonalized')?.click());
+    await page.evaluate(() => {
+      document
+        .querySelector('.aside-panel:not([hidden]) button[data-aside-role="recovery-check-again"]')
+        ?.click();
+    });
+    await waitForPanelStatus(page, /Branch answer is ready in this window\./);
+    const after = await branchFrame.evaluate(() => ({
+      docToken: window.__docToken ?? null,
+      submitCount: window.__submitCount ?? 0,
+      lastPrompt: window.__lastPrompt ?? null,
+      location: window.location.href,
+      toggleClicks: window.__temporaryChatToggleClicks ?? 0,
+      menuTriggerClicks: window.__menuTriggerClicks ?? 0,
+      choice: window.__personalizationChoice ?? null,
+      temporaryChatModeActive: window.__temporaryChatModeActive ?? false
+    }));
+    const storage = await readExtensionStorage(browser);
+
+    return {
+      awaiting,
+      frameBefore,
+      after,
+      privateTextInLocalStorage: storage.local.includes(PRIVATE_PROBE_QUESTION),
+      privateTextInSessionStorage: storage.session.includes(PRIVATE_PROBE_QUESTION)
+    };
   } finally {
     await page.close();
   }
@@ -1557,7 +1830,34 @@ async function runProjectScenario(browser) {
   const page = await createSourcePage(browser, sourcePath);
 
   try {
-    const { branchFrame } = await openDraftAndSubmit(page, 'Why this assumption?');
+    await openDraft(page);
+    // Inside a project, choosing the private mode must say ONCE that the branch
+    // leaves the project — as the note's own warning line, with the duplicate
+    // bullet hidden — and must not pop the note open on the owner.
+    await setPanelBranchKind(page, 'temporary');
+    const privacyNote = await page.evaluate(() => {
+      const note = document.querySelector('.aside-panel:not([hidden]) .aside-privacy-note');
+      const warning = note?.querySelector('.aside-privacy-warning:not([hidden])');
+      const bullets = Array.from(note?.querySelectorAll('li') ?? []);
+      return {
+        noteOpen: note instanceof HTMLDetailsElement ? note.open : null,
+        containerWarningVisible: Boolean(warning && /project/i.test(warning.textContent ?? '')),
+        projectBulletHidden: bullets
+          .filter((item) => /project/i.test(item.textContent ?? ''))
+          .every((item) => item.hidden),
+        projectMentionsShown: (note instanceof HTMLElement ? note.innerText : '').match(/project/gi)?.length ?? 0
+      };
+    });
+    await setPanelBranchKind(page, 'persistent');
+    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
+    await page.evaluate(() => {
+      const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
+      if (!(button instanceof HTMLButtonElement)) {
+        throw new Error('Panel submit button not found');
+      }
+      button.click();
+    });
+    const branchFrame = await waitForBranchFrame(page);
     await waitForPanelStatus(page, /Branch answer is ready in this window\./);
 
     return await Promise.all([
@@ -1569,7 +1869,7 @@ async function runProjectScenario(browser) {
       branchFrame.evaluate(() => ({
         branchLocation: window.location.href
       }))
-    ]).then(([source, branch]) => ({ ...source, ...branch }));
+    ]).then(([source, branch]) => ({ ...source, ...branch, privacyNote }));
   } finally {
     await page.close();
   }
@@ -1793,10 +2093,16 @@ function buildClaudeSourceHtml({ variant = 'current' } = {}) {
 }
 
 function buildClaudeComposerHtml({ conversationPath = '/chat/generated-claude', incognito = 'available' } = {}) {
+  // 'active-interface' models the documented ACTIVE state: no launch control, the
+  // "Incognito chat" label in the provider's own header.
   const incognitoMarkup =
-    incognito === 'none'
+    incognito === 'none' || incognito === 'active-interface'
       ? ''
       : `<button id="incognito-toggle" type="button" aria-label="Start incognito chat" aria-pressed="false">Incognito</button>`;
+  const headerMarkup =
+    incognito === 'active-interface'
+      ? `<header>Fake Claude header <span id="incognito-indicator" aria-label="Incognito chat">Incognito chat</span></header>`
+      : `<header>Fake Claude header</header>`;
 
   return `<!doctype html>
 <html>
@@ -1804,7 +2110,7 @@ function buildClaudeComposerHtml({ conversationPath = '/chat/generated-claude', 
   <body data-sidebar="open">
     <nav aria-label="Chat history"><div>Recents</div></nav>
     <main>
-      <header>Fake Claude header</header>
+      ${headerMarkup}
       <div id="turns"></div>
       <form id="composer-form">
         <fieldset style="border:0;padding:0;margin:0;">
@@ -1819,6 +2125,7 @@ function buildClaudeComposerHtml({ conversationPath = '/chat/generated-claude', 
     <script>
       const composer = document.getElementById('prompt');
       const incognitoToggle = document.getElementById('incognito-toggle');
+      window.__incognitoActive = ${incognito === 'active-interface' ? 'true' : 'false'};
       if (incognitoToggle) {
         incognitoToggle.addEventListener('click', () => {
           const active = incognitoToggle.getAttribute('aria-pressed') === 'true';
@@ -2128,6 +2435,74 @@ async function runClaudeEmbeddedScenario(browser) {
   }
 }
 
+/**
+ * Claude with incognito ALREADY active in the branch document: no launch control,
+ * only the documented interface label. That label is the verification, and the
+ * private branch must run in the panel with a single send and no toggle click.
+ */
+async function runClaudeIncognitoActiveScenario(browser) {
+  routeMap = { '*': buildSourceHtml() };
+  refuseFramingForPaths = [];
+  claudeRouteMap = {
+    '/chat/source-claude-incognito': buildClaudeSourceHtml({ variant: 'current' }),
+    '/new': buildClaudeComposerHtml({ incognito: 'active-interface' }),
+    '*': buildClaudeComposerHtml({ incognito: 'active-interface' })
+  };
+
+  const page = await createClaudePage(browser, '/chat/source-claude-incognito');
+  const existingPages = await browser.pages();
+
+  try {
+    await selectClaudeAssistantText(page);
+    await page.waitForFunction(
+      () => {
+        const toolbar = document.querySelector('#aside-selection-toolbar');
+        return toolbar instanceof HTMLElement && !toolbar.hidden;
+      },
+      { timeout: 10_000 }
+    );
+    await page.evaluate(() => document.querySelector('#aside-ask-button')?.click());
+    await page.waitForSelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', {
+      timeout: 10_000
+    });
+    await setPanelBranchKind(page, 'temporary');
+    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', PRIVATE_PROBE_QUESTION);
+    await page.evaluate(() => {
+      document.querySelector('.aside-panel:not([hidden]) button[type="submit"]')?.click();
+    });
+    const branchFrame = await waitForBranchFrame(page);
+    await waitForPanelStatus(page, /Branch answer is ready in this window\./);
+    await capture(page, 'panel-claude-incognito-verified');
+
+    const branch = await branchFrame.evaluate(() => ({
+      location: window.location.href,
+      sendClicks: window.__sendClicks ?? 0,
+      incognitoClicks: window.__incognitoClicks ?? 0,
+      lastPrompt: window.__lastPrompt ?? null
+    }));
+    const pagesAfter = await browser.pages();
+    const storage = await readExtensionStorage(browser);
+    const log = await page.evaluate(
+      () =>
+        document.querySelector('.aside-panel:not([hidden]) textarea[data-aside-role="debug-log"]')?.value ?? ''
+    );
+
+    return {
+      ...branch,
+      openedSeparateWindow: pagesAfter.length > existingPages.length,
+      privateTextInLocalStorage: storage.local.includes(PRIVATE_PROBE_QUESTION),
+      privateTextInSessionStorage: storage.session.includes(PRIVATE_PROBE_QUESTION),
+      logMentionsMarker: /interface-marker/.test(log) || storage.session.includes('interface-marker')
+    };
+  } finally {
+    const pages = await browser.pages();
+    await Promise.all(
+      pages.filter((candidate) => !existingPages.includes(candidate)).map((c) => c.close().catch(() => {}))
+    );
+    await page.close();
+  }
+}
+
 const SCREENSHOT_DIR = process.env.CAPTURE_SCREENSHOTS ?? null;
 
 async function capture(page, name) {
@@ -2390,6 +2765,8 @@ try {
   const temporaryChatUnconfirmed = await runTemporaryChatUnconfirmedScenario(browser);
   const temporaryChatVerified = await runTemporaryChatVerifiedScenario(browser);
   const temporaryChatBlocked = await runTemporaryChatBlockedScenario(browser);
+  const temporaryChatMenuChooser = await runTemporaryChatMenuChooserScenario(browser);
+  const claudeIncognitoActive = await runClaudeIncognitoActiveScenario(browser);
   const claudeCurrent = await runClaudeScenario(browser, { variant: 'current' });
   const claudeLegacy = await runClaudeScenario(browser, { variant: 'legacy' });
   const claudeEmbedded = await runClaudeEmbeddedScenario(browser);
@@ -2407,6 +2784,8 @@ try {
     temporaryChatUnconfirmed,
     temporaryChatVerified,
     temporaryChatBlocked,
+    temporaryChatMenuChooser,
+    claudeIncognitoActive,
     layoutMatrix,
     claudeCurrent,
     claudeLegacy,
@@ -2669,7 +3048,10 @@ try {
 
   if (
     project.status !== 'Branch answer is ready in this window.' ||
-    project.branchLocation !== 'https://chatgpt.com/g/g-p-demo-project/c/generated-project'
+    project.branchLocation !== 'https://chatgpt.com/g/g-p-demo-project/c/generated-project' ||
+    project.privacyNote.containerWarningVisible !== true ||
+    project.privacyNote.projectBulletHidden !== true ||
+    project.privacyNote.noteOpen !== false
   ) {
     throw new Error(`Project embedded branch scenario failed: ${JSON.stringify(project)}`);
   }
@@ -2684,7 +3066,7 @@ try {
 
   if (
     // Unverifiable privacy must block BEFORE anything is typed or sent.
-    temporaryChatUnconfirmed.status !== 'Local branch creation failed.' ||
+    temporaryChatUnconfirmed.status !== 'This branch was not sent.' ||
     !/never confirmed it|did not report/i.test(temporaryChatUnconfirmed.errorText ?? '') ||
     temporaryChatUnconfirmed.composerValue !== '' ||
     temporaryChatUnconfirmed.lastPrompt !== null ||
@@ -2692,11 +3074,81 @@ try {
     temporaryChatUnconfirmed.branchLocation.includes('/c/') ||
     // …and the user keeps their question and a way to retry.
     temporaryChatUnconfirmed.questionPreserved !== 'Why this assumption?' ||
-    temporaryChatUnconfirmed.formVisible !== true
+    temporaryChatUnconfirmed.formVisible !== true ||
+    // The failed state the screenshots objected to: one error, no blank frame,
+    // diagnostics behind More, recovery near the question.
+    temporaryChatUnconfirmed.failedLayout.frameShellHidden !== true ||
+    temporaryChatUnconfirmed.failedLayout.errorCount !== 1 ||
+    temporaryChatUnconfirmed.failedLayout.errorTextOccurrences !== 1 ||
+    temporaryChatUnconfirmed.failedLayout.visibleHeaderButtons.includes('Copy log') ||
+    !temporaryChatUnconfirmed.failedLayout.moreButtons.includes('Copy log') ||
+    !temporaryChatUnconfirmed.failedLayout.moreButtons.includes('Copy log + text') ||
+    !temporaryChatUnconfirmed.failedLayout.moreButtons.includes('Select log') ||
+    temporaryChatUnconfirmed.failedLayout.recoveryVisible !== true ||
+    !temporaryChatUnconfirmed.failedLayout.recoveryButtons.includes('Check again') ||
+    !temporaryChatUnconfirmed.failedLayout.recoveryButtons.includes('Show branch window') ||
+    !temporaryChatUnconfirmed.failedLayout.recoveryButtons.includes('Use ordinary mode…') ||
+    temporaryChatUnconfirmed.failedLayout.shellVisibleAfterShow !== true ||
+    // Check again re-observes the SAME document and continues there, once.
+    temporaryChatUnconfirmed.recheck.docToken !== 'unconfirmed-doc' ||
+    temporaryChatUnconfirmed.recheck.submitCount !== 1 ||
+    !temporaryChatUnconfirmed.recheck.lastPrompt?.includes('SELECTED PASSAGE') ||
+    temporaryChatUnconfirmed.recheck.location.includes('/c/') ||
+    temporaryChatUnconfirmed.recheck.status !== 'Branch answer is ready in this window.'
   ) {
     throw new Error(
       `Unverified temporary chat must block the send: ${JSON.stringify(temporaryChatUnconfirmed)}`
     );
+  }
+
+  if (
+    temporaryChatMenuChooser.awaiting.status !== 'This branch was not sent.' ||
+    !/asking for a choice/i.test(temporaryChatMenuChooser.awaiting.errorText ?? '') ||
+    !/Make the choice/.test(temporaryChatMenuChooser.awaiting.hint ?? '') ||
+    temporaryChatMenuChooser.awaiting.errorCount !== 1 ||
+    temporaryChatMenuChooser.awaiting.frameShellHidden !== true ||
+    temporaryChatMenuChooser.awaiting.privacyNoteOpen !== false ||
+    !temporaryChatMenuChooser.awaiting.recoveryButtons.includes('Check again') ||
+    !temporaryChatMenuChooser.awaiting.recoveryButtons.includes('Show branch window') ||
+    // A chooser is the provider asking a question; ordinary mode is not an answer to it.
+    temporaryChatMenuChooser.awaiting.recoveryButtons.includes('Use ordinary mode…') ||
+    // Aside opened the menu once, selected the control once, and chose nothing.
+    temporaryChatMenuChooser.frameBefore.menuTriggerClicks !== 1 ||
+    temporaryChatMenuChooser.frameBefore.toggleClicks !== 1 ||
+    temporaryChatMenuChooser.frameBefore.chooserVisible !== true ||
+    temporaryChatMenuChooser.frameBefore.choice !== null ||
+    temporaryChatMenuChooser.frameBefore.composerValue !== '' ||
+    temporaryChatMenuChooser.frameBefore.lastPrompt !== null ||
+    temporaryChatMenuChooser.frameBefore.submitCount !== 0 ||
+    // After the owner's choice and Check again: same document, one send, private.
+    temporaryChatMenuChooser.after.docToken !== 'menu-doc' ||
+    temporaryChatMenuChooser.after.choice !== 'chooser-unpersonalized' ||
+    temporaryChatMenuChooser.after.submitCount !== 1 ||
+    !temporaryChatMenuChooser.after.lastPrompt?.includes('SELECTED PASSAGE') ||
+    temporaryChatMenuChooser.after.location.includes('/c/') ||
+    temporaryChatMenuChooser.after.toggleClicks !== 1 ||
+    temporaryChatMenuChooser.after.menuTriggerClicks !== 1 ||
+    temporaryChatMenuChooser.after.temporaryChatModeActive !== true ||
+    temporaryChatMenuChooser.privateTextInLocalStorage !== false ||
+    temporaryChatMenuChooser.privateTextInSessionStorage !== true
+  ) {
+    throw new Error(
+      `Temporary chat behind a menu with a chooser failed: ${JSON.stringify(temporaryChatMenuChooser)}`
+    );
+  }
+
+  if (
+    claudeIncognitoActive.openedSeparateWindow !== false ||
+    !claudeIncognitoActive.location.startsWith('https://claude.ai/') ||
+    claudeIncognitoActive.location.includes('/chat/generated') ||
+    claudeIncognitoActive.sendClicks !== 1 ||
+    claudeIncognitoActive.incognitoClicks !== 0 ||
+    !claudeIncognitoActive.lastPrompt?.includes('SELECTED PASSAGE') ||
+    claudeIncognitoActive.privateTextInLocalStorage !== false ||
+    claudeIncognitoActive.privateTextInSessionStorage !== true ||
+    claudeIncognitoActive.logMentionsMarker !== true
+  ) {
+    throw new Error(`Claude incognito-active scenario failed: ${JSON.stringify(claudeIncognitoActive)}`);
   }
 
   if (
@@ -2718,13 +3170,24 @@ try {
   if (
     // A temporary chat that cannot be turned on must block, not leak. Previously
     // this path typed the passage into a persistent chat and reported it afterwards.
-    temporaryChatBlocked.status !== 'Local branch creation failed.' ||
+    temporaryChatBlocked.status !== 'This branch was not sent.' ||
     !/never confirmed it|did not report|could not find/i.test(temporaryChatBlocked.errorText ?? '') ||
     temporaryChatBlocked.composerValue !== '' ||
     temporaryChatBlocked.lastPrompt !== null ||
     temporaryChatBlocked.turnsRendered !== 0 ||
     temporaryChatBlocked.branchLocation.includes('/c/') ||
-    temporaryChatBlocked.temporaryChatToggleClicks < 1
+    temporaryChatBlocked.temporaryChatToggleClicks < 1 ||
+    // Ordinary mode is offered, and only as an explicit two-step choice.
+    !temporaryChatBlocked.failedLayout.recoveryButtons.includes('Use ordinary mode…') ||
+    temporaryChatBlocked.afterFirstClick.confirmVisible !== true ||
+    !/ordinary .* chat/i.test(temporaryChatBlocked.afterFirstClick.confirmText) ||
+    temporaryChatBlocked.afterFirstClick.status !== 'This branch was not sent.' ||
+    temporaryChatBlocked.afterFirstClick.lastPrompt !== null ||
+    // Confirmed: the branch is sent as an ordinary, saved chat and says so.
+    temporaryChatBlocked.ordinary.selectedKind !== 'branch-kind-persistent' ||
+    temporaryChatBlocked.ordinary.location !== 'https://chatgpt.com/c/generated-temp-blocked' ||
+    !temporaryChatBlocked.ordinary.lastPrompt?.includes('SELECTED PASSAGE') ||
+    temporaryChatBlocked.ordinary.temporaryChatModeActive !== false
   ) {
     throw new Error(
       `Temporary-chat blocked scenario failed: ${JSON.stringify(temporaryChatBlocked)}`

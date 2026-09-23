@@ -74,17 +74,39 @@ Two things are kept apart: the provider's own conversation mode (normal, or its
 verified Temporary/Incognito mode) and Aside's local retention (durable, or
 session-only). A private question is session-only — it has no record in the
 question database, no export, no backup — and it is only sent once Aside can
-positively see that the provider's private mode is on. Missing, disabled, unreadable, unchanged or unconfirmed — all
-of them stop the branch **before anything is typed**, with the question preserved
-so you can retry or switch to a persistent branch. Nothing is ever downgraded from
-private to persistent automatically, and a selection made inside a private chat
-defaults to a private branch.
+positively see that the provider's private mode is on. Nothing is ever downgraded
+from private to persistent automatically, and a selection made inside a private
+chat defaults to a private branch.
+
+**Preparing the mode is a workflow, not a selector lookup.** Aside observes the
+branch document as three separate facts — whether the mode is offered here at
+all, what the page currently says the conversation is, and how far preparation
+has got — and acts on the next step only:
+
+| Observed | What Aside does |
+| --- | --- |
+| the provider's own control reads as on, or the provider's own active-mode interface is shown (Claude's "Incognito chat" label) | verified; the prompt is typed and sent once |
+| the control reads as off | it is activated once, then re-observed; only a provider-owned on-state counts |
+| the control exists but sits behind a menu (present, enabled, no box) | the menu opener is used, then the control; never reported as "unsupported" |
+| the provider asks a question (ChatGPT's Personalized / Unpersonalized choice) | Aside stops without choosing and waits for you |
+| the page navigated during preparation (Claude opens Incognito as a new page) | the pending question is carried to the new document — only while nothing has been typed yet |
+| the control is disabled | reported as unavailable in this branch window (usually a project or workspace rule) |
+| nothing observed yet | reported as not observed; unknown stays unknown |
+
+Every stop happens **before anything is typed**, with the question preserved and
+a recovery row under it: **Show branch window** (see the document Aside is
+looking at, and act in it), **Check again** (re-observe the *same* document and
+continue the pending question there — no reload, no new window), and, where it
+makes sense, **Use ordinary mode…** — a two-step choice that sends the question
+as an ordinary, saved chat only after you confirm. Aside never makes that switch
+by itself. Try again after such a stop reuses the branch window you may just
+have fixed.
 
 Before a private branch runs, the panel shows what that provider documents about
-its own private mode — including, on Claude, that Incognito is unavailable inside
-projects and that a closed Incognito chat cannot be reopened. The toggle carries
-the provider's own name for the mode, so it is recognisable in the provider's own
-interface.
+its own private mode. The note stays collapsed until you open it; inside a
+project it says once, on its own line, that the branch will start outside the
+project. The toggle carries the provider's own name for the mode, so it is
+recognisable in the provider's own interface.
 
 Private branch text, prompts, answers and logs are kept in session storage, which
 the browser clears when the session ends. They never reach durable storage. If a
@@ -97,6 +119,17 @@ its servers.
 The mode is re-checked after the composer is acquired and again before every
 submit attempt, not only the first: the fallback chain that handles providers
 where a click does not send spans several seconds of further attempts.
+
+### Mathematics in a selection
+
+A selection made inside a rendered formula (KaTeX, MathJax, MathML) is read
+against the live selection, not the copied fragment: the whole equation's source
+is recovered from the rendering's own annotation, so `$S_2 \ne S^2$` reaches the
+preview and the prompt as written, never as `S2≠S2`. A selection that covers only
+part of an equation is sent as that part, with the whole equation supplied
+separately and labelled as context, not as the selection. Fidelity is disclosed
+in the Context section (which equations were read, whether fully, and any that had
+no readable source). Nothing is "cleaned up" by a model or a regex.
 
 ## Local development
 
@@ -197,9 +230,20 @@ The audit checks for obvious release blockers such as:
 
 The export script creates a clean staged repo tree in a separate directory so you can inspect it before running `git init` and pushing it publicly.
 
+## Diagnostics
+
+The panel header keeps the everyday actions; **More** holds the diagnostics:
+**Copy log** (redacted: URLs, status, automation steps, private-mode
+observations as attributes only), **Copy log + text** (adds your selected text
+and the generated prompt) and **Select log** (shows the redacted report in the
+panel when the clipboard is blocked). Every report starts with the build ids of
+the page's content script, the service worker and the branch frame; the worker,
+frame and branch-tab handshakes all carry their build, and a mismatch is logged
+as `stale-client` and shown as a notice asking for a page reload.
+
 ## Privacy note
 
-Aside’s branch debug logs can include selected text, the generated first prompt, root and branch URLs, and branch status details. Review logs before sharing them in issues or public discussions.
+Aside's branch debug logs can include selected text, the generated first prompt, root and branch URLs, and branch status details (only with **Copy log + text**; the default report is redacted). Review logs before sharing them in issues or public discussions.
 
 ## License
 

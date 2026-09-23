@@ -41,6 +41,14 @@ export interface SelectionPayload {
   selectedText: string;
   /** Structure-preserving selection, used when building a prompt. */
   structuredSelectedText?: string;
+  /** Source of equations the selection only partly covers, supplied as context. */
+  enclosingEquations?: string[];
+  /** How faithfully the selection's mathematics was read; disclosed before sending. */
+  fidelity?: {
+    equations: Array<{ source: string; coverage: 'full' | 'partial' }>;
+    unreadableEquations: number;
+    limitations: string[];
+  };
   /** The user turn immediately before the anchored answer, offered but not included. */
   precedingQuestion?: SelectedBlock;
   selectedBlocks: SelectedBlock[];
@@ -100,6 +108,11 @@ export interface BranchPanelState {
   status: BranchPanelStatus;
   statusLabel: string;
   errorMessage?: string;
+  /**
+   * Where a private-mode preparation stopped, when the last failure was one.
+   * Drives the recovery controls; cleared by the next attempt.
+   */
+  recovery?: PrivacyRecovery;
   debugLog?: string[];
   createdAt: number;
   updatedAt: number;
@@ -142,6 +155,92 @@ export interface BranchFailedEvent {
   branchChatUrl?: string;
   launchTabId?: number;
   launchWindowId?: number;
+  /**
+   * Present when the failure is a private-mode preparation that stopped before
+   * anything was typed: the panel can offer Check again on the same target.
+   */
+  recovery?: PrivacyRecovery;
+  /** Build of the document that reported the failure. */
+  buildId?: string;
+}
+
+/** Sanitized description of a provider control: attributes only, never page text. */
+export interface PrivacyControlDescriptor {
+  tag: string;
+  role: string | null;
+  label: string;
+  rendered: boolean;
+  disabled: boolean;
+  ariaPressed: string | null;
+  ariaChecked: string | null;
+  ariaExpanded: string | null;
+  dataState: string | null;
+  inClosedMenu: boolean;
+}
+
+export type PrivacyAvailability =
+  | 'available'
+  | 'not-observed-yet'
+  | 'unavailable-in-this-context'
+  | 'unknown';
+
+export type PrivacyObservedMode = 'normal' | 'private' | 'unknown';
+
+export type PrivacyPreparationStep =
+  | 'page-loading'
+  | 'awaiting-login'
+  | 'locating-control'
+  | 'activating-mode'
+  | 'awaiting-choice'
+  | 'navigating'
+  | 'verifying-mode'
+  | 'ready'
+  | 'blocked';
+
+export type PrivacyEvidenceKind =
+  | 'control-state'
+  | 'interface-marker'
+  | 'chooser-dialog'
+  | 'control-hidden'
+  | 'control-disabled'
+  | 'none';
+
+export type PrivacyNextAction =
+  | 'open-menu'
+  | 'activate-control'
+  | 'choose-personalization'
+  | 'wait-for-page'
+  | 'sign-in'
+  | 'check-again'
+  | 'none';
+
+/**
+ * Where private-mode preparation stands, as a redacted, serializable record
+ * carried from the branch document to the panel. Capability, observed mode and
+ * preparation step are kept apart on purpose: "no selector matched" is a step
+ * still to take, not a verdict that the provider lacks the feature.
+ */
+export interface PrivacyRecovery {
+  step: PrivacyPreparationStep;
+  availability: PrivacyAvailability;
+  mode: PrivacyObservedMode;
+  evidence: PrivacyEvidenceKind;
+  nextAction: PrivacyNextAction;
+  /** Short, redacted reason for the panel. */
+  reason: string;
+  control: PrivacyControlDescriptor | null;
+  offerCheckAgain: boolean;
+  offerShowTarget: boolean;
+  offerOrdinaryMode: boolean;
+  observedAt: number;
+  /** Build of the document that made the observation, for stale-client detection. */
+  buildId?: string;
+}
+
+/** A private-mode preparation step reported while the branch is being prepared. */
+export interface BranchPreparationEvent {
+  kind: 'preparation';
+  recovery: PrivacyRecovery;
 }
 
 /** One exposed message of the branch conversation, as read from its page. */
@@ -174,7 +273,8 @@ export type BranchPanelEvent =
   | BranchTitleEvent
   | BranchLiveEvent
   | BranchFailedEvent
-  | BranchCapturedEvent;
+  | BranchCapturedEvent
+  | BranchPreparationEvent;
 
 /**
  * Identity every branch message must carry.
@@ -230,6 +330,23 @@ export interface RunBranchPromptInTabMessage extends BranchAttemptRef {
 export interface RunBranchPromptInTabResponse {
   ok: boolean;
   reason?: string;
+  /** Build of the content script that accepted the run; compared by the panel. */
+  buildId?: string;
+}
+
+/**
+ * Re-observe the SAME branch tab for a private-mode attempt that stopped before
+ * anything was typed, and continue the pending prompt there. No navigation, no
+ * new window: the target the Owner may just have fixed is the one checked.
+ */
+export interface RecheckBranchInTabMessage extends BranchAttemptRef {
+  type: 'RECHECK_BRANCH_IN_TAB';
+}
+
+export interface RecheckBranchInTabResponse {
+  ok: boolean;
+  reason?: string;
+  buildId?: string;
 }
 
 export interface BranchAutomationEventMessage extends BranchAttemptRef {
@@ -245,6 +362,7 @@ export interface ForwardBranchPanelEventMessage extends BranchAttemptRef {
 export type BackgroundRequestMessage =
   | CreateBranchWindowMessage
   | FocusBranchWindowMessage
+  | RecheckBranchInTabMessage
   | BranchAutomationEventMessage;
 
 /* ------------------------------------------------------------------ *
@@ -284,6 +402,8 @@ export interface PanelListResponse {
   records: PanelListedRecord[];
   /** True when private branches could not be read, so the UI can say so. */
   sessionUnavailable?: boolean;
+  /** Build of the service worker answering; a content script compares it with its own. */
+  buildId?: string;
 }
 
 export interface PanelWriteResponse {

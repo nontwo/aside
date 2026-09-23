@@ -148,7 +148,13 @@ export function extractStructuredNodeText(node: Node): string {
         element.closest<HTMLElement>('[data-latex]') ??
         element.closest<HTMLElement>('math') ??
         element;
-      equation.replaceWith(document.createTextNode(` $${latex.trim()}$ `));
+      // Pad only where the neighbouring text does not already separate the
+      // formula, so "Then $x$ holds." does not become "Then  $x$  holds.".
+      const before = equation.previousSibling?.textContent ?? '';
+      const after = equation.nextSibling?.textContent ?? '';
+      const lead = before && !/\s$/.test(before) ? ' ' : '';
+      const trail = after && !/^\s/.test(after) ? ' ' : '';
+      equation.replaceWith(document.createTextNode(`${lead}$${latex.trim()}$${trail}`));
     });
 
   container.querySelectorAll<HTMLElement>(activeTranscript.nonContentSelector).forEach((element) => {
@@ -245,8 +251,170 @@ function indexOfListItem(item: Element): number {
   return index;
 }
 
+/** Equation wrappers whose source Aside can read, in the order it prefers them. */
+const EQUATION_WRAPPER_SELECTOR = '.katex, [data-latex], mjx-container, math';
+
+/** How faithfully a selection's mathematics was read. */
+export interface SelectionFidelity {
+  /** Equations the selection touched, by source text. */
+  equations: Array<{ source: string; coverage: 'full' | 'partial' }>;
+  /** Equations touched whose source could not be read at all. */
+  unreadableEquations: number;
+  /** Human-readable limitations to disclose before sending. */
+  limitations: string[];
+}
+
+export interface StructuredSelection {
+  /** The focus: the selected text, structure preserved, equations as source. */
+  text: string;
+  /** Source of every equation the selection only partly covers, for context. */
+  enclosingEquations: string[];
+  fidelity: SelectionFidelity;
+}
+
+function equationSource(wrapper: Element): string | null {
+  const dataLatex = wrapper.getAttribute('data-latex');
+  if (dataLatex?.trim()) {
+    return dataLatex.trim();
+  }
+  const annotation = wrapper.querySelector('annotation[encoding*="tex" i]');
+  if (annotation?.textContent?.trim()) {
+    return annotation.textContent.trim();
+  }
+  // MathML without a TeX annotation: keep the MathML markup itself as source.
+  const mathml = wrapper.matches('math') ? wrapper : wrapper.querySelector('math');
+  if (mathml && !mathml.querySelector('annotation')) {
+    return mathml.outerHTML.length < 4_000 ? mathml.outerHTML : null;
+  }
+  return null;
+}
+
+function equationWrappersTouching(range: Range): Element[] {
+  const ancestor =
+    range.commonAncestorContainer instanceof Element
+      ? range.commonAncestorContainer
+      : range.commonAncestorContainer.parentElement;
+  if (!ancestor) {
+    return [];
+  }
+  const outermost: Element[] = [];
+  const candidates = [
+    ...(ancestor.matches(EQUATION_WRAPPER_SELECTOR) ? [ancestor] : []),
+    ...(ancestor.closest(EQUATION_WRAPPER_SELECTOR) ? [ancestor.closest(EQUATION_WRAPPER_SELECTOR)!] : []),
+    ...Array.from(ancestor.querySelectorAll(EQUATION_WRAPPER_SELECTOR))
+  ];
+  candidates.forEach((candidate) => {
+    let intersects = false;
+    try {
+      intersects = range.intersectsNode(candidate);
+    } catch {
+      intersects = false;
+    }
+    if (!intersects) {
+      return;
+    }
+    // Keep only outermost wrappers: a `math` inside a `.katex` is the same equation.
+    if (outermost.some((kept) => kept.contains(candidate))) {
+      return;
+    }
+    const inner = outermost.findIndex((kept) => candidate.contains(kept));
+    if (inner >= 0) {
+      outermost.splice(inner, 1);
+    }
+    if (!outermost.includes(candidate)) {
+      outermost.push(candidate);
+    }
+  });
+  return outermost;
+}
+
+/**
+ * Whether the selection covers the whole RENDERED equation. A user selecting a
+ * KaTeX formula selects its visual subtree; the assistive `.katex-mathml` twin is
+ * never part of a selection, so coverage is judged against the visual node.
+ */
+function rangeCoversWhole(range: Range, wrapper: Element): boolean {
+  const visual = wrapper.querySelector('.katex-html') ?? wrapper;
+  // Judged by rendered text, not by boundary points: a range that starts at
+  // offset 0 of the first glyph text node is, in DOM order, "after" the visual
+  // container's own start, yet it covers every rendered glyph.
+  const wanted = compactWhitespace(visual.textContent ?? '');
+  if (!wanted) {
+    return false;
+  }
+  return compactWhitespace(range.toString()).includes(wanted);
+}
+
+/**
+ * The selection as a model should read it, resolved against the LIVE document.
+ *
+ * `range.cloneContents()` of a selection that starts or ends inside an equation's
+ * visual subtree clones only glyph spans: no wrapper, no TeX annotation, nothing
+ * for the source promotion to find. The equations the selection touches are
+ * therefore identified on the live tree first; for each, the source is read from
+ * the wrapper, and the extraction range is widened to whole wrappers so the
+ * cloned fragment carries them. A partly selected equation is reported as such —
+ * the focus is not inflated to "the whole equation was selected" — and its full
+ * source is returned separately as context.
+ */
+export function extractStructuredSelection(range: Range): StructuredSelection {
+  const fidelity: SelectionFidelity = { equations: [], unreadableEquations: 0, limitations: [] };
+  const enclosingEquations: string[] = [];
+  const wrappers = equationWrappersTouching(range);
+
+  if (!wrappers.length) {
+    return { text: extractStructuredNodeText(range.cloneContents()), enclosingEquations, fidelity };
+  }
+
+  const widened = range.cloneRange();
+  wrappers.forEach((wrapper) => {
+    const source = equationSource(wrapper);
+    const full = rangeCoversWhole(range, wrapper);
+    if (source) {
+      fidelity.equations.push({ source, coverage: full ? 'full' : 'partial' });
+      if (!full) {
+        enclosingEquations.push(source);
+      }
+    } else {
+      fidelity.unreadableEquations += 1;
+    }
+    // Widen so the clone carries the whole wrapper (and its source annotation).
+    // comparePoint: -1 = the point lies before the range, 1 = after it.
+    const parent = wrapper.parentNode;
+    if (parent) {
+      const index = Array.prototype.indexOf.call(parent.childNodes, wrapper);
+      if (widened.comparePoint(parent, index) < 0) {
+        widened.setStartBefore(wrapper);
+      }
+      if (widened.comparePoint(parent, index + 1) > 0) {
+        widened.setEndAfter(wrapper);
+      }
+    }
+  });
+
+  let text = extractStructuredNodeText(widened.cloneContents());
+
+  const partial = fidelity.equations.filter((equation) => equation.coverage === 'partial');
+  if (partial.length) {
+    fidelity.limitations.push(
+      partial.length === 1
+        ? 'the selection covers part of an equation; its full source is included as context and marked as such'
+        : `the selection covers parts of ${partial.length} equations; their full sources are included as context and marked as such`
+    );
+    // Say it in the focus itself, so the model is not told the whole equation was selected.
+    text = `${text}\n(selection covers only part of the equation${partial.length > 1 ? 's' : ''} shown above)`;
+  }
+  if (fidelity.unreadableEquations) {
+    fidelity.limitations.push(
+      `${fidelity.unreadableEquations} equation${fidelity.unreadableEquations > 1 ? 's' : ''} in the selection exposed no readable source; what you see is the rendered glyph text, which may have lost sub/superscripts or operators`
+    );
+  }
+
+  return { text, enclosingEquations, fidelity };
+}
+
 export function extractStructuredRangeText(range: Range): string {
-  return extractStructuredNodeText(range.cloneContents());
+  return extractStructuredSelection(range).text;
 }
 
 export function extractCleanRangeText(range: Range): string {
@@ -389,6 +557,8 @@ export interface SelectionDraft {
   rootChatUrl: string;
   selectedText: string;
   structuredSelectedText: string;
+  enclosingEquations: string[];
+  fidelity: SelectionFidelity;
   rangeQuotes: RangeQuotes;
   fallbackScrollY: number;
   selectionRect: DOMRect;
@@ -523,11 +693,14 @@ export function captureSelectionDraftFromRange(range: Range): SelectionDraft | n
 
   const selectionRect = getRangeRect(range);
   const { rootConversationId, rootChatUrl } = activeScopeResolver();
+  const structured = extractStructuredSelection(range);
   return {
     rootConversationId,
     rootChatUrl,
     selectedText,
-    structuredSelectedText: extractStructuredRangeText(range),
+    structuredSelectedText: structured.text,
+    enclosingEquations: structured.enclosingEquations,
+    fidelity: structured.fidelity,
     rangeQuotes: getQuoteContext(range),
     fallbackScrollY: window.scrollY,
     selectionRect,
@@ -600,6 +773,8 @@ export function buildSelectionPayloadFromDraft(draft: SelectionDraft): Selection
     rootChatUrl: draft.rootChatUrl,
     selectedText: draft.selectedText,
     structuredSelectedText: draft.structuredSelectedText,
+    enclosingEquations: draft.enclosingEquations,
+    fidelity: draft.fidelity,
     precedingQuestion: findPrecedingQuestion(anchorAssistant.turnIndex) ?? undefined,
     selectedBlocks,
     branchBaseMessageId: anchorAssistant.messageId,
