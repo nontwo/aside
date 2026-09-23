@@ -16,6 +16,16 @@ import type {
 import { providerHostnames } from '../shared/providers/origins';
 import { isBranchAttemptRef, isBranchPanelEvent, ownsAttempt } from '../shared/branch-attempt';
 import { handlePanelDelete, handlePanelList, handlePanelUpsert } from './panel-authority';
+import {
+  ensureMigrated,
+  handleDomainBackup,
+  handleDomainCommand,
+  handleDomainExport,
+  handleDomainQuery,
+  handleDomainRestore,
+  handleLegacyCleanup
+} from '../storage/authority';
+import { isDomainRequest, type DomainRequestMessage } from '../storage/protocol';
 
 interface BranchWindowSession {
   panelId: string;
@@ -87,11 +97,16 @@ async function allowContentScriptSessionStorage(): Promise<void> {
 }
 
 void allowContentScriptSessionStorage();
+// The legacy migration is journaled and idempotent, so running it on every
+// worker start is safe and is what makes an interrupted run resume.
+void ensureMigrated();
 chrome.runtime.onStartup.addListener(() => {
   void allowContentScriptSessionStorage();
+  void ensureMigrated();
 });
 chrome.runtime.onInstalled.addListener(() => {
   void allowContentScriptSessionStorage();
+  void ensureMigrated();
 });
 
 async function persistSessions(): Promise<void> {
@@ -513,11 +528,45 @@ type WorkerMessage =
   | BackgroundRequestMessage
   | PanelUpsertMessage
   | PanelDeleteMessage
-  | { type: 'PANEL_LIST' };
+  | { type: 'PANEL_LIST' }
+  | DomainRequestMessage;
 
 chrome.runtime.onMessage.addListener((message: WorkerMessage, sender, sendResponse) => {
   if (!message || typeof message !== 'object' || !('type' in message)) {
     return false;
+  }
+
+  // Durable question records: one authority, one transaction per command, and a
+  // response only after the commit. Requests are accepted from this extension's
+  // own content scripts and pages only.
+  if (isDomainRequest(message)) {
+    if (sender.id !== chrome.runtime.id) {
+      return false;
+    }
+    const respond = (value: unknown) => sendResponse(value);
+    const fail = (error: unknown) => sendResponse({ ok: false, reason: describeError(error) });
+    switch (message.type) {
+      case 'DOMAIN_COMMAND':
+        void handleDomainCommand(message).then(respond, fail);
+        return true;
+      case 'DOMAIN_QUERY':
+        void handleDomainQuery(message).then(respond, fail);
+        return true;
+      case 'DOMAIN_BACKUP':
+        void handleDomainBackup().then(respond, fail);
+        return true;
+      case 'DOMAIN_RESTORE':
+        void handleDomainRestore(message.backup).then(respond, fail);
+        return true;
+      case 'DOMAIN_EXPORT_MARKDOWN':
+        void handleDomainExport(message.sourceId).then(respond, fail);
+        return true;
+      case 'DOMAIN_LEGACY_CLEANUP':
+        void handleLegacyCleanup(message.confirm).then(respond, fail);
+        return true;
+      default:
+        return false;
+    }
   }
 
   // Every branch message is validated as data on arrival, not trusted by shape.
