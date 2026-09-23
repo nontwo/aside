@@ -81,6 +81,15 @@ export interface ConversationIdentity {
   conversationUrl: string | null;
   /** URL that opens a NEW conversation in the same container. */
   launchUrl: string;
+  /**
+   * Where to start a branch that must NOT inherit the current project.
+   *
+   * A private branch cannot stay in a project: both providers document private
+   * mode as unavailable there. Launching one at the project route is why a live
+   * ChatGPT Temporary branch found the toggle present but unrendered (0x0) and
+   * refused — correctly, but for a reason Aside had created.
+   */
+  rootLaunchUrl: string;
   /** Container (project) home URL, when the page is inside one. */
   containerUrl: string | null;
   /**

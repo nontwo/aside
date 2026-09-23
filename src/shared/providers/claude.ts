@@ -153,6 +153,7 @@ function identify(url: string, sessionDiscriminator: string): ConversationIdenti
       containerId: null,
       conversationUrl: null,
       launchUrl: `${ORIGINS[0]}/new`,
+      rootLaunchUrl: `${ORIGINS[0]}/new`,
       containerUrl: null,
       urlPrivacyHint: 'unknown',
       scopeKey: `claude:session:${sessionDiscriminator}`
@@ -166,6 +167,7 @@ function identify(url: string, sessionDiscriminator: string): ConversationIdenti
   const containerUrl = projectId ? `${origin}/project/${projectId}` : null;
   // A new chat inside a project starts from the project page; otherwise /new.
   const launchUrl = containerUrl ?? `${origin}/new`;
+  const rootLaunchUrl = `${origin}/new`;
 
   // Claude does not expose a documented incognito query parameter, so the URL tells
   // us nothing about privacy either way. Saying 'unknown' keeps callers from
@@ -184,6 +186,7 @@ function identify(url: string, sessionDiscriminator: string): ConversationIdenti
     containerId: projectId,
     conversationUrl: conversationId ? normalizeUrl(url) : null,
     launchUrl,
+    rootLaunchUrl,
     containerUrl,
     urlPrivacyHint,
     scopeKey
@@ -367,12 +370,17 @@ export const claudeAdapter: ProviderAdapter = {
     // unauthenticated response — so this is not flipped to "supported" either.
     // It is attempted once, the outcome is observed from the rendered frame, and
     // a refusal falls back to a driven window for the rest of the session.
-    embedded: 'unverified',
+    // Upgraded from 'unverified' on evidence from a live logged-in account: the
+    // frame loaded and completed its handshake at claude.ai/new, logged as
+    // "frameRefused": false. It is 'fixture-only' rather than 'verified' because
+    // one successful load on one account is not a guarantee for every account or
+    // enterprise policy — a refusal is still detected at runtime and falls back.
+    embedded: 'fixture-only',
     // Implemented and fixture-exercised, never run against a live Claude account.
     // See the SELECTOR PROVENANCE note at the top of this file.
     nativeWindow: 'fixture-only',
     detail:
-      'Aside attempts an in-page panel frame on Claude. If claude.ai refuses to be framed, the branch falls back to a window Aside controls and stays there for the rest of the session.'
+      'Aside runs Claude branches in an in-page panel frame, which has been observed to load on a live account. If claude.ai refuses to be framed on yours, the branch falls back to a window Aside controls and stays there for the rest of the session.'
   },
 
   privacy: {

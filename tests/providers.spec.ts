@@ -152,10 +152,10 @@ describe('declared capabilities are explicit, not optimistic', () => {
     expect(surfaceIsAvailable(claudeAdapter.surfaces.embedded)).toBe(false);
   });
 
-  it('claims no surface as live-verified, because none has been run against a live account', () => {
-    // `verified` is defined as "observed in the live DOM". Nothing in this build
-    // observes a surface — the values are static — so claiming it would be an
-    // unearned confidence level, which is the failure mode this test exists for.
+  it('claims no surface as live-verified', () => {
+    // `verified` means the adapter positively observes the capability in the live
+    // DOM. The runtime observation does that per session; the static declaration
+    // must not claim it for every account in advance.
     [chatgptAdapter, claudeAdapter].forEach((adapter) => {
       expect(adapter.surfaces.embedded).not.toBe('verified');
       expect(adapter.surfaces.nativeWindow).not.toBe('verified');
@@ -173,15 +173,21 @@ describe('declared capabilities are explicit, not optimistic', () => {
   it('separates what may be attempted from what may be claimed', () => {
     // The defect this exists for: Claude's embedded surface was marked
     // unsupported on an unchecked assumption, and because the same flag gated the
-    // attempt, nothing could ever check it. An unverified surface is tried once.
-    expect(claudeAdapter.surfaces.embedded).toBe('unverified');
-    expect(surfaceIsAvailable(claudeAdapter.surfaces.embedded)).toBe(false);
+    // attempt, nothing could ever check it.
+    expect(surfaceMayBeAttempted('unverified')).toBe(true);
+    expect(surfaceIsAvailable('unverified')).toBe(false);
+  });
+
+  it('records that the Claude panel frame has been observed to load', () => {
+    // A live run logged frameRefused:false at claude.ai/new. Not 'verified':
+    // one account is not every account, and a refusal still falls back.
+    expect(claudeAdapter.surfaces.embedded).toBe('fixture-only');
     expect(surfaceMayBeAttempted(claudeAdapter.surfaces.embedded)).toBe(true);
   });
 
   it('stops attempting a surface once it has been observed to fail', () => {
-    expect(surfaceMayBeAttempted(claudeAdapter.surfaces.embedded, 'refused')).toBe(false);
-    expect(surfaceMayBeAttempted(claudeAdapter.surfaces.embedded, 'worked')).toBe(true);
+    expect(surfaceMayBeAttempted('fixture-only', 'refused')).toBe(false);
+    expect(surfaceMayBeAttempted('unverified', 'worked')).toBe(true);
   });
 
   it('never attempts a surface declared unsupported, whatever was observed', () => {
@@ -197,11 +203,31 @@ describe('declared capabilities are explicit, not optimistic', () => {
     expect(claudeAdapter.surfaces.detail).toMatch(/falls back/i);
   });
 
-  it('records that Claude Incognito leaves a project but ChatGPT Temporary Chat does not', () => {
+  it('records that private mode leaves a project on both providers', () => {
+    // ChatGPT was `false` here on an assumption. A live run launched a Temporary
+    // branch at a project route and found the Temporary Chat control present but
+    // unrendered — a 0x0 box — which is what "not offered here" looks like from
+    // the DOM. Both providers now say what they do with the project.
     expect(claudeAdapter.privacy.leavesContainer).toBe(true);
-    expect(chatgptAdapter.privacy.leavesContainer).toBe(false);
+    expect(chatgptAdapter.privacy.leavesContainer).toBe(true);
     expect(claudeAdapter.privacy.constraints.join(' ')).toMatch(/project/i);
+    expect(chatgptAdapter.privacy.constraints.join(' ')).toMatch(/project/i);
     expect(chatgptAdapter.privacy.constraints.join(' ')).toMatch(/personaliz/i);
+  });
+
+  it('offers a container-free launch url for a private branch', () => {
+    // The root cause of the live refusal: a private branch launched at the
+    // project route, where the provider does not offer its private mode at all.
+    const inProject = chatgptAdapter.identify(
+      'https://chatgpt.com/g/g-p-abc/c/conv-1',
+      'sess'
+    );
+    expect(inProject.containerId).toBeTruthy();
+    expect(inProject.launchUrl).toMatch(/\/project$/);
+    expect(inProject.rootLaunchUrl).toBe('https://chatgpt.com/');
+
+    const claudeProject = claudeAdapter.identify('https://claude.ai/project/p-1', 'sess');
+    expect(claudeProject.rootLaunchUrl).toBe('https://claude.ai/new');
   });
 });
 

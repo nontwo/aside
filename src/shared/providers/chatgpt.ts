@@ -122,6 +122,7 @@ function identify(url: string, sessionDiscriminator: string): ConversationIdenti
       conversationUrl: null,
       launchUrl: `${ORIGINS[0]}/`,
       containerUrl: null,
+      rootLaunchUrl: `${ORIGINS[0]}/`,
       urlPrivacyHint: 'unknown',
       scopeKey: `chatgpt:session:${sessionDiscriminator}`
     };
@@ -134,6 +135,7 @@ function identify(url: string, sessionDiscriminator: string): ConversationIdenti
   const containerUrl = projectId ? `${origin}/g/${projectId}` : null;
   // Projects launch a new chat from their /project route; everything else from root.
   const launchUrl = containerUrl ? `${containerUrl}/project` : `${origin}/`;
+  const rootLaunchUrl = `${origin}/`;
 
   // ChatGPT marks a temporary chat with a query parameter. It is a hint only:
   // the parameter can be absent on a temporary chat opened by other means, and
@@ -154,6 +156,7 @@ function identify(url: string, sessionDiscriminator: string): ConversationIdenti
     containerId: projectId,
     conversationUrl: conversationId ? normalizeUrl(url) : null,
     launchUrl,
+    rootLaunchUrl,
     containerUrl,
     urlPrivacyHint,
     scopeKey
@@ -331,10 +334,14 @@ export const chatgptAdapter: ProviderAdapter = {
   privacy: {
     label: 'Temporary Chat',
     constraints: [
+      'Temporary Chat is not offered inside a project. A private branch started from a project conversation therefore runs outside it, so the project\'s files and instructions do not travel with the branch.',
       'Temporary Chat controls chat history, not personalization: ChatGPT documents both personalized and unpersonalized temporary chats, so selecting it does not by itself mean memory is unused.',
       'A temporary chat can later be saved to regular history from ChatGPT itself. Aside treats that as a state change, not a failure.',
       'Aside can only observe the page. It cannot prove anything about server-side retention.'
     ],
-    leavesContainer: false
+    // Corrected from `false` on live evidence: a Temporary branch launched at a
+    // project route found the Temporary Chat control present but unrendered
+    // (a 0x0 box), which is what "not offered here" looks like from the DOM.
+    leavesContainer: true
   }
 };

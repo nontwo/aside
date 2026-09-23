@@ -172,3 +172,37 @@ export function isAcceptableSendControl(profile: SendCandidateProfile): boolean 
 
   return profile.explicitSend || profile.submitLike;
 }
+
+/**
+ * How much a composer candidate's size counts against it.
+ *
+ * Size used to be a veto: `rect.width < 120 || rect.height < 24` returned
+ * -Infinity, which made a present composer invisible to the picker. This repo has
+ * already been bitten by it once — commit 9621ee1 found that an empty
+ * contenteditable has no intrinsic height, and the FIXTURE was padded to work
+ * around it rather than the gate being fixed. A live Claude run then spent twenty
+ * seconds failing to find a composer.
+ *
+ * Small is a reason to rank last, not a reason to be unusable. Genuinely unusable
+ * — no layout box, display:none, visibility:hidden, disabled, readonly — stays a
+ * hard rejection, decided elsewhere.
+ */
+export function composerSizePenalty(
+  width: number,
+  height: number,
+  structuralOnly = false
+): number {
+  let penalty = 0;
+  if (width < 120) {
+    penalty -= 200;
+  }
+  if (height < 24) {
+    penalty -= 100;
+  }
+  if (structuralOnly) {
+    // Found by structure rather than by the adapter's own selectors: usable, but
+    // the adapter's knowledge should win whenever it has any.
+    penalty -= 50;
+  }
+  return penalty;
+}

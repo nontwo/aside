@@ -59,6 +59,7 @@ import { surfaceMayBeAttempted } from '../shared/providers/types';
 import type { SurfaceObservation } from '../shared/providers/types';
 import type { Rect } from '../shared/placement';
 import {
+  composerSizePenalty,
   getActionLabel,
   getSendCandidateProfile,
   inferTemporaryChatState,
@@ -108,6 +109,7 @@ interface PanelRuntime {
   branchKindField: HTMLDivElement;
   privacyNoteEl: HTMLDetailsElement;
   privacyStorageWarning: HTMLParagraphElement;
+  privacyContainerWarning: HTMLParagraphElement;
   persistentKindButton: HTMLButtonElement;
   temporaryKindButton: HTMLButtonElement;
   questionInput: HTMLTextAreaElement;
@@ -250,6 +252,35 @@ let provider: ProviderAdapter = getAdapter('chatgpt');
  * somebody else's panels.
  */
 const sessionDiscriminator = randomId('doc').slice(4);
+
+/**
+ * Where a branch of this kind should start.
+ *
+ * A private branch cannot stay inside a project: both providers document private
+ * mode as unavailable there. Launching one at the project route is exactly what a
+ * live ChatGPT run did — the Temporary Chat control was present but unrendered
+ * (a 0x0 box), so its state could not be read and the branch was refused. The
+ * refusal was correct; the launch URL was not.
+ *
+ * This drops the project's files and instructions from the branch, which is a
+ * real loss of context. It is stated in the panel before the branch is sent, never
+ * silently.
+ */
+function resolveLaunchUrl(identity: ConversationIdentity, branchKind: BranchKind): string {
+  if (branchKind === 'temporary' && identity.containerId && provider.privacy.leavesContainer) {
+    return identity.rootLaunchUrl;
+  }
+  return identity.launchUrl;
+}
+
+/** True when this branch will be pulled out of its project by going private. */
+function privateBranchLeavesContainer(state: BranchPanelState): boolean {
+  return (
+    state.branchKind === 'temporary' &&
+    Boolean(currentIdentity(state.rootChatUrl).containerId) &&
+    provider.privacy.leavesContainer
+  );
+}
 
 function currentIdentity(url = lastKnownUrl): ConversationIdentity {
   return provider.identify(url, sessionDiscriminator);
@@ -2913,6 +2944,11 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   // but Aside will not fall back to writing its content to disk, so the panel
   // cannot be kept. The user should hear that before choosing the mode, not after
   // the branch disappears.
+  const privacyContainerWarning = document.createElement('p');
+  privacyContainerWarning.className = 'aside-privacy-warning';
+  privacyContainerWarning.textContent = `${provider.privacy.label} is not available inside a project, so this branch will start outside it. The project's files and instructions will not travel with it.`;
+  privacyContainerWarning.hidden = true;
+
   const privacyStorageWarning = document.createElement('p');
   privacyStorageWarning.className = 'aside-privacy-warning';
   privacyStorageWarning.textContent =
@@ -2924,7 +2960,12 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     item.textContent = constraint;
     privacyNoteList.append(item);
   });
-  privacyNoteEl.append(privacyNoteSummary, privacyStorageWarning, privacyNoteList);
+  privacyNoteEl.append(
+    privacyNoteSummary,
+    privacyContainerWarning,
+    privacyStorageWarning,
+    privacyNoteList
+  );
   const questionInput = document.createElement('textarea');
   // Stable hook: the panel has more than one textarea, and selectors that rely on
   // document order break the moment a section is added above this one.
@@ -3038,6 +3079,7 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     branchKindField,
     privacyNoteEl,
     privacyStorageWarning,
+    privacyContainerWarning,
     persistentKindButton,
     temporaryKindButton,
     questionInput,
@@ -3312,6 +3354,14 @@ function syncPanelUI(runtime: PanelRuntime): void {
   runtime.branchKindField.style.display = canShowBranchKindToggle(state) ? 'inline-flex' : 'none';
   const privacyNoteVisible = showForm && state.branchKind === 'temporary';
   runtime.privacyNoteEl.hidden = !privacyNoteVisible;
+
+  // Losing the project's files and instructions is a real change to what the
+  // branch can see. Say it before the branch is sent, not after.
+  const leavesContainer = privateBranchLeavesContainer(state);
+  runtime.privacyContainerWarning.hidden = !(privacyNoteVisible && leavesContainer);
+  if (privacyNoteVisible && leavesContainer) {
+    runtime.privacyNoteEl.open = true;
+  }
   runtime.privacyStorageWarning.hidden = sessionStorageUsable;
   if (privacyNoteVisible && !sessionStorageUsable) {
     // A limitation the user needs before choosing, not one they have to open.
@@ -3746,7 +3796,9 @@ async function openSelectionInNewTab(
   selection: SelectionPayload,
   branchKind: BranchKind
 ): Promise<void> {
-  const launchUrl = provider.normalizeUrl(currentIdentity(selection.rootChatUrl).launchUrl);
+  const launchUrl = provider.normalizeUrl(
+    resolveLaunchUrl(currentIdentity(selection.rootChatUrl), branchKind)
+  );
 
   // New-tab assembles its prompt exactly as Ask and Why do, from the structured
   // context rather than the normalized anchor text.
@@ -4386,7 +4438,9 @@ async function startBranch(panelId: string, question: string): Promise<void> {
 
   const frozen = freezeContext(context);
   const prompt = buildBranchPrompt({ contextText: frozen.text, question }).prompt;
-  const launchUrl = provider.normalizeUrl(currentIdentity(runtime.state.rootChatUrl).launchUrl);
+  const launchUrl = provider.normalizeUrl(
+    resolveLaunchUrl(currentIdentity(runtime.state.rootChatUrl), runtime.state.branchKind)
+  );
 
   if (!launchUrl) {
     runtime.state.initialQuestion = question;
@@ -5084,6 +5138,18 @@ function queryMany<T extends Element = HTMLElement>(selectors: string[], root: P
   return results;
 }
 
+/**
+ * Composer candidates, adapter selectors first and structure as a hedge.
+ *
+ * The adapter's selectors stay tier 1 — they are the provider knowledge this
+ * codebase is organised around, and they found the live ChatGPT composer. But all
+ * five of Claude's require tag DIV and the literal attribute value "true", so
+ * `contenteditable=""`, `contenteditable="plaintext-only"` and inherited
+ * editability are invisible to them. Tier 2 enumerates by a property of the
+ * rendered page instead — `isContentEditable`, or a real textarea — across shadow
+ * roots too, and is scored below any tier-1 match so selector drift degrades the
+ * ranking rather than being fatal.
+ */
 function getComposerCandidates(): Array<HTMLElement | HTMLTextAreaElement> {
   const selectors = provider.composer.composerSelectors;
   const seen = new Set<Element>();
@@ -5096,8 +5162,41 @@ function getComposerCandidates(): Array<HTMLElement | HTMLTextAreaElement> {
     seen.add(candidate);
     candidates.push(candidate);
   });
+
+  const tierOneCount = candidates.length;
+
+  getDeepQueryRoots().forEach((root) => {
+    root.querySelectorAll<HTMLElement>('textarea, [contenteditable]').forEach((element) => {
+      if (seen.has(element)) {
+        return;
+      }
+      const editable =
+        element instanceof HTMLTextAreaElement || element.isContentEditable === true;
+      if (!editable) {
+        return;
+      }
+      // The outermost editable host: an editable child of an editable is part of
+      // the same field, not a second composer.
+      if (
+        !(element instanceof HTMLTextAreaElement) &&
+        element.parentElement?.closest('[contenteditable]')
+      ) {
+        return;
+      }
+      seen.add(element);
+      structuralComposerCandidates.add(element);
+      candidates.push(element);
+    });
+  });
+
+  composerCensusCounts = { tierOne: tierOneCount, total: candidates.length };
   return candidates;
 }
+
+/** Candidates found only by structure, so they can be ranked below adapter matches. */
+const structuralComposerCandidates = new WeakSet<Element>();
+
+let composerCensusCounts = { tierOne: 0, total: 0 };
 
 function isDisabledElement(element: Element): boolean {
   if (element instanceof HTMLButtonElement || element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
@@ -5107,19 +5206,43 @@ function isDisabledElement(element: Element): boolean {
   return element.getAttribute('aria-disabled') === 'true';
 }
 
+/** Why a candidate was rejected, so a failure can say which gate closed. */
+type ComposerRejection = 'not-visible' | 'disabled' | 'readonly' | 'accepted';
+
+let lastComposerRejection: ComposerRejection = 'accepted';
+
 function scoreComposerCandidate(candidate: HTMLElement | HTMLTextAreaElement): number {
-  if (!isElementVisible(candidate) || isDisabledElement(candidate)) {
+  lastComposerRejection = 'accepted';
+
+  // Hard gates, all of them properties of the rendered page rather than markup.
+  // An element with no layout box must never win: it also becomes the anchor the
+  // privacy control is searched around.
+  if (!isElementVisible(candidate)) {
+    lastComposerRejection = 'not-visible';
+    return Number.NEGATIVE_INFINITY;
+  }
+  if (isDisabledElement(candidate)) {
+    lastComposerRejection = 'disabled';
     return Number.NEGATIVE_INFINITY;
   }
 
   if (candidate.getAttribute('readonly') === 'true' || candidate.hasAttribute('readonly')) {
+    lastComposerRejection = 'readonly';
     return Number.NEGATIVE_INFINITY;
   }
 
   const rect = candidate.getBoundingClientRect();
-  if (rect.width < 120 || rect.height < 24) {
-    return Number.NEGATIVE_INFINITY;
-  }
+
+  // Size is a penalty, not a veto. This repo has already been bitten by the veto
+  // once — commit 9621ee1 found that an empty contenteditable has no intrinsic
+  // height, and the fixture was padded to work around it rather than the gate
+  // being fixed. A small but genuinely rendered composer must still be able to
+  // win when nothing better exists.
+  const sizePenalty = composerSizePenalty(
+    rect.width,
+    rect.height,
+    structuralComposerCandidates.has(candidate)
+  );
 
   const label = compactWhitespace(
     [
@@ -5162,7 +5285,74 @@ function scoreComposerCandidate(candidate: HTMLElement | HTMLTextAreaElement): n
   score += Math.max(0, Math.round(rect.top / 3));
   score += Math.max(0, Math.round((window.innerHeight - Math.max(0, window.innerHeight - rect.bottom)) / 6));
 
-  return score;
+  return score + sizePenalty;
+}
+
+/**
+ * What the composer picker actually saw, for a failure that can be diagnosed.
+ *
+ * The live Claude run produced twenty seconds of silence and then one sentence —
+ * "The Claude composer did not appear in time." — which cannot distinguish "the
+ * page rendered no composer" from "a composer was there and every gate rejected
+ * it". Those need opposite fixes, and guessing between them is how this project
+ * has already lost two rounds.
+ *
+ * Structure only: tags, roles, geometry, computed visibility, rejection reasons.
+ * No field values, no page text.
+ */
+function describeComposerCensus(): Record<string, unknown> {
+  const selectorHits: Record<string, number> = {};
+  provider.composer.composerSelectors.forEach((selector) => {
+    try {
+      selectorHits[selector] = queryMany<HTMLElement>([selector]).length;
+    } catch {
+      selectorHits[selector] = -1;
+    }
+  });
+
+  const candidates = getComposerCandidates().slice(0, 8).map((candidate) => {
+    const rect = candidate.getBoundingClientRect();
+    const style = window.getComputedStyle(candidate);
+    const score = scoreComposerCandidate(candidate);
+    return {
+      tag: candidate.tagName,
+      role: candidate.getAttribute('role'),
+      testId: candidate.getAttribute('data-testid'),
+      contentEditableAttr: candidate.getAttribute('contenteditable'),
+      isContentEditable: candidate.isContentEditable === true,
+      hasPlaceholder: Boolean(
+        candidate.getAttribute('placeholder') ?? candidate.getAttribute('data-placeholder')
+      ),
+      rect: {
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        top: Math.round(rect.top)
+      },
+      clientRects: candidate.getClientRects().length,
+      display: style.display,
+      visibility: style.visibility,
+      opacity: style.opacity,
+      structuralOnly: structuralComposerCandidates.has(candidate),
+      score: Number.isFinite(score) ? score : null,
+      rejectedBy: Number.isFinite(score) ? null : lastComposerRejection
+    };
+  });
+
+  return {
+    providerId: provider.id,
+    readyState: document.readyState,
+    visibilityState: document.visibilityState,
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+    deepRoots: getDeepQueryRoots().length,
+    editableHosts: getDeepQueryRoots().reduce(
+      (total, root) => total + root.querySelectorAll('[contenteditable],textarea').length,
+      0
+    ),
+    selectorHits,
+    tierOneMatches: composerCensusCounts.tierOne,
+    candidateCount: composerCensusCounts.total,
+    candidates
+  };
 }
 
 function describeComposerCandidate(candidate: HTMLElement | HTMLTextAreaElement): Record<string, unknown> {
@@ -5199,15 +5389,36 @@ function findComposer(): HTMLElement | HTMLTextAreaElement | null {
 }
 
 async function waitForComposer(timeoutMs = 20_000): Promise<HTMLElement | HTMLTextAreaElement> {
+  // A frame that is not being rendered has no laid-out anything, so every
+  // candidate fails the visibility gate and the wait burns its whole budget
+  // blaming the composer for it. Say what is actually wrong instead.
+  if (window.innerWidth === 0 || window.innerHeight === 0) {
+    recordAutomationLog('Branch frame is not being rendered', {
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      visibilityState: document.visibilityState
+    });
+    throw new Error(
+      `The branch window is not being rendered, so nothing could be typed into ${provider.label}.`
+    );
+  }
+
   const deadline = Date.now() + timeoutMs;
+  let censusLogged = false;
+  const censusAt = Date.now() + 2_000;
+
   while (Date.now() < deadline) {
     const composer = findComposer();
     if (composer) {
       return composer;
     }
+    if (!censusLogged && Date.now() >= censusAt) {
+      censusLogged = true;
+      recordAutomationLog('Composer not found yet', describeComposerCensus());
+    }
     await sleep(250);
   }
 
+  recordAutomationLog('Composer search timed out', describeComposerCensus());
   throw new Error(`The ${provider.label} composer did not appear in time.`);
 }
 
@@ -5692,6 +5903,32 @@ async function ensureTemporaryChatMode(
   }
 
   if (primaryState === 'unknown') {
+    // Two different situations produce 'unknown', and they need different advice.
+    // Report what was MEASURED — a layout box, and the computed styles
+    // isElementVisible folds together — rather than naming a CSS cause the
+    // rounded rect in the log cannot actually support.
+    const controlRect = primaryCandidate.getBoundingClientRect();
+    const controlStyle = window.getComputedStyle(primaryCandidate);
+    const notRendered =
+      controlRect.width <= 0 ||
+      controlRect.height <= 0 ||
+      primaryCandidate.getClientRects().length === 0;
+
+    recordAutomationLog('Private mode state could not be read', {
+      notRendered,
+      rect: { width: Math.round(controlRect.width), height: Math.round(controlRect.height) },
+      clientRects: primaryCandidate.getClientRects().length,
+      display: controlStyle.display,
+      visibility: controlStyle.visibility,
+      opacity: controlStyle.opacity
+    });
+
+    if (notRendered) {
+      throw new PrivacyNotVerifiedError(
+        `${provider.label}'s ${label} control is on this page but is not being shown here, so nothing was typed or sent. This is usual inside a project. Turn ${label} on yourself and try again, or switch this branch to Persistent.`
+      );
+    }
+
     throw new PrivacyNotVerifiedError(
       `${provider.label} did not report whether ${label} is on, so nothing was typed or sent. Turn ${label} on yourself and try again, or switch this branch to Persistent.`
     );
