@@ -1,118 +1,117 @@
 # Owner visual acceptance
 
-Everything below is offline-verified except where marked. Live provider checks are
-the part only you can do — no live ChatGPT or Claude account was used in this work.
+Everything below is offline-verified against fixtures unless marked **live**. Live
+checks on real accounts are the part only you can do; this build has not been
+run against one by the maintainer.
 
 ## Load the build
 
 ```bash
-npm ci
 npm run build
 ```
 
 1. `chrome://extensions/` → Developer Mode → **Load unpacked** → select `dist/`.
-2. If Aside is already loaded, press **Reload** on its card. The manifest now
-   requests `https://claude.ai/*`; Chrome does not grant a new host permission to
-   an extension that is merely refreshed in the page. Confirm the card lists
-   `claude.ai` under *Site access* and approve it if asked.
+   If Aside is already loaded, press **Reload** on its card. Chrome will not grant
+   a new host permission to an extension that is merely refreshed in the page;
+   confirm the card lists `claude.ai` under *Site access*.
+2. The card's toolbar icon now opens Aside's **library** (a toolbar action; no
+   new permission was added).
 3. Hard-reload `chatgpt.com` and `claude.ai`. The content script is injected on
    page load only.
+4. The build identifier appears in the library footer and in any **Copy log**
+   report as `build: <sha>[-dirty]+<timestamp>`. Compare it with the PR head.
 
-Reference images captured from the fixtures live in
-[`docs/layout-evidence/`](./layout-evidence/), including the panel with its
-Context section and each provider's private-mode note.
+Reference images captured from fixtures live in
+[`docs/layout-evidence/`](./layout-evidence/).
 
-## Checklist
+## Walkthrough
 
-### 1. Native options still work
+### 1. Native controls still work
 
 - [ ] Select text in an assistant answer. The provider's own selection actions
-      appear exactly as they did before, in the same place.
-- [ ] Click one of them. It does what it always did.
-- [ ] Aside's toolbar sits *beside* them, labelled `Aside`, overlapping nothing —
-      in **either** direction. Check the provider's own buttons are fully visible
-      and clickable, not just that Aside's are.
-- [ ] Select with the keyboard (Shift+Arrow) and copy with Cmd/Ctrl+C. Both work.
-- [ ] Open a provider menu and press Escape. The menu closes; Aside does not
-      swallow it.
-- [ ] Right-click a selection. The browser context menu appears normally.
+      appear as before, in the same place. Aside's toolbar sits beside them; both
+      are fully clickable. Right-click, copy, keyboard selection and Escape on a
+      provider menu all behave normally.
 
-### 2. Left rail
+### 2. Ask, with visible context
 
-- [ ] Start a branch, then Minimize. The tab appears in the gutter **left** of the
-      reading column and **right** of the provider's navigation.
-- [ ] Collapse and expand the provider sidebar. The rail re-anchors and never
-      overlaps it.
-- [ ] Narrow the window until the gutter disappears. The rail is replaced by a
-      compact `Aside (n)` entry in free space — not stacked on native chrome.
-- [ ] Open a tool/artifact pane. The rail stays clear of it.
+- [ ] Select a **math** passage inside a longer derivation and press `Ask`. The
+      panel shows *Selected local focus*, and **Context** summarises the actual
+      plan: the passage, its enclosing step/paragraph, the question that produced
+      the answer.
+- [ ] Open Context. Untick the enclosing unit; the preview shrinks. Tick it back.
+      The preview is the complete prompt, instructions and question included.
+- [ ] Type a question and press **Start branch**. On ChatGPT the answer runs in
+      the panel frame. On Claude it also tries the panel frame first; if claude.ai
+      refuses framing on your account it moves to a window Aside opens, with no
+      error — note which of the two you see (**live**).
+- [ ] The title is taken from your question and is renameable from the list. No
+      `[[BRANCH_TITLE …]]` line is requested from the model.
+- [ ] As the answer streams, **Saved so far** appears in the panel and settles to
+      *Captured through message N*.
 
-### 3. Branching, both providers
+### 3. Why and New-tab
 
-On ChatGPT and again on Claude:
+- [ ] `Why` asks in one click and runs the same pipeline.
+- [ ] `New-tab` opens a **draft** first; nothing is sent until you type and press
+      Start branch, and then the real question is sent once, in its own window.
 
-- [ ] `Ask` opens a panel. The **Context** section shows the passage, the answer
-      blocks it read, and a preview of the exact text that will be sent.
-- [ ] Untick a block; the preview shrinks. Tick the preceding question; it appears.
-- [ ] Send. The answer addresses the passage. On both providers Aside first tries
-      to run it in the in-page panel. If claude.ai refuses to be framed, the branch
-      should move to a window Aside opens **by itself**, without an error — and
-      stay there for the rest of the session. Tell me which of the two you see on
-      Claude: that is the one thing offline testing cannot settle.
-- [ ] Ask a follow-up inside the branch. It still works.
-- [ ] Minimize, restore, and use **Jump to origin** — the original passage is
-      highlighted and you have not lost your reading position.
-- [ ] `Why` does the same in one click; `New-tab` opens its own window.
+### 4. Follow-up and continuation
 
-### 4. Private branches
+- [ ] Type a follow-up in the branch conversation itself. It stays in the same
+      provider conversation; the panel's saved thread grows.
+- [ ] Press **Close**. The panel disappears; nothing is deleted. Open
+      **Questions (n)** in the left rail: the question is listed as active.
+- [ ] Reload the page. The question is still listed. Open it: the saved thread is
+      shown read-only; no provider tab opens by itself. **Open branch** continues
+      at the provider.
 
-- [ ] The private toggle reads the provider's own name for the mode — `Temporary
-      Chat` on ChatGPT, `Incognito chat` on Claude — and opening the note under it
-      lists what that provider documents about the mode.
-- [ ] Choose it and send. It only proceeds once the provider's own control reads
-      as on.
-- [ ] Turn the provider's private mode off, then try again. Aside must refuse
-      **before typing anything**, keep your question, and offer a retry. Check the
-      provider's composer is empty — nothing should have been typed into it.
-- [ ] Turn private mode off *while* a branch is being prepared (right after
-      pressing Start branch). Aside must stop and clear the composer rather than
-      finishing the send.
-- [ ] Select text inside a private chat and open a branch. It should default to
-      private, not to whatever you last used.
+### 5. Retention actions
 
-### 5. Math and structure
+- [ ] From the list: **Resolve**, then **Reopen**, then **Archive**; the status
+      filter reflects each. **Rename** changes the title everywhere.
+- [ ] **Delete** asks for confirmation, removes the local record only, and says
+      provider history is untouched. The question does not come back after a
+      reload or from another tab.
 
-- [ ] Select a passage containing an equation, a code block, and a list. The
-      Context preview keeps the code's indentation and the list's items, and shows
-      the formula rather than a flattened glyph run.
-- [ ] Ask about a step that depends on an unstated condition — for example an
-      inverse-based derivation that needs full column rank. The answer should
-      *state the missing condition* rather than assert it silently.
+### 6. Library, export, backup
 
-### 6. Cross-tab
+- [ ] Toolbar icon → library. Sources on the left; questions with status filters;
+      search finds a word from a saved answer.
+- [ ] **Export this page as Markdown** (from the list or the library) downloads a
+      file with the selected passage, the exact prompt, the saved thread and its
+      capture state.
+- [ ] **Backup** downloads JSON. **Restore…** of that same file reports
+      everything skipped as older (nothing duplicated).
+
+### 7. Private branches (**live**)
+
+- [ ] Choose the provider's private mode on the toggle (`Temporary Chat` /
+      `Incognito chat`). Its documented constraints are shown before sending.
+- [ ] Send. It proceeds only once the provider's own control reads as on. From a
+      project conversation the branch starts outside the project and says so.
+- [ ] Turn the provider's private mode off and try again: Aside refuses before
+      typing anything, keeps your question, and the provider composer is empty.
+- [ ] A private question never appears in the library, export or backup. Close
+      and reopen keeps it in this session only; a browser restart loses it and
+      the panel warns about that in advance.
+
+### 8. Cross-tab
 
 - [ ] Open the same conversation in two tabs. Edit a draft in one; the other
-      picks it up.
-- [ ] Open a third tab on that conversation *while* you are typing in the first.
-      The new tab shows the draft, not a stale copy of it.
-- [ ] Edit the same draft in both tabs at once. Whichever tab loses keeps the text
-      you typed in its box — it is never replaced by the other tab's version
-      without you seeing it — and the panel reads as unsaved until it lands.
-- [ ] Mark a branch Private in one tab. Reload the other. It comes back Private,
-      not Persistent.
-- [ ] Close the branch in tab A. It disappears from tab B and does not come back.
+      shows it after you leave the box. Close the view in tab A; tab B's view is
+      **not** closed.
+- [ ] Delete from tab A. It disappears from tab B and does not come back.
 
-## What to expect to be imperfect
+## Known limitations
 
-- Neither provider was run against a live account in this work. Both declare their
-  surfaces as `fixture-only`, which is what this checklist exists to move past.
-- Claude's selectors are fixture-verified only. If Claude's interface has moved on
-  your account, Aside should report the capability as unavailable rather than
-  misbehave — if it does something else, that is a bug worth reporting.
-- A branch still running is torn down if you navigate away; it comes back as a
-  failed panel you can retry, not as a resumed one.
-- The `[[BRANCH_TITLE: …]]` instruction is visible as your own first message inside
-  the branch chat. That is unavoidable while the prompt is typed into the
-  provider's composer.
-- Up to ~300 ms of typing in a draft can be lost on a hard navigation; structural
-  changes are written immediately.
+- Live provider coverage is pending until you run the steps marked **live**.
+  Claude's composer and selection popup selectors are fixture-verified; a
+  failure there now writes a structural census to the debug log (**Copy log**)
+  instead of a bare timeout.
+- Follow-ups are typed in the provider's own conversation; Aside does not offer a
+  second composer of its own.
+- A branch still running is not resumed after a hard navigation; it comes back as
+  a saved thread with whatever was captured, and continuing is explicit.
+- Attachment and file contents are never read; a referenced file is listed as
+  missing in the plan, not fetched.

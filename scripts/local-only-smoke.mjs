@@ -967,6 +967,12 @@ async function runNonProjectScenario(browser) {
         ),
       { timeout: 25_000 }
     );
+    const nonProjectPanelId = await page.evaluate(
+      () => document.querySelector('.aside-panel:not([hidden])')?.getAttribute('data-panel-id') ?? null
+    );
+    const nonProjectQuestionId = nonProjectPanelId
+      ? JSON.parse((await readExtensionStorage(browser)).local)[`aside:panel:${nonProjectPanelId}`]?.state?.questionId ?? null
+      : null;
     const captureState = await page.evaluate(() => ({
       archiveStatus:
         document.querySelector('.aside-panel:not([hidden]) .aside-archive-status')?.textContent ?? null,
@@ -1000,6 +1006,7 @@ async function runNonProjectScenario(browser) {
       pageCountBefore,
       pageCountAfter,
       captureState,
+      questionId: nonProjectQuestionId,
       promptContainsSelectedPassage: Boolean(
         branch.prompt?.includes('convexity assumption guarantees the relaxation stays tight')
       ),
@@ -1835,7 +1842,7 @@ function buildClaudeComposerHtml({ conversationPath = '/chat/generated-claude', 
         document.getElementById('turns').innerHTML =
           '<div data-testid="user-message"><div class="standard-markdown"></div></div>' +
           '<div class="font-claude-message"><div class="standard-markdown">' +
-          '<p>[[BRANCH_TITLE: local convexity]]</p><p>This answers the selected passage.</p>' +
+          '<p>This answers the selected passage.</p>' +
           '</div></div>';
         document.querySelector('#turns [data-testid="user-message"] .standard-markdown').textContent = prompt;
       }
@@ -2231,6 +2238,83 @@ async function runLayoutMatrixScenario(browser) {
   return results;
 }
 
+/**
+ * The library page: Aside's own extension page, reached through the worker's
+ * extension id. It must list the sources and questions the earlier scenarios
+ * created, show a captured answer read-only, and carry the build id.
+ */
+async function runLibraryScenario(browser, { questionId = null } = {}) {
+  const workerTarget = browser.targets().find((target) => target.type() === 'service_worker');
+  if (!workerTarget) {
+    throw new Error('Extension service worker target was not found.');
+  }
+  const extensionId = new URL(workerTarget.url()).hostname;
+  const page = await browser.newPage();
+  page.__dialogs = [];
+  page.on('dialog', (dialog) => {
+    page.__dialogs.push({ type: dialog.type(), message: dialog.message() });
+    void dialog.accept();
+  });
+
+  try {
+    await page.goto(`chrome-extension://${extensionId}/library.html`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await page.waitForSelector('#sources .source', { timeout: 20_000 });
+    const sourceCount = await page.evaluate(() => document.querySelectorAll('#sources .source').length);
+    const footer = await page.evaluate(() => document.querySelector('#about')?.textContent ?? '');
+
+    // Search finds a word from a captured answer, across every source.
+    await page.type('#search', 'uses only the selected passage');
+    await page.waitForSelector('#content .q', { timeout: 10_000 });
+    const searchHit = await page.evaluate(() => document.querySelector('#content .q small')?.textContent ?? '');
+
+    // Open the first hit: the saved thread renders as text, read-only.
+    await page.evaluate(() => {
+      const view = Array.from(document.querySelectorAll('#content .q button')).find((b) => b.textContent === 'View');
+      view?.click();
+    });
+    await page.waitForSelector('#content .msg[data-role="assistant"]', { timeout: 10_000 });
+    const bundle = await page.evaluate(() => ({
+      assistantText: document.querySelector('#content .msg[data-role="assistant"]')?.textContent ?? null,
+      assistantPartial: document.querySelector('#content .msg[data-role="assistant"]')?.getAttribute('data-partial') ?? null,
+      status: document.querySelector('#content .meta')?.textContent ?? null,
+      promptShown: Boolean(Array.from(document.querySelectorAll('#content details summary')).find((el) => el.textContent?.includes('Exactly what was sent'))),
+      scripts: document.querySelectorAll('#content script').length
+    }));
+
+    // The record of the question the non-project scenario asked, read through
+    // the extension page's own channel: complete answer, captured through.
+    const record = questionId
+      ? await page.evaluate(async (id) => {
+          const response = await chrome.runtime.sendMessage({ type: 'DOMAIN_QUERY', query: 'bundle', questionId: id });
+          const bundle = response?.bundle;
+          if (!bundle) {
+            return null;
+          }
+          const last = bundle.messages.filter((m) => m.role === 'assistant').at(-1) ?? null;
+          const link = bundle.links.at(-1) ?? null;
+          return {
+            title: bundle.question.title,
+            lifecycle: bundle.question.lifecycle,
+            messageCount: bundle.messages.length,
+            lastAssistantText: last?.text ?? null,
+            lastAssistantPartial: last?.partial ?? null,
+            capture: link?.capture ?? null,
+            run: link?.run ?? null,
+            snapshotPrompt: bundle.snapshots.at(-1)?.prompt ?? null,
+            conversationUrl: link?.conversationUrl ?? null
+          };
+        }, questionId)
+      : null;
+
+    const storage = await readExtensionStorage(browser);
+    const journal = JSON.parse(storage.local)['aside:migration-journal'] ?? null;
+
+    return { extensionIdKnown: Boolean(extensionId), sourceCount, footer, searchHit, bundle, record, journal, dialogs: page.__dialogs };
+  } finally {
+    await page.close();
+  }
+}
+
 async function runFailureScenario(browser) {
   routeMap = {
     '/c/source-failure': buildSourceHtml(),
@@ -2312,6 +2396,7 @@ try {
   const layoutMatrix = await runLayoutMatrixScenario(browser);
   const crossTab = await runCrossTabScenario(browser);
   const failure = await runFailureScenario(browser);
+  const library = await runLibraryScenario(browser, { questionId: nonProject.liveResult.questionId });
 
   const result = {
     nonProject,
@@ -2327,10 +2412,36 @@ try {
     claudeLegacy,
     claudeEmbedded,
     crossTab,
-    failure
+    failure,
+    library
   };
 
   console.log(JSON.stringify(result, null, 2));
+
+  if (
+    library.extensionIdKnown !== true ||
+    (library.sourceCount ?? 0) < 1 ||
+    !/Aside build /.test(library.footer) ||
+    !/matched in (message|title|draft)/.test(library.searchHit) ||
+    !library.bundle.assistantText?.includes('This uses only the selected passage.') ||
+    library.bundle.promptShown !== true ||
+    // The non-project question's own record: answer complete, captured through,
+    // the frozen prompt equal to what the branch received, run submitted.
+    !library.record ||
+    library.record.title !== 'Why this assumption?' ||
+    library.record.lastAssistantText !== 'This uses only the selected passage.' ||
+    library.record.lastAssistantPartial !== false ||
+    library.record.capture !== 'captured-through' ||
+    library.record.snapshotPrompt !== nonProject.liveResult.prompt ||
+    library.record.conversationUrl !== 'https://chatgpt.com/c/generated-local' ||
+    // Captured text is rendered as text nodes only.
+    library.bundle.scripts !== 0 ||
+    // Migration ran and validated on this fresh profile (nothing legacy to migrate).
+    !library.journal || library.journal.validation?.ok !== true ||
+    library.dialogs.length !== 0
+  ) {
+    throw new Error(`Library scenario failed: ${JSON.stringify(library)}`);
+  }
 
   layoutMatrix.forEach((entry) => {
     if (

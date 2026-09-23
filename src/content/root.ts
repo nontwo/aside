@@ -7271,6 +7271,9 @@ async function freezeSnapshotForPanel(
   if (!state.questionId || !state.attemptId) {
     return;
   }
+  // The draft — and with it the local title — is saved at the moment of sending,
+  // not only when the box loses focus: Enter can submit without a blur.
+  await syncDraftToStore(runtime);
   const snapshotId = newSnapshotId();
   const linkId = newLinkId();
   const scopeKey = scopeKeyForState(state);
@@ -7402,11 +7405,21 @@ function readObservedTurns(): ObservedTurn[] {
       turn.element.getAttribute('data-message-id') ??
       turn.element.querySelector('[data-message-id]')?.getAttribute('data-message-id') ??
       null,
-    streaming:
-      turn.element.hasAttribute('data-is-streaming') ||
-      turn.element.getAttribute('data-is-streaming') === 'true' ||
-      Boolean(turn.element.querySelector('[data-is-streaming="true"]'))
+    // Claude marks a finished turn with data-is-streaming="false", so the
+    // attribute's presence alone is not evidence of streaming; only a value
+    // other than "false" is.
+    streaming: isStreamingMarker(turn.element)
   }));
+}
+
+function isStreamingMarker(element: HTMLElement): boolean {
+  const own = element.getAttribute('data-is-streaming');
+  if (own !== null && own !== 'false') {
+    return true;
+  }
+  const nested = element.querySelector<HTMLElement>('[data-is-streaming]');
+  const nestedValue = nested?.getAttribute('data-is-streaming');
+  return nestedValue !== undefined && nestedValue !== null && nestedValue !== 'false';
 }
 
 function startCaptureWatcher(): void {

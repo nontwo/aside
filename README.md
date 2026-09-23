@@ -18,11 +18,21 @@ knowledge, memory, hidden reasoning or model state.
 
 ## What Aside does
 
-- Opens a branch workspace beside the main conversation instead of making you scroll the original chat.
-- Shows the exact context it will submit before it submits it — the selected passage, the answer blocks it touched, an optional preceding question, and anything you add — and lets you remove any of it.
-- Runs the branch on the same provider, in an embedded panel where the provider allows it and in a window Aside drives where it does not.
-- Preserves minimized branches so several questions can run at once, saved per conversation so leaving a chat and coming back does not discard them.
+- Opens a question beside the main conversation instead of making you scroll the original chat.
+- Plans the context structurally and shows it before sending — the selected passage, the paragraph, step or code block it sits in, the question that produced the answer, definitions the passage refers to, and anything you add — with a preview that is the complete prompt, byte for byte.
+- Runs the question on the same provider, in an embedded panel where the provider allows it and in a window Aside drives where it does not.
+- Reads the answer back and keeps it with the question: every saved thread says whether it is link only, partially captured, or captured through a given message.
+- Keeps questions attached to their source. Closing a view deletes nothing; a source's questions are listed on its page and in the library, where they can be resolved, reopened, archived, renamed, exported as Markdown, backed up, or explicitly deleted.
 - Fails with a real error and a way to retry instead of an endless spinner.
+
+### Questions, not windows
+
+A question is a record attached to the passage it was asked about. The panel is a
+view of it. **Close** and **Minimize** hide the view; **Resolved**, **Archived**
+and **Delete** are separate, explicit actions on the question itself, and delete
+removes only Aside's local record — provider history is never touched. Titles are
+generated locally from the question and can be renamed; the model is never asked
+to emit one.
 
 ### Coexisting with the provider's own interface
 
@@ -60,8 +70,11 @@ unavailable rather than guessing.
 
 ### Private branches
 
-A private branch is only sent once Aside can positively see that the provider's
-private mode is on. Missing, disabled, unreadable, unchanged or unconfirmed — all
+Two things are kept apart: the provider's own conversation mode (normal, or its
+verified Temporary/Incognito mode) and Aside's local retention (durable, or
+session-only). A private question is session-only — it has no record in the
+question database, no export, no backup — and it is only sent once Aside can
+positively see that the provider's private mode is on. Missing, disabled, unreadable, unchanged or unconfirmed — all
 of them stop the branch **before anything is typed**, with the question preserved
 so you can retry or switch to a persistent branch. Nothing is ever downgraded from
 private to persistent automatically, and a selection made inside a private chat
@@ -109,6 +122,12 @@ npm run build
 5. Reload `chatgpt.com` **and** `claude.ai` (the content script is only injected on
    a fresh load), select assistant text, and try `Ask`, `Why`, or `New-tab`.
 
+6. The toolbar icon opens Aside's **library**: every source and question, search,
+   Markdown export, JSON backup and restore, and the build identifier of the
+   installed copy. On first run after upgrading, existing branches are migrated
+   into the question database; the legacy copies are kept until you remove them
+   from the library footer. See [`docs/migration-and-recovery.md`](docs/migration-and-recovery.md).
+
 ## Course submission package
 
 The Text as Data course submission lives in [`course-submission/`](./course-submission/). It includes a static public demo, synthetic sample data, a report, replication notes, and a preserved extension artifact.
@@ -136,10 +155,17 @@ npm run build
 npm run smoke:local
 ```
 
+`npm test` covers the question database (commands, conflicts, tombstones,
+reference-counted deletion, migration, backup/restore) with an in-memory
+IndexedDB, the context planner against a small grounding corpus, capture honesty,
+placement geometry and the provider adapters.
+
 `npm run smoke:local` runs the extension against fake `chatgpt.com` and `claude.ai`
-fixtures in a disposable Chrome profile: selection toolbar, context preview, branch
-creation, privacy verification, the cross-tab panel protocol, and the layout matrix
-across widths, themes and sidebar states. Requests are intercepted at the browser
+fixtures in a disposable Chrome profile: selection toolbar, context preview equal
+to the submitted prompt, branch creation, answer capture settling to "captured
+through", local titles, New-tab drafting, close-without-delete and explicit delete
+across two tabs, privacy verification, and the layout matrix across widths,
+themes and sidebar states. Requests are intercepted at the browser
 level, so windows the extension opens itself are covered too, and any request to a
 host the harness does not serve **fails the run** — the default smoke can never
 reach a real ChatGPT or Claude account.
