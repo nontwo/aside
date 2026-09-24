@@ -129,7 +129,7 @@ async function applyInside(
           updatedAt: now,
           rev: REV_START
         } satisfies Source);
-      } else if (source.title !== command.source.title && command.source.title) {
+      } else if (!command.keepExistingSourceTitle && source.title !== command.source.title && command.source.title) {
         await put(tx, STORES.sources, { ...source, title: command.source.title, updatedAt: now, rev: source.rev + 1 });
       }
 

@@ -28,7 +28,7 @@ OpenAI or Anthropic.
 | Opens a new top-level provider page — no text in the URL, no referrer | Confirm the native temporary mode and personalization, choose a model, send |
 | Nothing in the native page: no clicks, typing, paste, send, or answer capture | Read and follow up there |
 | Brings you back to the passage | — |
-| **End & discard**: clears the question from Aside and closes the tab it opened | Decide when a question is done |
+| **End & discard**: clears the question from Aside, and closes the tab it opened while it can still prove that tab is its own | Decide when a question is done |
 | **Save local note…**: a permanent library record of the passage, question and your note | Decide what is worth keeping |
 
 ### Temporary by default, not saved
@@ -74,7 +74,10 @@ Each Ask/Why/New-tab is a new session with its own native tab. **Continue in
 ChatGPT/Claude** focuses the tab of *that* question; it never reuses another
 question's chat and never copies again (follow-ups are typed in the native chat).
 If that tab was closed, its temporary conversation cannot be reopened and the
-question is cleared from Aside; select the passage again for a new one.
+question is cleared from Aside; select the passage again for a new one. Once a
+native tab shows a conversation address (the provider giving the chat its own
+URL, or you opening another chat in it), Aside can no longer prove it is the page
+it opened: it will still focus it, but End leaves it for you to close.
 
 The toolbar popup lists the active handoffs — useful while you are looking at the
 native chat — with **Return to source**, **Continue**, **Copy prompt** and **End &

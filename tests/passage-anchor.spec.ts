@@ -95,15 +95,22 @@ describe('returning to the passage', () => {
   });
 
   it('says the passage changed when its message is still identifiable', () => {
+    // The message id hashes the first 240 characters of the turn, so an edit
+    // after them keeps the message identifiable while the passage changes.
+    const head = 'Background sentence that stays exactly the same. '.repeat(6);
+    render([`${head}Finally the bound stays tight here.`]);
+    const selection = select(0, 'the bound stays tight');
+    const paragraph = document.querySelector('article[data-message-author-role="assistant"] p') as HTMLElement;
+    paragraph.textContent = `${head}Finally the bound becomes loose here.`;
+    const found = locatePassage(selection);
+    expect(found.status).toBe('message-only');
+  });
+
+  it('reports not-found when neither the message nor the passage is there', () => {
     render(['The convexity assumption keeps the bound tight.']);
     const selection = select(0, 'keeps the bound tight');
-    // Edit only after the first 240 characters would keep the id; here we keep the
-    // message id stable by editing a descendant that is outside the hashed prefix.
     const paragraph = document.querySelector('article[data-message-author-role="assistant"] p') as HTMLElement;
-    const originalId = selection.selectedBlocks[0].messageId;
-    paragraph.textContent = 'The convexity assumption keeps the bound loose.';
-    const found = locatePassage({ ...selection, selectedBlocks: selection.selectedBlocks.map((block) => ({ ...block, messageId: originalId })) });
-    expect(['message-only', 'not-found']).toContain(found.status);
-    expect(found.status).not.toBe('exact');
+    paragraph.textContent = 'An entirely different answer.';
+    expect(locatePassage(selection).status).toBe('not-found');
   });
 });

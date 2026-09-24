@@ -9,7 +9,7 @@ What this build does automatically, and what only you do:
 | On **Copy & open temporary chat**: copies exactly the previewed prompt, then opens a new ChatGPT/Claude window (New-tab: a tab) | Check the native page is in Temporary / Incognito mode, choose Personalized/Unpersonalized and a model if you want, paste, and send |
 | Nothing in the native page: no clicks, no typing, no paste, no send, no reading the answer back | Read the answer and ask follow-ups there |
 | Returns you to the passage (the card's **Jump to passage**, or the toolbar popup's **Return to source**) | Keep reading |
-| On **End & discard**: clears the question from Aside and closes the tab it opened (after telling you) | Decide when a question is done |
+| On **End & discard**: clears the question from Aside; closes the tab it opened while that tab is still provably its own (after telling you) | Decide when a question is done; close the native tab yourself when Aside says it will stay open |
 | On **Save local note…**: saves the passage, question and your note as a permanent library record — only then | Decide what is worth keeping |
 
 Everything is offline-verified against fixtures unless marked **live**. Live
@@ -55,7 +55,10 @@ For ChatGPT, then Claude:
    and send. Ask one follow-up in the same native chat.
 6. Back on the source tab (or popup → **Return to source**), the passage is
    highlighted where you left it; the conversation has not changed.
-7. **End & discard** → confirm. The native tab closes; the card is gone.
+7. **End & discard** → read the confirmation. If the native page still shows the
+   new chat Aside opened, the tab closes; if ChatGPT/Claude has moved the chat to
+   its own conversation address, Aside cannot prove the tab is still its own and
+   says the tab will stay open — close it yourself. Either way the card is gone.
 8. Popup: no active handoffs. Library: no new record for this question.
 
 Also check once:
@@ -94,8 +97,10 @@ Also check once:
   **Save local note…** yourself.
 - A temporary handoff lives only for the browser session; a browser or extension
   restart clears it (by design, never restored from disk).
-- If a native tab is navigated to another conversation, Aside will focus it but
-  not close it on End.
+- Once a native tab shows any conversation address (the provider moving the
+  temporary chat to its own URL, or you opening another chat there), Aside will
+  focus it but not close it on End: from the URL alone the two cannot be told
+  apart, and Aside never closes a tab it cannot prove it opened.
 - The open card occupies the right of the page; it stops above the composer, but
   at narrow widths it can sit over reading text. Check that ChatGPT's/Claude's own
   selection popup is not left under the card on your screen (**Hide** or Escape

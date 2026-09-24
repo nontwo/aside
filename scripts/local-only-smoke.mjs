@@ -672,7 +672,10 @@ async function runLayoutMatrixScenario(browser) {
     { name: '1024', width: 1024, height: 768 },
     { name: '768', width: 768, height: 800 },
     // Browser zoom at 125% on a 1440px window: fewer CSS pixels, denser device pixels.
-    { name: '1152-zoom125', width: 1152, height: 720, deviceScaleFactor: 1.25 }
+    { name: '1152-zoom125', width: 1152, height: 720, deviceScaleFactor: 1.25 },
+    // A short viewport: the card must shrink above the composer, not cover it.
+    // (Shorter still, it steps aside to the rail with a notice instead.)
+    { name: '1024-short', width: 1024, height: 480 }
   ];
   const results = [];
 
@@ -1692,6 +1695,41 @@ async function runClaudeScenario(browser, { variant = 'current' } = {}) {
   }
 }
 
+/** The same tab moving to another provider must never receive this provider's scratch. */
+async function runCrossProviderTabScenario(browser) {
+  routeMap = { '/c/source-cross': buildSourceHtml(), '/': buildNativeChatHtml({}) };
+  claudeRouteMap = { '*': buildClaudeSourceHtml({ variant: 'current' }) };
+  const page = await createSourcePage(browser, '/c/source-cross');
+  try {
+    await selectAssistantText(page);
+    await openCard(page);
+    await page.type(`${CARD} textarea[data-aside-role="handoff-question"]`, `Cross provider ${MARK}`);
+    await sleep(600);
+    await page.goto('https://claude.ai/chat/elsewhere', { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#aside-root', { timeout: 15_000 });
+    await sleep(1_000);
+    const onClaude = await page.evaluate((mark) => ({
+      cards: document.querySelectorAll('.aside-handoff').length,
+      railEntries: document.querySelectorAll('.aside-tab-handoff').length,
+      markerInDom: document.documentElement.innerHTML.includes(mark)
+    }), MARK);
+    await page.goto('https://chatgpt.com/c/source-cross', { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#aside-root', { timeout: 15_000 });
+    await page.waitForFunction(() => document.querySelectorAll('.aside-handoff').length === 1, { timeout: 10_000 });
+    const backOnChatGPT = await page.evaluate(() => document.querySelectorAll('.aside-handoff').length);
+    await page.evaluate(() => document.querySelector('.aside-tab-handoff button')?.click());
+    await page.waitForSelector(CARD, { timeout: 10_000 }).catch(() => {});
+    if (await page.$(CARD)) {
+      await clickCard(page, 'handoff-end');
+      await clickCard(page, 'handoff-end-confirm');
+      await page.waitForFunction(() => !document.querySelector('.aside-handoff'), { timeout: 10_000 });
+    }
+    return { onClaude, backOnChatGPT, sessions: (await handoffSessionKeys(browser)).length };
+  } finally {
+    await page.close();
+  }
+}
+
 /** Retired automation cannot be asked for by any client, and stale builds are refused. */
 async function runRetiredEndpointsScenario(browser) {
   const page = await openExtensionPage(browser, 'popup.html');
@@ -1865,8 +1903,12 @@ async function runRetainedDataScenario(browser, seedOutcome) {
     await clickCard(page, 'handoff-end-confirm');
     await page.waitForFunction(() => !document.querySelector('.aside-handoff'), { timeout: 10_000 });
     const recordAfter = JSON.parse((await readExtensionStorage(browser)).local)['aside:panel:panel_seed_live'];
-    result.legacyRecordUnchanged = JSON.stringify(recordBefore?.state?.selection) === JSON.stringify(recordAfter?.state?.selection) &&
-      recordBefore?.state?.initialQuestion === recordAfter?.state?.initialQuestion;
+    // Everything but this tab's own view state must be exactly as stored.
+    const withoutView = (record) => {
+      const { minimized, closedView, updatedAt, ...rest } = record?.state ?? {};
+      return JSON.stringify(rest);
+    };
+    result.legacyRecordUnchanged = Boolean(recordBefore) && withoutView(recordBefore) === withoutView(recordAfter);
   } finally {
     await page.close();
   }
@@ -1944,12 +1986,13 @@ try {
   const whyPreference = await runWhyPreferenceScenario(browser);
   const claudeCurrent = await runClaudeScenario(browser, { variant: 'current' });
   const claudeLegacy = await runClaudeScenario(browser, { variant: 'legacy' });
+  const crossProvider = await runCrossProviderTabScenario(browser);
   const retired = await runRetiredEndpointsScenario(browser);
   const many = await runManySessionsScenario(browser);
   const layoutMatrix = await runLayoutMatrixScenario(browser);
   const retained = await runRetainedDataScenario(browser, seedOutcome);
 
-  const result = { coexistence, chatgpt, sourceClose, newTab, whyPreference, claudeCurrent, claudeLegacy, retired, many, layoutMatrix, retained };
+  const result = { coexistence, chatgpt, sourceClose, newTab, whyPreference, claudeCurrent, claudeLegacy, crossProvider, retired, many, layoutMatrix, retained };
   console.log(JSON.stringify(result, null, 2));
 
   /* ---------------------------- coexistence ---------------------------- */
@@ -2162,6 +2205,15 @@ try {
       claude
     );
   });
+  check(
+    crossProvider.onClaude.cards === 0 &&
+      crossProvider.onClaude.railEntries === 0 &&
+      crossProvider.onClaude.markerInDom === false &&
+      crossProvider.backOnChatGPT === 1 &&
+      crossProvider.sessions === 0,
+    "A tab that moves to another provider must not receive the first provider's scratch",
+    crossProvider
+  );
   check(
     retired.createWindow?.code === 'retired' &&
       retired.recheck?.code === 'retired' &&

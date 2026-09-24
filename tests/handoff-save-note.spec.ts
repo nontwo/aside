@@ -24,7 +24,7 @@ function scratch(): ScratchHandoff {
     providerId: 'chatgpt',
     policy: 'temporary-intended',
     entry: 'why',
-    source: { tabId: 1, windowId: 1, scopeKey: 'chatgpt:c:conv-1', url: 'https://chatgpt.com/c/conv-1', open: true },
+    source: { tabId: 1, windowId: 1, scopeKey: 'chatgpt:c:conv-1', url: 'https://chatgpt.com/c/conv-1', open: true, title: 'Convexity chat' },
     selection: {
       rootConversationId: 'chatgpt:c:conv-1',
       rootChatUrl: 'https://chatgpt.com/c/conv-1',
@@ -63,7 +63,7 @@ describe('explicit local note from a scratch handoff', () => {
   it('saves the passage, the question and the note together, and nothing else', async () => {
     const command = buildSaveNoteCommand(
       scratch(),
-      { note: 'My takeaway.', excerpt: 'It holds because S_2 counts pairs.', title: '', sourceTitle: 'Convexity chat' },
+      { note: 'My takeaway.', excerpt: 'It holds because S_2 counts pairs.', title: '' },
       { conversationId: 'conv-1', containerId: null },
       ids
     );
@@ -94,14 +94,14 @@ describe('explicit local note from a scratch handoff', () => {
   it('writes nothing at all when the question cannot be created', async () => {
     const command = buildSaveNoteCommand(
       scratch(),
-      { note: 'n', excerpt: '', title: 't', sourceTitle: '' },
+      { note: 'n', excerpt: '', title: 't' },
       { conversationId: null, containerId: null },
       ids
     );
     expect((await applyCommand(db, command, NOW)).status).toBe('applied');
     const second = buildSaveNoteCommand(
       scratch(),
-      { note: 'second', excerpt: '', title: 't', sourceTitle: '' },
+      { note: 'second', excerpt: '', title: 't' },
       { conversationId: null, containerId: null },
       { ...ids, noteId: 'n_other' }
     );
@@ -116,7 +116,7 @@ describe('explicit local note from a scratch handoff', () => {
       db,
       buildSaveNoteCommand(
         scratch(),
-        { note: 'keep me', excerpt: '', title: 't', sourceTitle: '' },
+        { note: 'keep me', excerpt: '', title: 't' },
         { conversationId: null, containerId: null },
         ids
       ),
@@ -124,6 +124,20 @@ describe('explicit local note from a scratch handoff', () => {
     );
     const backup = createBackup(await dumpAll(db), 'test-build', NOW);
     expect(JSON.stringify(backup)).toContain('keep me');
+  });
+
+  it('never renames a saved source that already exists', async () => {
+    const first = buildSaveNoteCommand(scratch(), { note: 'one', excerpt: '', title: 't' }, { conversationId: null, containerId: null }, ids);
+    await applyCommand(db, first, NOW);
+    const renamed = { ...scratch(), source: { ...scratch().source, title: 'A different title later' } };
+    const second = buildSaveNoteCommand(renamed, { note: 'two', excerpt: '', title: 't' }, { conversationId: null, containerId: null }, {
+      questionId: 'q_note_2',
+      anchorId: 'a_note_2',
+      noteId: 'n_note_2'
+    });
+    expect((await applyCommand(db, second, NOW)).status).toBe('applied');
+    const dump = await dumpAll(db);
+    expect(dump.sources.map((source) => source.title)).toEqual(['Convexity chat']);
   });
 
   it('composes an excerpt only when the Owner supplied one', () => {

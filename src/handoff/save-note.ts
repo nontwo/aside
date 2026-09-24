@@ -21,7 +21,6 @@ export interface SaveNoteInput {
   note: string;
   excerpt: string;
   title: string;
-  sourceTitle: string;
 }
 
 export interface SaveNoteIds {
@@ -68,7 +67,9 @@ export function buildSaveNoteCommand(
       conversationId: identity.conversationId,
       containerId: identity.containerId,
       url: selection.rootChatUrl,
-      title: input.sourceTitle.trim().slice(0, 120) || (session.providerId === 'claude' ? 'Claude conversation' : 'ChatGPT conversation'),
+      // Recorded when the question was created, so a later navigation of the
+      // tab cannot put another conversation's title on this passage.
+      title: session.source.title.trim().slice(0, 120) || (session.providerId === 'claude' ? 'Claude conversation' : 'ChatGPT conversation'),
       kind: 'assistant-answer',
       acquisition: 'selected-fragment',
       messageId: anchorBlock?.messageId ?? null
@@ -101,6 +102,8 @@ export function buildSaveNoteCommand(
       entryAction: session.entry
     },
     draft: { text: question, excludedBlockIds: [], background: '' },
-    note: { id: ids.noteId, text: composeNoteText(input.note, input.excerpt) }
+    note: { id: ids.noteId, text: composeNoteText(input.note, input.excerpt) },
+    // An existing saved source keeps its title; a note never renames it.
+    keepExistingSourceTitle: true
   };
 }

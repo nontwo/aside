@@ -13,7 +13,7 @@ function session(overrides: Partial<ScratchHandoff> = {}): ScratchHandoff {
     providerId: 'chatgpt',
     policy: 'temporary-intended',
     entry: 'why',
-    source: { tabId: 1, windowId: 1, scopeKey: 'chatgpt:c:1', url: 'https://chatgpt.com/c/1', open: true },
+    source: { tabId: 1, windowId: 1, scopeKey: 'chatgpt:c:1', url: 'https://chatgpt.com/c/1', open: true, title: 'Source chat' },
     selection: {
       rootConversationId: 'chatgpt:c:1',
       rootChatUrl: 'https://chatgpt.com/c/1',
@@ -109,7 +109,6 @@ function makeCard(
       return { ok: true, code: 'ok' };
     },
     jumpToPassage: () => 'exact',
-    sourceTitle: () => 'Source chat',
     openLibrary: () => undefined,
     onVisibilityChange: () => undefined,
     onDisposed: () => {
@@ -268,7 +267,10 @@ describe('handoff card: failures are local and recoverable', () => {
     await new Promise((resolve) => setTimeout(resolve, 60));
     expect(harness.clipboard[0]).toMatch(/Why does this step hold\?/);
     expect(harness.clipboard[0]).not.toMatch(/A different question/);
-    expect(harness.sent.every((message) => !('sessionId' in message) || message.sessionId === 'sess-1')).toBe(true);
+    // What the worker records as copied is the frozen revision, not the edit.
+    const copied = harness.sent.find((message) => message.type === 'HANDOFF_COPIED') as Extract<HandoffRequest, { type: 'HANDOFF_COPIED' }>;
+    expect(copied.prompt?.text).toBe(harness.clipboard[0]);
+    expect(copied.prompt?.text).not.toMatch(/A different question/);
   });
 });
 
@@ -286,6 +288,40 @@ describe('handoff card: clipboard clearing is explicit', () => {
     await flush();
     expect(harness.clipboard.at(-1)).toBe('');
     expect(harness.notices.at(-1)).toMatch(/Clipboard history or synced clipboards may still hold/);
+  });
+});
+
+describe('handoff card: honest clipboard claims', () => {
+  it('after Clear clipboard, never claims the prompt is on the clipboard, even when restored', async () => {
+    const harness = makeCard();
+    q<HTMLButtonElement>(harness, 'handoff-copy').click();
+    await flush();
+    q<HTMLButtonElement>(harness, 'handoff-clear-clipboard').click();
+    await flush();
+    expect(q(harness, 'handoff-clipboard-status').textContent).toMatch(/no longer on the clipboard/);
+    const replaced = harness.sent.filter((message) => message.type === 'HANDOFF_COPIED').at(-1) as Extract<HandoffRequest, { type: 'HANDOFF_COPIED' }>;
+    expect(replaced.replaced).toBe(true);
+  });
+
+  it('a card restored from a recorded copy says "copied earlier", not "on the clipboard"', () => {
+    const prompt = preparePrompt(session().selection, session().draft, null);
+    const harness = makeCard({ initial: { clipboard: 'copied', copied: prompt } });
+    expect(q(harness, 'handoff-clipboard-status').textContent).toMatch(/Copied earlier/);
+    expect(q(harness, 'handoff-clipboard-status').textContent).not.toMatch(/this exact prompt is on the clipboard/);
+  });
+
+  it('a focus refusal leaves the question in place and says so', async () => {
+    const harness = makeCard({
+      respond: (message) =>
+        message.type === 'HANDOFF_OPEN'
+          ? { ok: false, code: 'focus-failed', buildId: 'b', session: session({ target: { ...session().target, state: 'open', tabId: 9 } }) }
+          : { ok: true, code: 'ok', buildId: 'b' }
+    });
+    q<HTMLButtonElement>(harness, 'handoff-open').click();
+    await flush();
+    await flush();
+    expect(harness.disposed).toBe(false);
+    expect(q(harness, 'handoff-target-status').textContent).toMatch(/did not switch to it/);
   });
 });
 
@@ -398,7 +434,10 @@ describe('clipboard writer', () => {
     (document as unknown as { execCommand: (command: string) => boolean }).execCommand = () => false;
     const result = await writeClipboardText(`secret ${MARKER}`, document.body);
     expect(result).toEqual({ ok: false, code: 'clipboard-denied' });
-    expect(document.body.innerHTML).not.toContain(MARKER);
+    // A textarea's value is not in innerHTML: check the elements themselves.
+    const areas = Array.from(document.querySelectorAll('textarea'));
+    expect(areas.some((area) => area.value.includes(MARKER))).toBe(false);
+    expect(areas).toHaveLength(0);
   });
 });
 

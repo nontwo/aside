@@ -40,9 +40,13 @@ Pieces (all under `src/handoff/` unless noted):
   memory mirrored to `chrome.storage.session` (never local/sync; memory-only when
   session storage is unavailable), requests authorized by the sender's tab (or an
   extension page), build-checked, epoch-checked, never an implicit create; target
-  ownership (blank tab first, registered, then navigated), focus-not-duplicate,
-  closure only of a demonstrably owned tab, purge before closure, purge on target
-  close, source close keeps the target, rehydration without any external action.
+  ownership (blank tab first, registered, then navigated; any conversation
+  address or off-provider URL makes it uncertain — focusable, never closed),
+  focus-not-duplicate, a focus refusal changes nothing while a vanished tab
+  purges, closure only of a demonstrably owned tab, purge before closure, purge
+  on target close, source close keeps the target, sessions listed or pushed only
+  to a tab still on the same provider, a failed session-storage write drops the
+  stale mirror, rehydration without any external action.
 - `save-note.ts` — one `CreateQuestion` command that carries its note, so the
   explicit local note is atomic (`providerMode: 'native-handoff'`, no link, no
   captured messages, no snapshot).

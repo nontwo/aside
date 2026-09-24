@@ -275,9 +275,30 @@ async function sendStoreMessage<T>(message: unknown): Promise<T | null> {
 }
 
 /** Adopt an authoritative record for a panel this tab has mounted. */
+/**
+ * The stored form of each legacy record, exactly as read. A saved-record view
+ * writes back only its per-tab view state onto this, never the normalized
+ * projection it displays — reading a record must not rewrite it.
+ */
+const legacyRawStates = new Map<string, BranchPanelState>();
+
+function writableStateFor(runtime: PanelRuntime): BranchPanelState {
+  const raw = legacyRawStates.get(runtime.state.panelId);
+  if (!raw) {
+    return runtime.state;
+  }
+  return {
+    ...raw,
+    minimized: runtime.state.minimized,
+    closedView: runtime.state.closedView,
+    updatedAt: runtime.state.updatedAt
+  };
+}
+
 function adoptAuthoritativeState(panelId: string, state: BranchPanelState, rev: number): void {
   const runtime = panelRuntimes.get(panelId);
   panelRevisions.set(panelId, rev);
+  legacyRawStates.set(panelId, state);
   if (!runtime) {
     return;
   }
@@ -315,7 +336,7 @@ async function writePanelRecord(runtime: PanelRuntime, attempt = 0): Promise<voi
     scopeKey: runtime.state.rootConversationId,
     area: storageAreaForPanel(runtime.state),
     baseRev: panelRevisions.get(panelId) ?? 0,
-    state: runtime.state
+    state: writableStateFor(runtime)
   });
 
   if (!response) {
@@ -1586,19 +1607,19 @@ function ensureSelectionToolbar(): HTMLDivElement {
     askButton.id = ASK_BUTTON_ID;
     askButton.type = 'button';
     askButton.textContent = 'Ask';
-    askButton.setAttribute('aria-label', 'Ask in Aside about the selected passage');
+    askButton.setAttribute('aria-label', 'Prepare a temporary handoff about the selected passage');
 
     whyButton = document.createElement('button');
     whyButton.id = WHY_BUTTON_ID;
     whyButton.type = 'button';
     whyButton.textContent = 'Why';
-    whyButton.setAttribute('aria-label', 'Ask in Aside why the selected passage holds');
+    whyButton.setAttribute('aria-label', 'Prepare a temporary handoff asking why the selected passage holds');
 
     newTabButton = document.createElement('button');
     newTabButton.id = NEW_TAB_BUTTON_ID;
     newTabButton.type = 'button';
     newTabButton.textContent = 'New-tab';
-    newTabButton.setAttribute('aria-label', 'Open an Aside branch in a new window');
+    newTabButton.setAttribute('aria-label', 'Prepare a temporary handoff that opens in a new tab');
 
     askButton.addEventListener('click', (event) => {
       event.preventDefault();
@@ -2946,8 +2967,20 @@ function fitSlotToFreeSpace(element: HTMLElement): void {
   if (!blocking.length) {
     return;
   }
-  const limit = Math.min(...blocking.map((rect) => rect.top)) - card.top - 12;
-  element.style.maxHeight = `${Math.max(240, Math.floor(limit))}px`;
+  const limit = Math.floor(Math.min(...blocking.map((rect) => rect.top)) - card.top - 12);
+  if (limit < 160) {
+    // No room above the composer for a usable card: step aside to the rail
+    // rather than paint over the provider's control.
+    const handoffCard = [...handoffCards.values()].find((candidate) => candidate.element === element);
+    if (handoffCard) {
+      handoffCard.yieldSlot();
+      notifyAside('Not enough room to show the Aside card without covering the page. Make the window taller, then open it from the rail.');
+    } else {
+      element.style.maxHeight = `${Math.max(120, limit)}px`;
+    }
+    return;
+  }
+  element.style.maxHeight = `${limit}px`;
 }
 
 function syncMountedUi(): void {
@@ -2990,6 +3023,7 @@ function createStateFromRestore(raw: BranchPanelState): BranchPanelState | null 
   if (!raw?.panelId || !raw.selection?.selectedText) {
     return null;
   }
+  legacyRawStates.set(raw.panelId, raw);
 
   const normalizedRootChatUrl = normalizeChatUrl(raw.rootChatUrl ?? raw.selection.rootChatUrl);
   const normalizedLaunchUrl = raw.launchUrl ? normalizeChatUrl(raw.launchUrl) : undefined;
@@ -4216,7 +4250,6 @@ function handoffDeps(): HandoffCardDeps {
     send: sendHandoff,
     writeClipboard: (text) => writeClipboardText(text, ensureExtensionHost()),
     jumpToPassage: jumpToHandoffPassage,
-    sourceTitle: () => compactWhitespace(document.title).slice(0, 120),
     openLibrary: () => {
       void sendStoreMessage({ type: 'OPEN_LIBRARY' });
     },
@@ -4282,7 +4315,8 @@ async function openHandoff(entry: HandoffEntry, selection: SelectionPayload, que
     scopeKey: currentScopeKey(),
     sourceUrl: normalizeChatUrl(window.location.href),
     selection,
-    draft
+    draft,
+    sourceTitle: compactWhitespace(document.title).slice(0, 120)
   });
   if (!response) {
     notifyAside('Aside could not reach its extension worker. Reload this page to use it.');
@@ -4296,7 +4330,9 @@ async function openHandoff(entry: HandoffEntry, selection: SelectionPayload, que
     notifyAside('This passage could not be prepared. Select it again and retry.');
     return;
   }
-  const card = mountHandoffCard(response.session, { memoryOnly: response.code === 'storage-unavailable' });
+  const card = mountHandoffCard(response.session, {
+    memoryOnly: response.memoryOnly === true || response.code === 'storage-unavailable'
+  });
   showHandoffCard(card);
   card.focusQuestion();
 }
@@ -4314,9 +4350,13 @@ async function restoreHandoffs(): Promise<void> {
   let shown = false;
   response.sessions
     .slice()
+    // Defence in depth: the worker lists only this provider's sessions.
+    .filter((session) => session.providerId === provider.id)
     .sort((left, right) => left.updatedAt - right.updatedAt)
     .forEach((session) => {
-      const card = mountHandoffCard(session, { memoryOnly: response.code === 'storage-unavailable' });
+      const card = mountHandoffCard(session, {
+        memoryOnly: response.memoryOnly === true || response.code === 'storage-unavailable'
+      });
       const eligible = session.source.scopeKey === scope && !session.hidden;
       if (eligible && !shown && !getVisiblePanels().length && !questionListOpen) {
         shown = true;
@@ -4350,7 +4390,10 @@ function handleHandoffChanged(message: HandoffChangedMessage): void {
     return;
   }
   if (message.session) {
-    card.adoptSession(message.session, { keepLocalDraft: true });
+    if (message.session.providerId !== provider.id) {
+      return;
+    }
+    card.adoptSession(message.session, { keepLocalDraft: true, fromEvent: true });
     renderTabs();
     return;
   }

@@ -50,7 +50,8 @@ export interface PreparedPrompt {
   overBudget: boolean;
 }
 
-export type ClipboardState = 'idle' | 'copied' | 'failed';
+/** 'replaced': Aside itself put something else on the clipboard (Clear, diagnostics). */
+export type ClipboardState = 'idle' | 'copied' | 'failed' | 'replaced';
 
 /**
  * Ownership of the native destination, as far as Aside can demonstrate it.
@@ -85,6 +86,8 @@ export interface HandoffSource {
   url: string;
   /** False once the source tab closed; the session stays until End or target close. */
   open: boolean;
+  /** The source conversation's title as it was when the question was created. */
+  title: string;
 }
 
 export interface ScratchHandoff {
@@ -113,6 +116,7 @@ export type HandoffCode =
   | 'opened'
   | 'opening'
   | 'no-target'
+  | 'focus-failed'
   | 'unsupported-layout'
   | 'target-closed'
   | 'target-uncertain'
@@ -142,6 +146,8 @@ export interface HandoffCreateMessage {
   sourceUrl: string;
   selection: SelectionPayload;
   draft: HandoffDraft;
+  /** document.title at selection time, shown and saved with an explicit note. */
+  sourceTitle: string;
 }
 
 export interface HandoffUpdateMessage {
@@ -160,6 +166,8 @@ export interface HandoffCopiedMessage {
   ok: boolean;
   code: HandoffCode;
   prompt: PreparedPrompt | null;
+  /** Aside replaced the clipboard with something other than the prompt. */
+  replaced?: boolean;
 }
 
 export interface HandoffOpenMessage {
@@ -215,8 +223,6 @@ export interface HandoffSaveNoteMessage {
   /** An answer excerpt the Owner pasted in themselves, if any. */
   excerpt: string;
   title: string;
-  /** The source conversation's title as the preview showed it. */
-  sourceTitle: string;
 }
 
 export type HandoffRequest =
@@ -244,6 +250,8 @@ export interface HandoffResponse {
   /** For Return: how the source passage was found. */
   anchor?: AnchorResult;
   questionId?: string;
+  /** True while this worker keeps some session in memory only. */
+  memoryOnly?: boolean;
 }
 
 /** Worker -> the source tab only. */

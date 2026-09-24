@@ -38,7 +38,6 @@ export interface HandoffCardDeps {
   send(message: HandoffRequest): Promise<HandoffResponse | null>;
   writeClipboard(text: string): Promise<{ ok: boolean; code: HandoffCode }>;
   jumpToPassage(session: ScratchHandoff): AnchorResult;
-  sourceTitle(): string;
   openLibrary(): void;
   /** The card's visibility changed; the rail may need an entry. */
   onVisibilityChange(card: HandoffCard): void;
@@ -46,7 +45,29 @@ export interface HandoffCardDeps {
   onDisposed(card: HandoffCard): void;
 }
 
-type ClipboardLine = { kind: 'idle' } | { kind: 'copied'; revision: number } | { kind: 'failed'; code: HandoffCode };
+/**
+ * What the card may say about the clipboard. `here` is true only for a copy this
+ * card made in this page: a copy recorded earlier (a reload, the popup) may have
+ * been replaced by anything since, so it is never claimed as current.
+ */
+type ClipboardLine =
+  | { kind: 'idle' }
+  | { kind: 'copied'; revision: number; here: boolean }
+  | { kind: 'failed'; code: HandoffCode }
+  | { kind: 'replaced' };
+
+function clipboardLineFrom(session: ScratchHandoff): ClipboardLine {
+  if (session.clipboard === 'copied' && session.copied) {
+    return { kind: 'copied', revision: session.copied.revision, here: false };
+  }
+  if (session.clipboard === 'failed') {
+    return { kind: 'failed', code: 'clipboard-denied' };
+  }
+  if (session.clipboard === 'replaced') {
+    return { kind: 'replaced' };
+  }
+  return { kind: 'idle' };
+}
 
 const DRAFT_SYNC_DELAY_MS = 400;
 
@@ -152,12 +173,7 @@ export class HandoffCard {
     this.draft = { ...session.draft, excludedBlockIds: [...session.draft.excludedBlockIds] };
     this.lastCopied = session.copied;
     this.prompt = preparePrompt(session.selection, this.draft, this.lastCopied);
-    this.clipboardLine =
-      session.clipboard === 'copied' && session.copied
-        ? { kind: 'copied', revision: session.copied.revision }
-        : session.clipboard === 'failed'
-          ? { kind: 'failed', code: 'clipboard-denied' }
-          : { kind: 'idle' };
+    this.clipboardLine = clipboardLineFrom(session);
 
     this.element = el('div', { className: `aside-panel ${HANDOFF_CARD_CLASS}` });
     this.element.dataset.sessionId = session.sessionId;
@@ -476,6 +492,7 @@ export class HandoffCard {
       if (!response) {
         return;
       }
+      this.noteMemoryOnly(response);
       if (response.ok && response.session) {
         this.adoptSession(response.session, { keepLocalDraft: true });
         return;
@@ -547,7 +564,7 @@ export class HandoffCard {
     const result = await this.deps.writeClipboard(prompt.text);
     if (result.ok) {
       this.lastCopied = prompt;
-      this.clipboardLine = { kind: 'copied', revision: prompt.revision };
+      this.clipboardLine = { kind: 'copied', revision: prompt.revision, here: true };
       this.manualCopy.hidden = true;
     } else {
       this.clipboardLine = { kind: 'failed', code: result.code };
@@ -568,8 +585,34 @@ export class HandoffCard {
       code: result.code,
       prompt: result.ok ? prompt : null
     });
+    if (response) {
+      this.noteMemoryOnly(response);
+    }
     if (response?.session && response.session.sessionId === this.session.sessionId) {
       this.adoptSession(response.session, { keepLocalDraft: true });
+    }
+  }
+
+  /** Tell the worker Aside put something else on the clipboard. */
+  private async reportReplaced(): Promise<void> {
+    this.clipboardLine = { kind: 'replaced' };
+    const response = await this.deps.send({
+      type: 'HANDOFF_COPIED',
+      buildId: this.deps.buildId,
+      sessionId: this.session.sessionId,
+      ok: true,
+      code: 'ok',
+      prompt: null,
+      replaced: true
+    });
+    if (response?.session && response.session.sessionId === this.session.sessionId) {
+      this.adoptSession(response.session, { keepLocalDraft: true });
+    }
+  }
+
+  private noteMemoryOnly(response: HandoffResponse): void {
+    if (typeof response.memoryOnly === 'boolean' && response.memoryOnly !== this.memoryOnly) {
+      this.memoryOnly = response.memoryOnly;
     }
   }
 
@@ -600,6 +643,7 @@ export class HandoffCard {
         this.targetLine = `Could not reach Aside's extension worker, so ${this.providerLabel} was not opened. Reload this page and try again.`;
         return;
       }
+      this.noteMemoryOnly(response);
       if (response.session) {
         this.adoptSession(response.session, { keepLocalDraft: true });
       }
@@ -621,6 +665,9 @@ export class HandoffCard {
           break;
         case 'no-target':
           this.targetLine = `No ${this.providerLabel} page is open for this question yet.`;
+          break;
+        case 'focus-failed':
+          this.targetLine = `The ${this.providerLabel} ${this.session.target.kind === 'tab' ? 'tab' : 'window'} for this question is still open, but the browser did not switch to it. Switch to it yourself.`;
           break;
         case 'stale-client':
           this.markStale();
@@ -653,7 +700,9 @@ export class HandoffCard {
 
   private async clearClipboard(): Promise<void> {
     const result = await this.deps.writeClipboard('');
-    this.clipboardLine = { kind: 'idle' };
+    if (result.ok) {
+      await this.reportReplaced();
+    }
     this.deps.notify(
       result.ok
         ? 'Clipboard replaced with empty text in this browser. Clipboard history or synced clipboards may still hold what you copied.'
@@ -679,7 +728,9 @@ export class HandoffCard {
     ];
     const result = await this.deps.writeClipboard(lines.join('\n'));
     // Copying diagnostics replaces the prompt on the clipboard: say so.
-    this.clipboardLine = { kind: 'idle' };
+    if (result.ok) {
+      await this.reportReplaced();
+    }
     this.deps.notify(result.ok ? 'Diagnostics copied. The prompt is no longer on the clipboard.' : 'Diagnostics could not be copied.');
     this.render();
   }
@@ -697,7 +748,7 @@ export class HandoffCard {
     }
     this.notePreview.replaceChildren();
     const rows: Array<[string, string]> = [
-      ['Source', this.deps.sourceTitle() || `${this.providerLabel} conversation`],
+      ['Source', this.session.source.title || `${this.providerLabel} conversation`],
       ['Passage', clipText(focus, 600)],
       ['Question', this.draft.question.trim() || '(none)']
     ];
@@ -736,8 +787,7 @@ export class HandoffCard {
         sessionId: this.session.sessionId,
         note,
         excerpt,
-        title: this.noteTitle.value,
-        sourceTitle: this.deps.sourceTitle()
+        title: this.noteTitle.value
       });
       if (response?.ok && response.questionId) {
         this.noteForm.hidden = true;
@@ -801,9 +851,13 @@ export class HandoffCard {
 
   /* -------------------------------- worker updates -------------------------------- */
 
-  adoptSession(next: ScratchHandoff, options: { keepLocalDraft?: boolean } = {}): void {
+  adoptSession(next: ScratchHandoff, options: { keepLocalDraft?: boolean; fromEvent?: boolean } = {}): void {
     if (next.sessionId !== this.session.sessionId || this.ended) {
       return;
+    }
+    if (options.fromEvent && next.clipboard !== this.session.clipboard) {
+      // Another view (the popup) copied or replaced: recorded, not claimed as current.
+      this.clipboardLine = clipboardLineFrom(next);
     }
     const localDraft = this.draft;
     this.session = next;
@@ -949,9 +1003,16 @@ export class HandoffCard {
 
     const copiedCurrent =
       this.clipboardLine.kind === 'copied' && this.lastCopied !== null && this.lastCopied.text === this.prompt.text;
-    if (this.clipboardLine.kind === 'copied' && copiedCurrent) {
+    if (this.clipboardLine.kind === 'copied' && copiedCurrent && this.clipboardLine.here) {
       this.clipboardStatus.textContent = 'Copied: this exact prompt is on the clipboard. Nothing has been sent.';
       this.clipboardStatus.dataset.state = 'copied';
+    } else if (this.clipboardLine.kind === 'copied' && copiedCurrent) {
+      this.clipboardStatus.textContent =
+        'Copied earlier. If you have copied anything since, copy again before pasting. Nothing has been sent.';
+      this.clipboardStatus.dataset.state = 'copied-earlier';
+    } else if (this.clipboardLine.kind === 'replaced') {
+      this.clipboardStatus.textContent = 'The prompt is no longer on the clipboard. Copy again before pasting.';
+      this.clipboardStatus.dataset.state = 'stale';
     } else if (this.clipboardLine.kind === 'copied') {
       this.clipboardStatus.textContent = 'Edited since you copied it: copy again before pasting.';
       this.clipboardStatus.dataset.state = 'stale';

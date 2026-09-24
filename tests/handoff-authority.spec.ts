@@ -186,6 +186,7 @@ function createRequest(entry: 'ask' | 'why' | 'new_tab' = 'ask'): HandoffRequest
     entry,
     scopeKey: 'chatgpt:c:source-1',
     sourceUrl: 'https://chatgpt.com/c/source-1',
+    sourceTitle: 'Source chat title',
     selection: {
       rootConversationId: 'chatgpt:c:source-1',
       rootChatUrl: 'https://chatgpt.com/c/source-1',
@@ -405,6 +406,50 @@ describe('scratch handoff authority: authorization', () => {
   });
 });
 
+describe('scratch handoff authority: the same tab on another page', () => {
+  it('never lists a session to its tab once the tab shows another provider', async () => {
+    const { env, browser } = makeEnv(area);
+    const authority = new HandoffAuthority(env);
+    await created(authority);
+    const onClaude: SenderLike = { id: EXT, frameId: 0, tab: { id: 1, windowId: 1, url: 'https://claude.ai/new' } };
+    expect((await authority.handle({ type: 'HANDOFF_LIST_FOR_TAB', buildId: BUILD }, onClaude)).sessions).toEqual([]);
+    expect((await authority.handle({ type: 'HANDOFF_LIST_FOR_TAB', buildId: BUILD }, SOURCE)).sessions).toHaveLength(1);
+    // Nor is its content pushed to that tab.
+    (browser.tabs.get(1) as TabLike).url = 'https://claude.ai/chat/other';
+    const session = (await authority.all())[0];
+    await authority.handle({ type: 'HANDOFF_OPEN', buildId: BUILD, sessionId: session.sessionId, kind: 'window' }, POPUP);
+    expect(browser.messages.filter((entry) => entry.tabId === 1)).toEqual([]);
+  });
+});
+
+describe('scratch handoff authority: session storage failures', () => {
+  it('drops the stale mirrored copy when a later write fails, and says it is memory-only', async () => {
+    const { env } = makeEnv(area);
+    const authority = new HandoffAuthority(env);
+    const session = await created(authority);
+    expect(area.data.size).toBe(1);
+    area.failWrites = true;
+    const updated = await authority.handle(
+      { type: 'HANDOFF_UPDATE', buildId: BUILD, sessionId: session.sessionId, baseEpoch: session.epoch, draft: draft('changed') },
+      SOURCE
+    );
+    expect(updated.ok).toBe(true);
+    expect(updated.memoryOnly).toBe(true);
+    // No stale copy left to come back after a worker restart.
+    expect(area.data.size).toBe(0);
+    const restarted = new HandoffAuthority(makeEnv(area).env);
+    expect(await restarted.all()).toEqual([]);
+    // Recovers when writes work again.
+    area.failWrites = false;
+    const again = await authority.handle(
+      { type: 'HANDOFF_UPDATE', buildId: BUILD, sessionId: session.sessionId, baseEpoch: updated.session?.epoch as number, draft: draft('again') },
+      SOURCE
+    );
+    expect(again.memoryOnly).toBe(false);
+    expect(area.data.size).toBe(1);
+  });
+});
+
 describe('scratch handoff authority: the native destination', () => {
   it('opens blank first, registers ownership, then navigates to the route with no content in the URL', async () => {
     const { env, browser } = makeEnv(area);
@@ -531,6 +576,32 @@ describe('scratch handoff authority: the native destination', () => {
       SOURCE
     );
     expect(again.code).toBe('target-closed');
+    expect(again.session).toBeNull();
+    expect(browser.created).toHaveLength(1);
+    // Gone for good: nothing to rehydrate, nothing that can come back.
+    expect(await authority.all()).toEqual([]);
+    expect(area.data.size).toBe(0);
+  });
+
+  it('a tab that merely refused to be focused keeps its session and its tab', async () => {
+    const { env, browser } = makeEnv(area);
+    const authority = new HandoffAuthority(env);
+    const session = await created(authority);
+    const opened = await authority.handle(
+      { type: 'HANDOFF_OPEN', buildId: BUILD, sessionId: session.sessionId, kind: 'window' },
+      SOURCE
+    );
+    const realUpdate = env.tabs.update;
+    env.tabs.update = async () => {
+      throw new Error('Tabs cannot be edited right now');
+    };
+    const again = await authority.handle(
+      { type: 'HANDOFF_OPEN', buildId: BUILD, sessionId: session.sessionId, kind: 'window', focusOnly: true },
+      SOURCE
+    );
+    env.tabs.update = realUpdate;
+    expect(again.code).toBe('focus-failed');
+    expect(again.session?.target).toMatchObject({ state: 'open', tabId: opened.session?.target.tabId });
     expect(browser.created).toHaveLength(1);
   });
 });
@@ -604,10 +675,13 @@ describe('scratch handoff authority: browser events and closure', () => {
     const authority = new HandoffAuthority(env);
     const first = await openSession(authority);
     const tabId = first.target.tabId as number;
-    await authority.onTabUpdated(tabId, 'https://chatgpt.com/c/temp-1');
+    // Staying on the provider's new-chat pages keeps it provably Aside's tab.
+    await authority.onTabUpdated(tabId, 'https://chatgpt.com/?temporary-chat=true');
+    await authority.onTabUpdated(tabId, 'https://chatgpt.com/');
     let [current] = await authority.all();
     expect(current.target.ownership).toBe('owned');
-    await authority.onTabUpdated(tabId, 'https://chatgpt.com/c/someone-elses-chat');
+    // Any conversation address: it might be one of the Owner's saved chats.
+    await authority.onTabUpdated(tabId, 'https://chatgpt.com/c/existing-chat');
     [current] = await authority.all();
     expect(current.target.ownership).toBe('uncertain');
     const ended = await authority.handle(
@@ -695,12 +769,12 @@ describe('scratch handoff authority: explicit local note', () => {
     const authority = new HandoffAuthority(env);
     const session = await created(authority);
     const response = await authority.handle(
-      { type: 'HANDOFF_SAVE_NOTE', buildId: BUILD, sessionId: session.sessionId, note: 'my note', excerpt: '', title: 'Why?', sourceTitle: 'Src' },
+      { type: 'HANDOFF_SAVE_NOTE', buildId: BUILD, sessionId: session.sessionId, note: 'my note', excerpt: '', title: 'Why?' },
       SOURCE
     );
     expect(response.ok).toBe(true);
     expect(response.questionId).toBe('q-1');
-    expect(saved).toEqual([{ note: 'my note', excerpt: '', title: 'Why?', sourceTitle: 'Src' }]);
+    expect(saved).toEqual([{ note: 'my note', excerpt: '', title: 'Why?' }]);
     expect((await authority.all())[0].policy).toBe('temporary-intended');
   });
 
@@ -711,7 +785,7 @@ describe('scratch handoff authority: explicit local note', () => {
     const authority = new HandoffAuthority(env);
     const session = await created(authority);
     const response = await authority.handle(
-      { type: 'HANDOFF_SAVE_NOTE', buildId: BUILD, sessionId: session.sessionId, note: 'n', excerpt: '', title: 't', sourceTitle: '' },
+      { type: 'HANDOFF_SAVE_NOTE', buildId: BUILD, sessionId: session.sessionId, note: 'n', excerpt: '', title: 't' },
       SOURCE
     );
     expect(response.ok).toBe(false);
@@ -723,7 +797,7 @@ describe('scratch handoff authority: explicit local note', () => {
     const authority = new HandoffAuthority(env);
     const session = await created(authority);
     const response = await authority.handle(
-      { type: 'HANDOFF_SAVE_NOTE', buildId: BUILD, sessionId: session.sessionId, note: '  ', excerpt: '', title: 't', sourceTitle: '' },
+      { type: 'HANDOFF_SAVE_NOTE', buildId: BUILD, sessionId: session.sessionId, note: '  ', excerpt: '', title: 't' },
       SOURCE
     );
     expect(response.code).toBe('invalid-request');

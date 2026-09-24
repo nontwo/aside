@@ -33,6 +33,8 @@ export interface CreateQuestionCommand {
    * either creates the question and its note together or creates nothing.
    */
   note?: { id: string; text: string };
+  /** Leave an existing Source's title as it is (explicit notes never rename). */
+  keepExistingSourceTitle?: boolean;
 }
 
 export interface UpdateDraftCommand {

@@ -76,10 +76,7 @@ export interface HandoffEnv {
     get(windowId: number, options?: { populate?: boolean }): Promise<WindowLike>;
   };
   /** Commits an explicit local note through the storage authority. */
-  saveNote?(
-    session: ScratchHandoff,
-    input: { note: string; excerpt: string; title: string; sourceTitle: string }
-  ): Promise<{ questionId: string }>;
+  saveNote?(session: ScratchHandoff, input: { note: string; excerpt: string; title: string }): Promise<{ questionId: string }>;
 }
 
 export interface SenderLike {
@@ -181,11 +178,14 @@ export class HandoffAuthority {
   private readonly sessions = new Map<string, ScratchHandoff>();
   private hydration: Promise<void> | null = null;
   private queue: Promise<unknown> = Promise.resolve();
-  /** True once a write to session storage failed or the area was absent. */
-  memoryOnly: boolean;
+  /** Sessions whose latest state could not be mirrored to session storage. */
+  private readonly unmirrored = new Set<string>();
 
-  constructor(private readonly env: HandoffEnv) {
-    this.memoryOnly = env.session === null;
+  constructor(private readonly env: HandoffEnv) {}
+
+  /** True while any session lives in memory only (or the area is absent). */
+  get memoryOnly(): boolean {
+    return this.env.session === null || this.unmirrored.size > 0;
   }
 
   /* ---------------------------- persistence --------------------------- */
@@ -207,7 +207,7 @@ export class HandoffAuthority {
           }
         });
       } catch {
-        this.memoryOnly = true;
+        // Unreadable: start empty; nothing is fabricated.
       }
     })();
     return this.hydration;
@@ -215,19 +215,29 @@ export class HandoffAuthority {
 
   private async persist(session: ScratchHandoff): Promise<void> {
     this.sessions.set(session.sessionId, session);
-    if (!this.env.session || this.memoryOnly) {
+    if (!this.env.session) {
       return;
     }
+    const key = HANDOFF_STORAGE_PREFIX + session.sessionId;
     try {
-      await this.env.session.set({ [HANDOFF_STORAGE_PREFIX + session.sessionId]: session });
+      await this.env.session.set({ [key]: session });
+      this.unmirrored.delete(session.sessionId);
     } catch {
       // Full or unavailable: keep the session in memory and say so. Never disk.
-      this.memoryOnly = true;
+      // An older mirrored copy would come back after a worker restart as if it
+      // were current, so it is removed rather than left stale.
+      this.unmirrored.add(session.sessionId);
+      try {
+        await this.env.session.remove(key);
+      } catch {
+        // Nothing more to do; the in-memory copy is the only current one.
+      }
     }
   }
 
   private async purge(sessionId: string): Promise<void> {
     this.sessions.delete(sessionId);
+    this.unmirrored.delete(sessionId);
     if (!this.env.session) {
       return;
     }
@@ -249,7 +259,7 @@ export class HandoffAuthority {
   /* ------------------------------ helpers ----------------------------- */
 
   private respond(ok: boolean, code: HandoffCode, extra: Partial<HandoffResponse> = {}): HandoffResponse {
-    return { ok, code, buildId: this.env.buildId, ...extra };
+    return { ok, code, buildId: this.env.buildId, memoryOnly: this.memoryOnly, ...extra };
   }
 
   private callerOf(sender: SenderLike): Caller | null {
@@ -302,6 +312,16 @@ export class HandoffAuthority {
     reason: HandoffChangedMessage['reason']
   ): Promise<void> {
     if (!session.source.open || session.source.tabId < 0) {
+      return;
+    }
+    // The source tab may have moved to another site or provider since: its
+    // document is then not the one this session belongs to.
+    try {
+      const tab = await this.env.tabs.get(session.source.tabId);
+      if (!isProviderUrl(session.providerId, tab.url)) {
+        return;
+      }
+    } catch {
       return;
     }
     const message: HandoffChangedMessage = {
@@ -394,6 +414,7 @@ export class HandoffAuthority {
       !isSelection(request.selection) ||
       !isDraft(request.draft) ||
       !isString(request.scopeKey, 1_000) ||
+      !isString(request.sourceTitle ?? '', 400) ||
       !isProviderUrl(request.providerId, caller.url)
     ) {
       return this.respond(false, 'invalid-request');
@@ -414,7 +435,8 @@ export class HandoffAuthority {
         windowId: caller.windowId,
         scopeKey: request.scopeKey,
         url: caller.url,
-        open: true
+        open: true,
+        title: (request.sourceTitle ?? '').slice(0, 400)
       },
       selection: request.selection,
       draft: request.draft,
@@ -480,8 +502,8 @@ export class HandoffAuthority {
       return this.respond(false, 'invalid-request');
     }
     const next = this.bump(session, {
-      clipboard: request.ok ? 'copied' : 'failed',
-      copied: request.ok && request.prompt ? request.prompt : session.copied
+      clipboard: request.replaced ? 'replaced' : request.ok ? 'copied' : 'failed',
+      copied: request.ok && request.prompt && !request.replaced ? request.prompt : session.copied
     });
     await this.persist(next);
     if (caller.kind !== 'source') {
@@ -519,11 +541,24 @@ export class HandoffAuthority {
       if (focused) {
         return this.respond(true, 'focused-existing', { session });
       }
-      // The tab is gone without a removal event reaching us. Its temporary
-      // conversation cannot be restored; say so and do not reopen.
-      const next = this.bump(session, { target: { ...target, state: 'closed', tabId: null } });
-      await this.persist(next);
-      return this.respond(false, 'target-closed', { session: next });
+      let exists = false;
+      try {
+        await this.env.tabs.get(target.tabId);
+        exists = true;
+      } catch {
+        exists = false;
+      }
+      if (exists) {
+        // A transient refusal to switch tabs: nothing about the session changes.
+        return this.respond(false, 'focus-failed', { session });
+      }
+      // The tab is gone without a removal event reaching us: exactly as if it
+      // had been closed. Its temporary conversation cannot be restored.
+      await this.purge(session.sessionId);
+      if (caller.kind !== 'source') {
+        await this.notifySource(session, null, 'target-closed');
+      }
+      return this.respond(false, 'target-closed', { session: null });
     }
     if (target.state === 'closed') {
       return this.respond(false, 'target-closed', { session });
@@ -658,7 +693,11 @@ export class HandoffAuthority {
     if (caller.kind !== 'source') {
       return this.respond(false, 'invalid-request');
     }
-    const sessions = [...this.sessions.values()].filter((session) => session.source.tabId === caller.tabId);
+    // The tab id alone is not enough: the same tab may now show another
+    // provider's page, which must never receive this session's content.
+    const sessions = [...this.sessions.values()].filter(
+      (session) => session.source.tabId === caller.tabId && isProviderUrl(session.providerId, caller.url)
+    );
     return this.respond(true, this.memoryOnly ? 'storage-unavailable' : 'ok', { sessions });
   }
 
@@ -752,7 +791,6 @@ export class HandoffAuthority {
       !isString(request.note, 50_000) ||
       !isString(request.excerpt, 100_000) ||
       !isString(request.title, 400) ||
-      !isString(request.sourceTitle, 400) ||
       (!request.note.trim() && !request.excerpt.trim()) ||
       !this.env.saveNote
     ) {
@@ -762,8 +800,7 @@ export class HandoffAuthority {
       const { questionId } = await this.env.saveNote(session, {
         note: request.note,
         excerpt: request.excerpt,
-        title: request.title,
-        sourceTitle: request.sourceTitle
+        title: request.title
       });
       // The scratch itself stays scratch: saving a note does not promote it.
       return this.respond(true, 'ok', { session, questionId });
@@ -818,11 +855,12 @@ export class HandoffAuthority {
           const path = conversationPathOf(url);
           if (path && !paths.includes(path)) {
             paths.push(path);
-            if (paths.length > 1) {
-              // A second conversation in the same tab: the Owner went
-              // somewhere else. Aside will focus it but never close it.
-              ownership = 'uncertain';
-            }
+            // From the URL alone, the temporary chat getting an address of its
+            // own and the Owner opening one of their saved chats in this tab
+            // look the same. Aside only closes a tab it can still prove is the
+            // page it opened, so any conversation address makes it uncertain:
+            // focusable, never closed by Aside.
+            ownership = 'uncertain';
           }
         }
         if (ownership !== target.ownership || paths.length !== target.conversationPaths.length) {
