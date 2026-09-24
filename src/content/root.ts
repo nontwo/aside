@@ -7,64 +7,64 @@ import {
   HIGHLIGHT_OVERLAY_ID,
   LEGACY_LAST_BRANCH_KIND_STORAGE_KEY,
   LEGACY_PANEL_STORAGE_PREFIX,
-  PANEL_STORAGE_PREFIX,
   ROOT_STYLE_ID,
   LAST_BRANCH_KIND_STORAGE_KEY
 } from '../shared/constants';
+import { mergePanelStateOnConflict, resolveWriteConflict } from '../shared/panel-store';
 import {
   getPanelStorageKeyForConversationId,
-  getPanelStorageKeyForState,
   isCatchAllPanelStorageKey,
   isPanelStorageKey,
-  mergePanelBuckets
 } from '../shared/panel-storage';
-import type { PersistedPanelBucket } from '../shared/panel-storage';
-import {
-  buildSelectionPayloadFromDraft,
-  captureSelectionDraftFromRange,
-  countTranscriptTurns,
-  findQuotedTextRangeInElement,
-  findTurnElementByAnchor,
-  getRecentAssistantTexts,
-  rangeTouchesAssistantMessage
-} from '../shared/dom';
-import type { SelectionDraft } from '../shared/dom';
-import {
-  buildLocalInitialPrompt,
-  buildNativeBootstrapPrompt,
-  stripHiddenTitle
-} from '../shared/prompts';
-import { attachElementToHost, ensureExtensionHostElement } from './ui-host';
-import {
-  getActionLabel,
-  getSendCandidateProfile,
-  inferTemporaryChatState,
-  isAcceptableSendControl,
-  isTemporaryChatControl
-} from '../shared/send-controls';
 import type {
+  PanelChangedMessage,
+  PanelListResponse,
+  PanelListedRecord,
+  PanelWriteResponse,
   BranchCreationMode,
   BranchEntryAction,
   BranchKind,
-  BranchPanelEvent,
   BranchPanelState,
   BranchPanelStatus,
-  CreateBranchWindowResponse,
-  FocusBranchWindowResponse,
-  ForwardBranchPanelEventMessage,
-  RunBranchPromptInTabMessage,
+  CapturedMessage,
   SelectionPayload
 } from '../shared/types';
 import {
-  clipText,
-  compactWhitespace,
-  getBranchLaunchUrl,
-  getChatContainerBaseUrl,
-  getRootConversationId,
-  normalizeChatUrl,
-  randomId,
-  sleep
-} from '../shared/utils';
+  buildSelectionPayloadFromDraft,
+  captureSelectionDraftFromRange,
+  locatePassage,
+  rangeTouchesAssistantMessage,
+  setActiveScopeResolver,
+  setActiveTranscriptAdapter
+} from '../shared/dom';
+import type { SelectionDraft } from '../shared/dom';
+import { createContext, sanitizeStoredContext } from '../shared/context';
+import type { BranchContext, ContextBlock } from '../shared/context';
+import { attachElementToHost, ensureExtensionHostElement } from './ui-host';
+import { findFreeCorner, findLeftGutterSlot, findSafePlacement } from '../shared/placement';
+import type { Rect } from '../shared/placement';
+import { exportSourceMarkdown, fetchBundle, listQuestionsForScope, runCommand } from '../ui/question-client';
+import { renderQuestionList } from '../ui/question-list';
+import type { ListFilter } from '../ui/question-list';
+import { BUILD_ID } from '../shared/build-info';
+import type { QuestionBundle, QuestionListEntry } from '../storage/repository';
+import type { QuestionChangedMessage } from '../storage/protocol';
+import { clipText, compactWhitespace, normalizeChatUrl, randomId, sleep } from '../shared/utils';
+import { findChatAdapterForUrl, getAdapter } from '../shared/providers';
+import type { ConversationIdentity, ProviderAdapter } from '../shared/providers';
+import { HANDOFF_CARD_CSS, HandoffCard, writeClipboardText } from './handoff-card';
+import type { HandoffCardDeps } from './handoff-card';
+import { WHY_QUESTION, routeFor } from '../handoff/routes';
+import type {
+  AnchorResult,
+  HandoffChangedMessage,
+  HandoffDraft,
+  HandoffEntry,
+  HandoffRequest,
+  HandoffResponse,
+  HandoffScrollToAnchorMessage,
+  ScratchHandoff
+} from '../handoff/types';
 
 interface PanelRuntime {
   state: BranchPanelState;
@@ -73,57 +73,17 @@ interface PanelRuntime {
   statusEl: HTMLElement;
   errorEl: HTMLElement;
   focusTextEl: HTMLElement;
-  formEl: HTMLFormElement;
-  branchKindField: HTMLDivElement;
-  persistentKindButton: HTMLButtonElement;
-  temporaryKindButton: HTMLButtonElement;
-  questionInput: HTMLTextAreaElement;
-  submitButton: HTMLButtonElement;
-  iframeShell: HTMLDivElement;
-  iframeEl: HTMLIFrameElement;
-  iframeOverlay: HTMLDivElement;
-  iframeOverlayTitle: HTMLParagraphElement;
-  iframeOverlayText: HTMLParagraphElement;
+  promptShell: HTMLDetailsElement;
+  promptPre: HTMLPreElement;
+  archiveEl: HTMLDivElement;
   debugLogShell: HTMLDivElement;
   debugLogTextarea: HTMLTextAreaElement;
   copyLogButton: HTMLButtonElement;
   openTabHeaderButton: HTMLButtonElement;
-  pendingFramePrompt?: string;
-  frameReady: boolean;
-  frameStartSent: boolean;
-  watchdogId?: number;
+  moreDetails: HTMLDetailsElement;
 }
-
-type AutomationTransport = 'frame' | 'background';
 
 type ThemeMode = 'light' | 'dark';
-
-interface FrameStartBranchMessage {
-  source: 'aside';
-  target: 'frame';
-  type: 'SB_FRAME_START_BRANCH';
-  panelId: string;
-  prompt: string;
-  launchUrl: string;
-  branchKind: BranchKind;
-}
-
-interface FrameReadyMessage {
-  source: 'aside';
-  target: 'parent';
-  type: 'SB_FRAME_READY';
-  currentUrl: string;
-}
-
-interface FrameBranchEventMessage {
-  source: 'aside';
-  target: 'parent';
-  type: 'SB_FRAME_EVENT';
-  panelId: string;
-  event: BranchPanelEvent;
-}
-
-type FrameIncomingMessage = FrameReadyMessage | FrameBranchEventMessage;
 
 declare global {
   interface Window {
@@ -133,30 +93,11 @@ declare global {
 
 const PANEL_CLASS = 'aside-panel';
 const PANEL_TABBAR_ID = 'aside-tabbar';
-const FRAME_AUTOMATION_STYLE_ID = 'aside-frame-automation-style';
+const ASIDE_LAUNCHER_ID = 'aside-launcher';
+const RAIL_WIDTH_PX = 96;
 const EXTENSION_HOST_ID = 'aside-root';
-const TITLE_WATCH_TIMEOUT_MS = 120_000;
-// The envelope has to stay hidden for as long as the message can re-render, which is
-// longer than it takes to read the title out of it.
-const TITLE_MARKER_WATCH_TIMEOUT_MS = TITLE_WATCH_TIMEOUT_MS;
-const TEMPORARY_LEAK_WATCH_MS = 4_000;
 const MIN_SELECTION_LENGTH = 4;
-const ASK_TRIGGER_SYNC_DELAY_MS = 120;
 const PERSIST_DEBOUNCE_MS = 300;
-// ChatGPT can refuse to be framed, the frame can fail to load, or the branch window can
-// stop answering. Without these ceilings a panel sat on "Loading..." forever with no way
-// back to the question form.
-const FRAME_HANDSHAKE_TIMEOUT_MS = 25_000;
-const BRANCH_RESPONSE_TIMEOUT_MS = 180_000;
-const SELECTION_ACTION_PATTERNS = [
-  /ask\s*chatgpt/i,
-  /询问\s*chatgpt/i,
-  /问\s*chatgpt/i,
-  /向\s*chatgpt\s*提问/i,
-  /chat\s+with\s+chatgpt/i,
-  /与\s*chatgpt\s*聊天/i
-];
-
 let currentSelectionPayload: SelectionPayload | null = null;
 let currentSelectionDraft: SelectionDraft | null = null;
 let currentSelectionRect: DOMRect | null = null;
@@ -169,28 +110,77 @@ let tabBar: HTMLDivElement | null = null;
 let highlightOverlay: HTMLDivElement | null = null;
 let highlightOverlayTimer: number | undefined;
 let selectionTimer: number | undefined;
-let askTriggerTimer: number | undefined;
 let lastKnownUrl = normalizeChatUrl(window.location.href);
 let cleanupFns: Array<() => void> = [];
 const panelRuntimes = new Map<string, PanelRuntime>();
-let selectionActionObserver: MutationObserver | null = null;
+
+/* ---------------------------------------------------------------- *
+ * Canonical question records live in the worker's database. The panel is a
+ * view/run projection; these maps hold the revisions this tab last saw.
+ * ---------------------------------------------------------------- */
+const questionRevs = new Map<string, number>();
+const draftRevs = new Map<string, number>();
+const linkRevs = new Map<string, number>();
+
+let questionListEl: HTMLDivElement | null = null;
+let questionListFilter: ListFilter = 'active';
+let questionListEntries: QuestionListEntry[] = [];
+let questionListSourceId: string | null = null;
+let questionListOpen = false;
+let nativeLayoutObserver: MutationObserver | null = null;
+let layoutSyncFrame: number | undefined;
+let asideLauncher: HTMLButtonElement | null = null;
 let themeObserver: MutationObserver | null = null;
 let activeTheme: ThemeMode | null = null;
 let pendingUrlChangeToken = 0;
-let lastUsedBranchKind: BranchKind = 'persistent';
-let selectionActionMutationMuted = false;
-let selectionActionRefreshTimer: number | undefined;
 let isEvaluatingSelection = false;
-let pendingDraftFocusPanelId: string | null = null;
-const suppressedSelectionActions = new Set<HTMLElement>();
 // Panels the user closed on purpose. Everything else found in storage belongs to another
 // conversation (or another tab) and has to survive a write from this page.
 const closedPanelIds = new Set<string>();
+
+/**
+ * The provider that owns this document. Resolved once at init and never changed:
+ * a selection made on ChatGPT runs its branch on ChatGPT, and a Claude selection
+ * runs on Claude. There is no cross-provider transfer.
+ */
+let provider: ProviderAdapter = getAdapter('chatgpt');
+
+/**
+ * Discriminator that keeps pages without an addressable conversation — a new chat,
+ * a project home, a shared link — from sharing one storage bucket. It is scoped to
+ * this document, so a reload deliberately starts a new scope rather than adopting
+ * somebody else's panels.
+ */
+const sessionDiscriminator = randomId('doc').slice(4);
+
+function currentIdentity(url = lastKnownUrl): ConversationIdentity {
+  return provider.identify(url, sessionDiscriminator);
+}
 let persistTimer: number | undefined;
 let persistQueue: Promise<void> = Promise.resolve();
 let toolbarSyncFrame: number | undefined;
 
-type TemporaryChatVerification = 'confirmed' | 'assumed';
+/**
+ * Two builds talking to each other — a content script left over from a previous
+ * install, a frame loaded before an update — explain a whole class of "it does
+ * nothing" reports. Said once per pair, in the log and on screen.
+ */
+const staleClientReports = new Set<string>();
+let workerBuildId: string | undefined;
+
+function reportStaleClient(runtime: PanelRuntime | null, source: string, otherBuild: string): void {
+  const key = `${source}:${otherBuild}`;
+  if (staleClientReports.has(key)) {
+    return;
+  }
+  staleClientReports.add(key);
+  const entry = `stale-client: ${source} build ${otherBuild} differs from this page's build ${BUILD_ID}`;
+  console.warn('[Aside]', entry);
+  if (runtime) {
+    appendPanelLog(runtime, entry);
+  }
+  notifyAside("Aside's page and background builds differ: press Reload on Aside in chrome://extensions, then reload this page.");
+}
 
 function hasRuntimeAccess(): boolean {
   try {
@@ -208,10 +198,6 @@ function isTopFrame(): boolean {
   return window.top === window.self;
 }
 
-function getConversationStorageKey(url = lastKnownUrl): string {
-  return getPanelStorageKeyForConversationId(getRootConversationId(url));
-}
-
 function formatDebugLogEntry(message: string, details?: unknown): string {
   let suffix = '';
   if (details !== undefined) {
@@ -225,20 +211,6 @@ function formatDebugLogEntry(message: string, details?: unknown): string {
   return `[${new Date().toISOString()}] ${message}${suffix}`;
 }
 
-function recordAutomationLog(message: string, details?: unknown): string {
-  const entry = formatDebugLogEntry(message, details);
-  console.info('[Aside]', entry);
-
-  if (activeAutomationPanelId) {
-    void sendAutomationEvent({
-      kind: 'debug-log',
-      message: entry
-    });
-  }
-
-  return entry;
-}
-
 function appendPanelLog(runtime: PanelRuntime, message: string, details?: unknown): void {
   const entry = formatDebugLogEntry(message, details);
   runtime.state.debugLog = [...(runtime.state.debugLog ?? []), entry].slice(-250);
@@ -246,124 +218,236 @@ function appendPanelLog(runtime: PanelRuntime, message: string, details?: unknow
   console.info('[Aside]', entry);
 }
 
-function appendPanelLogEntries(runtime: PanelRuntime, entries: string[]): void {
-  if (!entries.length) {
-    return;
-  }
+/**
+ * Panel persistence client.
+ *
+ * The tab no longer reads, merges and rewrites the panel store: the service worker
+ * is the single authority. Each panel is proposed individually with the revision
+ * this tab last saw, so a concurrent write from another tab is reported as a
+ * conflict instead of being silently overwritten, and a panel closed elsewhere
+ * stays closed.
+ */
+const panelRevisions = new Map<string, number>();
+const dirtyPanelIds = new Set<string>();
+const unsavedPanelIds = new Set<string>();
 
-  runtime.state.debugLog = [...(runtime.state.debugLog ?? []), ...entries].slice(-250);
-  runtime.state.updatedAt = Date.now();
+function storageAreaForPanel(state: Pick<BranchPanelState, 'branchKind'>): 'local' | 'session' {
+  return state.branchKind === 'temporary' ? 'session' : 'local';
 }
 
-async function readPersistedPanels(url = lastKnownUrl): Promise<BranchPanelState[]> {
-  if (!hasRuntimeAccess()) {
-    return [];
-  }
-
-  const key = getConversationStorageKey(url);
-
-  try {
-    const stored = (await chrome.storage.local.get(key)) as Record<string, unknown>;
-    const raw = stored[key];
-    return Array.isArray(raw) ? (raw as BranchPanelState[]) : [];
-  } catch (error) {
-    if (isInvalidatedError(error)) {
-      return [];
-    }
-    throw error;
-  }
+function markPanelDirty(panelId: string): void {
+  dirtyPanelIds.add(panelId);
 }
 
-async function migrateLegacyPanelStorage(): Promise<void> {
+/** The last state successfully written for a panel, so unchanged panels are skipped. */
+const lastWrittenSignatures = new Map<string, string>();
+
+/**
+ * What is actually worth writing.
+ *
+ * `updatedAt` is excluded deliberately: several call sites stamp it without
+ * changing anything the user would notice, and writing for that alone bumps the
+ * record's revision, which is what makes another tab's in-progress draft flip to
+ * unsaved on unrelated activity here.
+ */
+function panelWriteSignature(state: BranchPanelState): string {
+  const { updatedAt: _updatedAt, ...rest } = state;
+  return JSON.stringify(rest);
+}
+
+function markAllPanelsDirty(): void {
+  panelRuntimes.forEach((runtime) => dirtyPanelIds.add(runtime.state.panelId));
+}
+
+async function sendStoreMessage<T>(message: unknown): Promise<T | null> {
   if (!hasRuntimeAccess()) {
-    return;
+    return null;
   }
 
   try {
-    const stored = (await chrome.storage.local.get(null)) as Record<string, unknown>;
-    const nextEntries: Record<string, unknown> = {};
-
-    Object.entries(stored).forEach(([key, value]) => {
-      if (!key.startsWith(LEGACY_PANEL_STORAGE_PREFIX)) {
-        return;
-      }
-
-      const nextKey = `${PANEL_STORAGE_PREFIX}${key.slice(LEGACY_PANEL_STORAGE_PREFIX.length)}`;
-      if (!(nextKey in stored) && !(nextKey in nextEntries)) {
-        nextEntries[nextKey] = value;
-      }
-    });
-
-    if (
-      !(LAST_BRANCH_KIND_STORAGE_KEY in stored) &&
-      LEGACY_LAST_BRANCH_KIND_STORAGE_KEY in stored
-    ) {
-      nextEntries[LAST_BRANCH_KIND_STORAGE_KEY] = stored[LEGACY_LAST_BRANCH_KIND_STORAGE_KEY];
-    }
-
-    if (Object.keys(nextEntries).length) {
-      await chrome.storage.local.set(nextEntries);
-    }
+    return (await chrome.runtime.sendMessage(message)) as T;
   } catch (error) {
     if (!isInvalidatedError(error)) {
-      throw error;
+      console.warn('[Aside] Panel store message failed', error);
     }
+    return null;
   }
 }
 
-async function readAllPersistedPanelBuckets(): Promise<PersistedPanelBucket[]> {
-  if (!hasRuntimeAccess()) {
-    return [];
-  }
+/** Adopt an authoritative record for a panel this tab has mounted. */
+/**
+ * The stored form of each legacy record, exactly as read. A saved-record view
+ * writes back only its per-tab view state onto this, never the normalized
+ * projection it displays — reading a record must not rewrite it.
+ */
+const legacyRawStates = new Map<string, BranchPanelState>();
 
-  try {
-    const stored = (await chrome.storage.local.get(null)) as Record<string, unknown>;
-    return Object.entries(stored)
-      .filter(([key]) => isPanelStorageKey(key))
-      .map(([key, value]) => ({
-        key,
-        panels: Array.isArray(value) ? (value as BranchPanelState[]) : []
-      }));
-  } catch (error) {
-    if (isInvalidatedError(error)) {
-      return [];
-    }
-    throw error;
+function writableStateFor(runtime: PanelRuntime): BranchPanelState {
+  const raw = legacyRawStates.get(runtime.state.panelId);
+  if (!raw) {
+    return runtime.state;
   }
+  return {
+    ...raw,
+    minimized: runtime.state.minimized,
+    closedView: runtime.state.closedView,
+    updatedAt: runtime.state.updatedAt
+  };
 }
 
-async function writePersistedPanels(): Promise<void> {
-  if (!hasRuntimeAccess()) {
+function adoptAuthoritativeState(panelId: string, state: BranchPanelState, rev: number): void {
+  const runtime = panelRuntimes.get(panelId);
+  panelRevisions.set(panelId, rev);
+  legacyRawStates.set(panelId, state);
+  if (!runtime) {
     return;
   }
 
-  try {
-    const { entries, removableKeys } = mergePanelBuckets(
-      sortPanels().map((runtime) => runtime.state),
-      await readAllPersistedPanelBuckets(),
-      closedPanelIds
-    );
+  // Saved-record views are read-only, so there is no local text to protect: the
+  // authoritative record wins, except for this tab's own view state.
+  runtime.state = mergePanelStateOnConflict({
+    local: runtime.state,
+    theirs: state,
+    localQuestion: state.initialQuestion ?? '',
+    localDrivesBranch: false
+  });
+  lastWrittenSignatures.set(panelId, panelWriteSignature(runtime.state));
+  unsavedPanelIds.delete(panelId);
 
-    if (removableKeys.length) {
-      await chrome.storage.local.remove(removableKeys);
-    }
+  syncPanelUI(runtime);
+  renderTabs();
+}
 
-    if (Object.keys(entries).length) {
-      await chrome.storage.local.set(entries);
+async function writePanelRecord(runtime: PanelRuntime, attempt = 0): Promise<void> {
+  const panelId = runtime.state.panelId;
+
+  // Taken before the round trip, and recorded only on success. Reading it back
+  // afterwards would mark as written whatever the user typed while the write was
+  // in flight, and the next write would then skip it: the last few characters of
+  // a draft would silently never be saved.
+  const signature = panelWriteSignature(runtime.state);
+  if (attempt === 0 && !unsavedPanelIds.has(panelId) && lastWrittenSignatures.get(panelId) === signature) {
+    return;
+  }
+
+  const response = await sendStoreMessage<PanelWriteResponse>({
+    type: 'PANEL_UPSERT',
+    panelId,
+    scopeKey: runtime.state.rootConversationId,
+    area: storageAreaForPanel(runtime.state),
+    baseRev: panelRevisions.get(panelId) ?? 0,
+    state: writableStateFor(runtime)
+  });
+
+  if (!response) {
+    runtime.element.dataset.storeStatus = 'no-response';
+    unsavedPanelIds.add(panelId);
+    return;
+  }
+
+  // The last write outcome, on the element, so the saved/unsaved state is
+  // inspectable rather than only inferable.
+  runtime.element.dataset.storeStatus = response.status;
+  runtime.element.dataset.storeRev = String(response.rev ?? panelRevisions.get(panelId) ?? 0);
+
+  if (response.status === 'applied' && typeof response.rev === 'number') {
+    panelRevisions.set(panelId, response.rev);
+    lastWrittenSignatures.set(panelId, signature);
+    unsavedPanelIds.delete(panelId);
+
+    // Anything typed while that write was in flight is still unwritten.
+    if (panelWriteSignature(runtime.state) !== signature) {
+      markPanelDirty(panelId);
+      persistPanelsSoon(panelId);
     }
-  } catch (error) {
-    if (isInvalidatedError(error)) {
+    return;
+  }
+
+  if (response.status === 'conflict' && response.current) {
+    const theirs = response.current;
+    panelRevisions.set(panelId, theirs.rev);
+
+    const localQuestion = runtime.state.initialQuestion ?? '';
+    const decision = resolveWriteConflict({
+      localQuestion,
+      theirQuestion: theirs.state.initialQuestion,
+      attempt
+    });
+
+    if (decision.action === 'rebase') {
+      appendPanelLog(runtime, 'Another tab wrote first; re-basing this draft onto it', {
+        theirRev: theirs.rev,
+        attempt: attempt + 1
+      });
+      runtime.state = {
+        ...mergePanelStateOnConflict({
+          local: runtime.state,
+          theirs: theirs.state,
+          localQuestion: decision.question,
+          localDrivesBranch: false
+        }),
+        updatedAt: Date.now()
+      };
+      await writePanelRecord(runtime, attempt + 1);
       return;
     }
 
-    // A quota or serialization failure here used to surface as an unhandled rejection and
-    // take the rest of the session's writes with it.
-    console.warn('[Aside] Could not persist branch panels', error);
+    if (decision.action === 'keep-local-unsaved') {
+      appendPanelLog(runtime, 'Could not save this draft; another tab keeps writing first', {
+        theirRev: theirs.rev
+      });
+      runtime.state = mergePanelStateOnConflict({
+        local: runtime.state,
+        theirs: theirs.state,
+        localQuestion: decision.question,
+        localDrivesBranch: false
+      });
+      unsavedPanelIds.add(panelId);
+      syncPanelUI(runtime);
+      return;
+    }
+
+    appendPanelLog(runtime, 'Another tab wrote this panel; adopting its version', {
+      theirRev: theirs.rev
+    });
+    adoptAuthoritativeState(panelId, theirs.state, theirs.rev);
+    return;
+  }
+
+  if (response.status === 'rejected-deleted') {
+    // Closed in another tab. Honour that here rather than resurrecting it.
+    appendPanelLog(runtime, 'Panel was closed in another tab; removing it here');
+    runtime.element.remove();
+    panelRuntimes.delete(panelId);
+    panelRevisions.delete(panelId);
+    unsavedPanelIds.delete(panelId);
+    renderTabs();
+    return;
+  }
+
+  if (response.unsaved) {
+    unsavedPanelIds.add(panelId);
+    if (storageAreaForPanel(runtime.state) === 'session') {
+    }
+    syncPanelUI(runtime);
+  }
+}
+
+async function flushPanelWrites(): Promise<void> {
+  const pending = [...dirtyPanelIds];
+  dirtyPanelIds.clear();
+
+  for (const panelId of pending) {
+    const runtime = panelRuntimes.get(panelId);
+    if (!runtime) {
+      continue;
+    }
+    await writePanelRecord(runtime);
   }
 }
 
 function queuePersistWrite(): Promise<void> {
-  persistQueue = persistQueue.catch(() => {}).then(() => writePersistedPanels());
+  persistQueue = persistQueue.catch(() => {}).then(() => flushPanelWrites());
   return persistQueue;
 }
 
@@ -372,23 +456,38 @@ function cancelPendingPersist(): void {
   persistTimer = undefined;
 }
 
-// Structural changes (create, minimize, close, status transitions) are written straight
-// away, because the user may navigate immediately afterwards.
-function persistPanels(): void {
+/**
+ * Structural changes (create, minimize, close, status transitions) are written
+ * straight away, because the user may navigate immediately afterwards.
+ */
+function persistPanels(panelId?: string): void {
   if (!hasRuntimeAccess()) {
     return;
+  }
+
+  // Only the panel that changed is written. Marking every mounted panel dirty
+  // meant a page with a full rail issued a write per panel on every interaction,
+  // which is both wasteful and a reliable way to lose a race with another tab.
+  if (panelId) {
+    markPanelDirty(panelId);
+  } else {
+    markAllPanelsDirty();
   }
 
   cancelPendingPersist();
   void queuePersistWrite();
 }
 
-// Typing in the question box and streaming debug-log lines used to trigger a full
-// read-modify-write of extension storage per keystroke and per log entry. Those paths
-// coalesce instead; the writes stay serialized so two merges cannot race.
-function persistPanelsSoon(): void {
+/** Typing and streaming diagnostics coalesce instead of writing per keystroke. */
+function persistPanelsSoon(panelId?: string): void {
   if (!hasRuntimeAccess()) {
     return;
+  }
+
+  if (panelId) {
+    markPanelDirty(panelId);
+  } else {
+    markAllPanelsDirty();
   }
 
   if (persistTimer !== undefined) {
@@ -402,103 +501,129 @@ function persistPanelsSoon(): void {
 }
 
 async function flushPersistedPanels(): Promise<void> {
+  markAllPanelsDirty();
   cancelPendingPersist();
   await queuePersistWrite();
 }
 
-async function loadLastUsedBranchKind(): Promise<void> {
+/** True when the deletion was recorded, so the panel will stay closed. */
+async function deletePanelRecord(panelId: string): Promise<boolean> {
+  const response = await sendStoreMessage<PanelWriteResponse>({
+    type: 'PANEL_DELETE',
+    panelId,
+    baseRev: panelRevisions.get(panelId) ?? 0
+  });
+
+  // No tombstone means no deletion: the record is still in storage, and the next
+  // reload — or any other tab, right now — will bring this panel back. Closing it
+  // in the DOM here would only hide that until it reappeared.
+  if (!response?.ok) {
+    return false;
+  }
+
+  panelRevisions.delete(panelId);
+  unsavedPanelIds.delete(panelId);
+  dirtyPanelIds.delete(panelId);
+  lastWrittenSignatures.delete(panelId);
+  return true;
+}
+
+async function listPanelRecords(): Promise<PanelListedRecord[]> {
+  const response = await sendStoreMessage<PanelListResponse>({ type: 'PANEL_LIST' });
+  if (!response?.ok) {
+    return [];
+  }
+  if (response.sessionUnavailable) {
+  }
+  if (response.buildId) {
+    workerBuildId = response.buildId;
+    if (response.buildId !== BUILD_ID) {
+      reportStaleClient(null, 'service worker', response.buildId);
+    }
+  }
+  return response.records;
+}
+
+/**
+ * One-time migration from the previous whole-bucket format.
+ *
+ * Records are written through the authority first; the legacy keys are only
+ * removed once every panel has been confirmed stored, so an interrupted or
+ * repeated migration leaves the original data intact.
+ */
+async function migrateLegacyPanelStorage(): Promise<void> {
   if (!hasRuntimeAccess()) {
-    lastUsedBranchKind = 'persistent';
     return;
   }
 
   try {
-    const stored = (await chrome.storage.local.get(LAST_BRANCH_KIND_STORAGE_KEY)) as Record<string, unknown>;
-    lastUsedBranchKind =
-      stored[LAST_BRANCH_KIND_STORAGE_KEY] === 'temporary' ? 'temporary' : 'persistent';
+    const stored = (await chrome.storage.local.get(null)) as Record<string, unknown>;
+    const legacyKeys = Object.keys(stored).filter(
+      (key) => isPanelStorageKey(key) || key.startsWith(LEGACY_PANEL_STORAGE_PREFIX)
+    );
+
+    if (!legacyKeys.length) {
+      return;
+    }
+
+    const migrated: string[] = [];
+    let allConfirmed = true;
+
+    for (const key of legacyKeys) {
+      const panels = Array.isArray(stored[key]) ? (stored[key] as BranchPanelState[]) : [];
+      for (const panel of panels) {
+        if (!panel?.panelId) {
+          continue;
+        }
+
+        const response = await sendStoreMessage<PanelWriteResponse>({
+          type: 'PANEL_UPSERT',
+          panelId: panel.panelId,
+          scopeKey: panel.rootConversationId || currentIdentity(panel.rootChatUrl).scopeKey,
+          area: storageAreaForPanel(panel),
+          baseRev: 0,
+          state: panel
+        });
+
+        // 'rejected-deleted' and 'conflict' both mean the authority already knows
+        // better than this legacy row, so they count as successfully handled.
+        const settled =
+          response?.status === 'applied' ||
+          response?.status === 'conflict' ||
+          response?.status === 'rejected-deleted' ||
+          response?.status === 'noop';
+        if (!settled) {
+          allConfirmed = false;
+        }
+      }
+      migrated.push(key);
+    }
+
+    if (allConfirmed && migrated.length) {
+      await chrome.storage.local.remove(migrated);
+      console.info('[Aside] Migrated legacy panel storage', { buckets: migrated.length });
+    } else if (!allConfirmed) {
+      console.warn('[Aside] Legacy panel storage was kept because migration was incomplete');
+    }
+
+    const legacyKindKey = LEGACY_LAST_BRANCH_KIND_STORAGE_KEY;
+    if (legacyKindKey in stored && !(branchKindStorageKey() in stored)) {
+      await chrome.storage.local.set({ [branchKindStorageKey()]: stored[legacyKindKey] });
+    }
   } catch (error) {
     if (!isInvalidatedError(error)) {
-      throw error;
+      console.warn('[Aside] Legacy panel migration failed; existing data was left alone', error);
     }
-    lastUsedBranchKind = 'persistent';
   }
 }
 
-function persistLastUsedBranchKind(kind: BranchKind): void {
-  lastUsedBranchKind = kind;
-  if (!hasRuntimeAccess()) {
-    return;
-  }
-
-  void chrome.storage.local
-    .set({ [LAST_BRANCH_KIND_STORAGE_KEY]: kind })
-    .catch((error) => {
-      if (!isInvalidatedError(error)) {
-        console.warn('[Aside] Failed to persist branch kind', error);
-      }
-    });
-}
-
-async function createNativeBranchWindow(options: {
-  panelId: string;
-  prompt: string;
-  launchUrl: string;
-  branchKind: BranchKind;
-  focusWindow?: boolean;
-  arrangeSideBySide?: boolean;
-}): Promise<CreateBranchWindowResponse> {
-  if (!hasRuntimeAccess()) {
-    return {
-      ok: false,
-      reason: 'Chrome extension runtime is unavailable.'
-    };
-  }
-
-  try {
-    return (await chrome.runtime.sendMessage({
-      type: 'CREATE_BRANCH_WINDOW',
-      panelId: options.panelId,
-      prompt: options.prompt,
-      launchUrl: options.launchUrl,
-      branchKind: options.branchKind,
-      focusWindow: options.focusWindow,
-      arrangeSideBySide: options.arrangeSideBySide
-    })) as CreateBranchWindowResponse;
-  } catch (error) {
-    return {
-      ok: false,
-      reason: error instanceof Error ? error.message : String(error)
-    };
-  }
-}
-
-async function focusNativeBranchWindow(options: {
-  panelId: string;
-  launchTabId?: number;
-  launchWindowId?: number;
-  branchChatUrl?: string;
-}): Promise<FocusBranchWindowResponse> {
-  if (!hasRuntimeAccess()) {
-    return {
-      ok: false,
-      reason: 'Chrome extension runtime is unavailable.'
-    };
-  }
-
-  try {
-    return (await chrome.runtime.sendMessage({
-      type: 'FOCUS_BRANCH_WINDOW',
-      panelId: options.panelId,
-      launchTabId: options.launchTabId,
-      launchWindowId: options.launchWindowId,
-      branchChatUrl: options.branchChatUrl
-    })) as FocusBranchWindowResponse;
-  } catch (error) {
-    return {
-      ok: false,
-      reason: error instanceof Error ? error.message : String(error)
-    };
-  }
+/**
+ * Mode preference is per provider: "Temporary Chat" on ChatGPT and "Incognito" on
+ * Claude are different features with different guarantees, and a choice made on one
+ * must not silently become the default on the other.
+ */
+function branchKindStorageKey(): string {
+  return `${LAST_BRANCH_KIND_STORAGE_KEY}:${provider.id}`;
 }
 
 function detectChatGptTheme(): ThemeMode {
@@ -574,13 +699,7 @@ function installThemeObserver(): void {
 }
 
 function ensureStyles(): void {
-  if (document.getElementById(ROOT_STYLE_ID)) {
-    return;
-  }
-
-  const style = document.createElement('style');
-  style.id = ROOT_STYLE_ID;
-  style.textContent = `
+  const css = `
     html[data-aside-theme="light"] {
       --sb-color-scheme: light;
       --sb-text: #111827;
@@ -684,12 +803,37 @@ function ensureStyles(): void {
       transform: translateY(-1px);
     }
 
-    .aside-selection-suppressed {
-      display: none !important;
-      visibility: hidden !important;
-      pointer-events: none !important;
+    .aside-toolbar-brand {
+      display: inline-flex;
+      align-items: center;
+      padding-right: 2px;
+      font: 600 11px/1 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      opacity: 0.62;
+      user-select: none;
     }
 
+    .aside-privacy-note {
+      font-size: 11px;
+      line-height: 1.45;
+      color: var(--sb-muted, #6b7280);
+      margin: 6px 0 0;
+    }
+    .aside-privacy-note summary {
+      cursor: pointer;
+    }
+    .aside-privacy-warning {
+      margin: 6px 0 0;
+      color: var(--sb-text, #111827);
+      font-weight: 600;
+    }
+    .aside-privacy-note ul {
+      margin: 6px 0 0;
+      padding-left: 16px;
+      display: grid;
+      gap: 4px;
+    }
     .aside-kind-toggle {
       display: inline-flex;
       align-items: center;
@@ -718,8 +862,6 @@ function ensureStyles(): void {
     #${PANEL_TABBAR_ID} {
       --sb-tab-width: 96px;
       position: fixed;
-      top: 96px;
-      bottom: 20px;
       z-index: 2147483645;
       display: flex;
       flex-direction: column;
@@ -734,8 +876,33 @@ function ensureStyles(): void {
       scrollbar-width: none;
     }
 
-    #${PANEL_TABBAR_ID}[data-placement="edge"] {
-      right: 8px;
+    /* Geometry comes from findLeftGutterSlot; these are only the fallbacks used
+       before the first measurement. */
+    #${PANEL_TABBAR_ID}[data-placement="left-gutter"] {
+      top: 96px;
+      bottom: 20px;
+      left: 12px;
+    }
+
+    #${ASIDE_LAUNCHER_ID} {
+      position: fixed;
+      z-index: 2147483645;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--sb-border-strong, rgba(15, 23, 42, 0.14));
+      background: var(--sb-chip-bg, rgba(255, 255, 255, 0.98));
+      color: var(--sb-text, #111827);
+      font: 500 12px/1.2 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      cursor: pointer;
+      pointer-events: auto;
+      box-shadow: 0 6px 18px rgba(15, 23, 42, 0.12);
+    }
+
+    #${ASIDE_LAUNCHER_ID}[hidden] {
+      display: none;
     }
 
     #${PANEL_TABBAR_ID}[hidden] {
@@ -855,14 +1022,14 @@ function ensureStyles(): void {
       align-items: flex-start;
       justify-content: space-between;
       gap: 12px;
-      padding: 18px 18px 14px;
+      padding: 12px 16px 10px;
       border-bottom: 1px solid var(--sb-border, rgba(15, 23, 42, 0.08));
       background: var(--sb-panel-header-bg, rgba(249, 250, 251, 0.95));
     }
 
     .aside-panel-heading h2 {
       margin: 0;
-      font: 700 18px/1.18 ui-sans-serif, system-ui, sans-serif;
+      font: 700 16px/1.2 ui-sans-serif, system-ui, sans-serif;
       color: var(--sb-text, #111827);
     }
 
@@ -881,9 +1048,80 @@ function ensureStyles(): void {
     .aside-panel-actions {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       flex-wrap: wrap;
       justify-content: flex-end;
+    }
+
+    /* Diagnostics live behind one disclosure so a failed panel is not a wall of buttons. */
+    .aside-panel-more {
+      position: relative;
+    }
+    .aside-panel-more summary {
+      list-style: none;
+      cursor: pointer;
+      border-radius: 999px;
+      padding: 9px 12px;
+      font: 600 13px/1 ui-sans-serif, system-ui, sans-serif;
+      border: 1px solid var(--sb-border, rgba(15, 23, 42, 0.08));
+      background: var(--sb-surface-bg, rgba(248, 250, 252, 0.96));
+      color: var(--sb-text, #111827);
+      user-select: none;
+    }
+    .aside-panel-more summary::-webkit-details-marker {
+      display: none;
+    }
+    .aside-panel-more-menu {
+      position: absolute;
+      right: 0;
+      top: calc(100% + 6px);
+      z-index: 2;
+      display: grid;
+      gap: 6px;
+      min-width: 170px;
+      padding: 8px;
+      border-radius: 12px;
+      border: 1px solid var(--sb-border, rgba(15, 23, 42, 0.08));
+      background: var(--sb-panel-bg, rgba(255, 255, 255, 0.98));
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.14);
+    }
+    .aside-panel-more-menu button {
+      width: 100%;
+      text-align: left;
+    }
+
+    /* Recovery for a private mode that could not be verified: near the question, short. */
+    .aside-recovery {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px 18px 0;
+    }
+    .aside-recovery[hidden],
+    .aside-recovery-confirm[hidden] {
+      display: none !important;
+    }
+    .aside-recovery p {
+      margin: 0;
+      font: 500 13px/1.45 ui-sans-serif, system-ui, sans-serif;
+      color: var(--sb-muted, #6b7280);
+    }
+    .aside-recovery-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .aside-recovery-confirm {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px;
+      border-radius: 12px;
+      border: 1px solid var(--sb-border, rgba(15, 23, 42, 0.08));
+      background: var(--sb-surface-bg, rgba(248, 250, 252, 0.96));
+    }
+    .aside-recovery-confirm p {
+      color: var(--sb-text, #111827);
     }
 
     .aside-panel-actions button,
@@ -934,10 +1172,20 @@ function ensureStyles(): void {
       margin: 0;
       color: var(--sb-text, #111827);
       font: 500 14px/1.45 ui-sans-serif, system-ui, sans-serif;
+      /* Structured text: equation source and code keep their line breaks. */
+      white-space: pre-wrap;
+      word-break: break-word;
       display: -webkit-box;
       -webkit-box-orient: vertical;
       -webkit-line-clamp: 5;
       overflow: hidden;
+      cursor: pointer;
+    }
+    .aside-focus p[data-expanded="true"] {
+      display: block;
+      -webkit-line-clamp: unset;
+      max-height: 40vh;
+      overflow: auto;
     }
 
     .aside-launcher {
@@ -1050,6 +1298,185 @@ function ensureStyles(): void {
       white-space: pre-wrap;
     }
 
+    .aside-notice {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      max-width: 360px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: var(--sb-panel-bg, rgba(255, 255, 255, 0.98));
+      color: var(--sb-text, #111827);
+      border: 1px solid var(--sb-border-strong, rgba(15, 23, 42, 0.14));
+      box-shadow: 0 12px 32px rgba(15, 23, 42, 0.22);
+      font-size: 12px;
+      z-index: 2147483647;
+    }
+    .aside-archive {
+      margin: 8px 0 4px;
+      padding: 8px 10px;
+      border: 1px solid var(--sb-border, rgba(15, 23, 42, 0.1));
+      border-radius: 12px;
+      background: var(--sb-subtle-bg, rgba(15, 23, 42, 0.03));
+      font-size: 12px;
+      display: grid;
+      gap: 6px;
+      max-height: 40vh;
+      overflow: auto;
+    }
+    .aside-archive-status {
+      color: var(--sb-muted, #6b7280);
+    }
+    .aside-archive-message {
+      white-space: pre-wrap;
+      word-break: break-word;
+      padding: 6px 8px;
+      border-left: 3px solid var(--sb-border-strong, rgba(15, 23, 42, 0.14));
+    }
+    .aside-archive-message[data-role="user"] {
+      border-left-color: var(--sb-text, #111827);
+    }
+    .aside-archive-message[data-partial="true"]::after {
+      content: ' (partial)';
+      color: var(--sb-muted, #6b7280);
+    }
+    .aside-qlist-panel {
+      padding: 12px 14px;
+      display: grid;
+      gap: 8px;
+      font-size: 12px;
+    }
+    .aside-qlist-header {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .aside-qlist-filters {
+      display: inline-flex;
+      gap: 4px;
+    }
+    .aside-qlist-filters button,
+    .aside-qlist-actions button,
+    .aside-qlist-footer button {
+      font: inherit;
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--sb-border, rgba(15, 23, 42, 0.1));
+      background: var(--sb-surface-bg, rgba(248, 250, 252, 0.96));
+      color: var(--sb-text, #111827);
+      cursor: pointer;
+    }
+    .aside-qlist-filters button[data-selected="true"] {
+      background: var(--sb-text, #111827);
+      color: var(--sb-primary-text, #ffffff);
+    }
+    .aside-qlist-row {
+      display: grid;
+      gap: 4px;
+      padding: 8px 10px;
+      border: 1px solid var(--sb-border, rgba(15, 23, 42, 0.1));
+      border-radius: 10px;
+      background: var(--sb-subtle-bg, rgba(15, 23, 42, 0.03));
+    }
+    .aside-qlist-open {
+      font: inherit;
+      font-weight: 600;
+      text-align: left;
+      background: none;
+      border: 0;
+      padding: 0;
+      color: var(--sb-text, #111827);
+      cursor: pointer;
+    }
+    .aside-qlist-meta {
+      color: var(--sb-muted, #6b7280);
+    }
+    .aside-qlist-actions,
+    .aside-qlist-footer {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .aside-qlist-empty {
+      color: var(--sb-muted, #6b7280);
+      margin: 0;
+    }
+    .aside-tab-questions button[data-selected="true"] {
+      background: var(--sb-text, #111827);
+      color: var(--sb-primary-text, #ffffff);
+    }
+    .aside-context {
+      margin: 8px 0 4px;
+      padding: 8px 10px;
+      border: 1px solid var(--sb-border, rgba(15, 23, 42, 0.1));
+      border-radius: 12px;
+      background: var(--sb-subtle-bg, rgba(15, 23, 42, 0.03));
+      font-size: 12px;
+    }
+
+    .aside-context > summary {
+      cursor: pointer;
+      font-weight: 600;
+      user-select: none;
+    }
+
+    .aside-context-source {
+      margin: 6px 0 4px;
+      opacity: 0.7;
+    }
+
+    .aside-context-block {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      margin: 4px 0;
+      line-height: 1.4;
+    }
+
+    .aside-context-limitation {
+      display: block;
+      width: 100%;
+      opacity: 0.7;
+    }
+
+    .aside-context-background {
+      display: block;
+      margin: 8px 0 4px;
+    }
+
+    .aside-context-background textarea {
+      width: 100%;
+      margin-top: 4px;
+      box-sizing: border-box;
+      font: inherit;
+    }
+
+    .aside-context-size[data-over-budget="true"] {
+      color: var(--sb-danger, #b91c1c);
+      font-weight: 600;
+    }
+
+    .aside-context-preview-label {
+      margin: 8px 0 4px;
+      opacity: 0.7;
+    }
+
+    .aside-context-preview {
+      max-height: 180px;
+      overflow: auto;
+      margin: 0;
+      padding: 8px;
+      border-radius: 8px;
+      background: var(--sb-code-bg, rgba(15, 23, 42, 0.06));
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 11px;
+      line-height: 1.45;
+    }
+
     .aside-debug-log {
       display: flex;
       flex-direction: column;
@@ -1095,10 +1522,12 @@ function ensureStyles(): void {
       flex-wrap: wrap;
     }
 
-    .aside-origin-flash {
+    .aside-origin-outline {
+      position: absolute;
+      pointer-events: none;
+      border-radius: 10px;
       outline: 3px solid rgba(16, 185, 129, 0.6);
       outline-offset: 6px;
-      transition: outline-color 180ms ease;
     }
 
     #${HIGHLIGHT_OVERLAY_ID} {
@@ -1114,37 +1543,25 @@ function ensureStyles(): void {
       background: rgba(16, 185, 129, 0.18);
       box-shadow: 0 0 0 2px rgba(5, 150, 105, 0.22);
     }
+  ${HANDOFF_CARD_CSS}
   `;
-  document.head.append(style);
-}
 
-function ensureFrameAutomationStyles(): void {
-  if (document.getElementById(FRAME_AUTOMATION_STYLE_ID)) {
+  const existing = document.getElementById(ROOT_STYLE_ID);
+  if (existing instanceof HTMLStyleElement && existing.textContent === css) {
     return;
   }
 
-  const style = document.createElement('style');
-  style.id = FRAME_AUTOMATION_STYLE_ID;
-  style.textContent = `
-    article[data-message-author-role] [class*="opacity-0"],
-    article[data-message-author-role] [class*="invisible"],
-    article[data-message-author-role] [class*="pointer-events-none"],
-    main [data-testid^="conversation-turn-"] [class*="opacity-0"],
-    main [data-testid^="conversation-turn-"] [class*="invisible"],
-    main [data-testid^="conversation-turn-"] [class*="pointer-events-none"] {
-      opacity: 1 !important;
-      visibility: visible !important;
-      pointer-events: auto !important;
-    }
+  // A stylesheet left behind by a previous build of the extension, which an
+  // in-place update does not remove: without this, the new content script finds
+  // the old id, returns early, and runs against the old build's CSS for the life
+  // of the tab.
+  existing?.remove();
 
-    article[data-message-author-role] button,
-    article[data-message-author-role] [role="button"],
-    main [data-testid^="conversation-turn-"] button,
-    main [data-testid^="conversation-turn-"] [role="button"] {
-      pointer-events: auto !important;
-    }
-  `;
+  const style = document.createElement('style');
+  style.id = ROOT_STYLE_ID;
+  style.textContent = css;
   document.head.append(style);
+  cleanupFns.push(() => style.remove());
 }
 
 function ensureExtensionHost(): HTMLDivElement {
@@ -1176,21 +1593,33 @@ function ensureSelectionToolbar(): HTMLDivElement {
     selectionToolbar = document.createElement('div');
     selectionToolbar.id = SELECTION_TOOLBAR_ID;
     selectionToolbar.hidden = true;
+    // The toolbar is Aside's, and says so: it sits next to the provider's own
+    // selection actions rather than replacing them.
+    selectionToolbar.setAttribute('role', 'toolbar');
+    selectionToolbar.setAttribute('aria-label', 'Aside branch actions');
+
+    const brand = document.createElement('span');
+    brand.className = 'aside-toolbar-brand';
+    brand.textContent = 'Aside';
+    brand.setAttribute('aria-hidden', 'true');
 
     askButton = document.createElement('button');
     askButton.id = ASK_BUTTON_ID;
     askButton.type = 'button';
     askButton.textContent = 'Ask';
+    askButton.setAttribute('aria-label', 'Prepare a temporary handoff about the selected passage');
 
     whyButton = document.createElement('button');
     whyButton.id = WHY_BUTTON_ID;
     whyButton.type = 'button';
     whyButton.textContent = 'Why';
+    whyButton.setAttribute('aria-label', 'Prepare a temporary handoff asking why the selected passage holds');
 
     newTabButton = document.createElement('button');
     newTabButton.id = NEW_TAB_BUTTON_ID;
     newTabButton.type = 'button';
     newTabButton.textContent = 'New-tab';
+    newTabButton.setAttribute('aria-label', 'Prepare a temporary handoff that opens in a new tab');
 
     askButton.addEventListener('click', (event) => {
       event.preventDefault();
@@ -1208,35 +1637,38 @@ function ensureSelectionToolbar(): HTMLDivElement {
       openDraftFromCurrentSelection('new_tab');
     });
 
-    selectionToolbar.append(askButton, whyButton, newTabButton);
+    selectionToolbar.append(brand, askButton, whyButton, newTabButton);
   }
 
   return mountInExtensionHost(selectionToolbar);
+}
+
+/**
+ * True while the toolbar is hidden because nothing fitted — not because there is
+ * no selection.
+ *
+ * `hidden` alone cannot tell those apart, and every re-entry path was gated on it,
+ * so a collapse was a one-way latch: the obstruction is usually the provider's own
+ * selection popup, which disappears on the very next click, and Aside stayed
+ * collapsed anyway until the user selected again.
+ */
+let selectionToolbarCollapsed = false;
+
+function selectionToolbarNeedsSync(): boolean {
+  if (!selectionToolbar) {
+    return false;
+  }
+  if (!selectionToolbar.hidden) {
+    return true;
+  }
+  return selectionToolbarCollapsed && Boolean(currentSelectionDraft);
 }
 
 function hideSelectionToolbar(): void {
   if (selectionToolbar) {
     selectionToolbar.hidden = true;
   }
-}
-
-// MutationObserver callbacks run at the microtask checkpoint, long after a synchronous
-// `muted = false` has been reached. Discarding the records we just caused is what
-// actually stops the observer from re-triggering itself in a loop.
-function discardSelfInflictedMutations(): void {
-  selectionActionObserver?.takeRecords();
-  selectionActionMutationMuted = false;
-}
-
-function restoreSuppressedSelectionActions(): void {
-  selectionActionMutationMuted = true;
-  suppressedSelectionActions.forEach((element) => {
-    if (element.isConnected) {
-      element.classList.remove('aside-selection-suppressed');
-    }
-  });
-  suppressedSelectionActions.clear();
-  discardSelfInflictedMutations();
+  selectionToolbarCollapsed = false;
 }
 
 function hideAskButton(clearSelection = true): void {
@@ -1244,9 +1676,10 @@ function hideAskButton(clearSelection = true): void {
     currentSelectionDraft = null;
     currentSelectionPayload = null;
     currentSelectionRect = null;
+    // What was in the way of the last selection says nothing about the next one.
+    dodgedProviderNodes = [];
   }
   hideSelectionToolbar();
-  restoreSuppressedSelectionActions();
 }
 
 function getSelectionDraftFromWindow(): SelectionDraft | null {
@@ -1276,10 +1709,6 @@ function materializeSelectionPayload(
   }
 }
 
-function getBranchKindForNewDraft(): BranchKind {
-  return lastUsedBranchKind;
-}
-
 function openDraftFromCurrentSelection(entryAction: BranchEntryAction): void {
   const draft = currentSelectionDraft ?? getSelectionDraftFromWindow();
   const payload = currentSelectionPayload ?? materializeSelectionPayload(draft);
@@ -1289,37 +1718,372 @@ function openDraftFromCurrentSelection(entryAction: BranchEntryAction): void {
   }
   currentSelectionPayload = payload;
 
-  const branchKind = getBranchKindForNewDraft();
-  if (entryAction === 'new_tab') {
-    void openSelectionInNewTab(payload, branchKind);
-  } else if (entryAction === 'why') {
-    createBranchDraft(payload, {
-      entryAction,
-      branchKind,
-      initialQuestion: 'Why?',
-      autoStart: true
-    });
-  } else {
-    createBranchDraft(payload, {
-      entryAction,
-      branchKind
-    });
-  }
-  window.getSelection()?.removeAllRanges();
-  hideAskButton();
+  // Ask, Why and New-tab share one path: a scratch handoff that is temporary-
+  // intended and session-only whatever mode an earlier branch used. Nothing is
+  // copied, opened or saved until the Owner clicks in the card.
+  void openHandoff(entryAction, payload);
+  // Deliberately does NOT clear the selection: the provider's native selection
+  // options must remain usable after Aside has been invoked.
+  hideAskButton(false);
 }
 
-function positionSelectionToolbar(rect: DOMRect): void {
+function toRect(domRect: DOMRect | { top: number; left: number; width: number; height: number }): Rect {
+  return { top: domRect.top, left: domRect.left, width: domRect.width, height: domRect.height };
+}
+
+/**
+ * Measure — never modify — the provider rectangles Aside must stay clear of.
+ *
+ * Elements are read with getBoundingClientRect only. Nothing here changes styles,
+ * attributes, event handlers or hit targets on provider DOM.
+ */
+function collectReservedRegions(includeSelectionToolbar = true): Rect[] {
+  const selectors = provider.layout.reservedRegionSelectors.map((entry) => entry.selector);
+  if (includeSelectionToolbar) {
+    selectors.push(...provider.layout.nativeSelectionToolbarSelectors);
+  }
+
+  const seen = new Set<Element>();
+  const rects: Rect[] = [];
+
+  selectors.forEach((selector) => {
+    let matches: HTMLElement[];
+    try {
+      matches = Array.from(document.querySelectorAll<HTMLElement>(selector));
+    } catch {
+      return;
+    }
+
+    matches.forEach((element) => {
+      if (seen.has(element) || isAsideOwned(element)) {
+        return;
+      }
+      seen.add(element);
+
+      const rect = element.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        rects.push(toRect(rect));
+      }
+    });
+  });
+
+  return rects;
+}
+
+/** True for nodes inside Aside's own host, so shared logic never mistakes them for provider UI. */
+function isAsideOwned(node: Node | null): boolean {
+  if (!node) {
+    return false;
+  }
+  const element = node instanceof Element ? node : node.parentElement;
+  return Boolean(element?.closest(`#${EXTENSION_HOST_ID}`));
+}
+
+/**
+ * The largest share of the viewport an occluding element may take and still be
+ * treated as something to dodge. A full-page overlay or a scroll container is not
+ * a popup, and reserving one would collapse Aside on every page.
+ */
+const MAX_OCCLUDER_VIEWPORT_FRACTION = 0.6;
+
+/**
+ * The floating container an occluding node belongs to.
+ *
+ * A hit test lands on whatever leaf is painted at that point — a label, an icon,
+ * a text node's span. Reserving that leaf would leave Aside overlapping the rest
+ * of the popup around it.
+ */
+function nearestPositionedAncestor(element: Element): HTMLElement | null {
+  let current: HTMLElement | null =
+    element instanceof HTMLElement ? element : element.parentElement;
+
+  while (current && current !== document.body && current !== document.documentElement) {
+    const position = window.getComputedStyle(current).position;
+    if (position === 'fixed' || position === 'absolute' || position === 'sticky') {
+      return current;
+    }
+    current = current.parentElement;
+  }
+
+  return element instanceof HTMLElement ? element : null;
+}
+
+/**
+ * What is actually painted on top of Aside's own controls.
+ *
+ * Selectors are a guess about a provider's markup; paint order is a fact about
+ * the page. Aside's toolbar overlapped ChatGPT's real selection popup because
+ * none of the three selectors written for it matched — and no wider guess would
+ * have been safer, because a selector that over-matches reserves a band the size
+ * of the reading column and collapses Aside for no reason.
+ *
+ * So: place first, then ask the page whether anything is covering us, and reserve
+ * only what genuinely is. This needs no provider knowledge and survives a
+ * redesign.
+ */
+/**
+ * Things a provider renders that a user is meant to be able to click.
+ *
+ * The harm being detected is "a provider control is unreachable because Aside is
+ * on top of it", so a control is exactly the right granularity to reserve: never
+ * a wrapper, which could be the size of the reading column.
+ */
+const CONFLICT_CONTROL_SELECTOR =
+  'button, [role="button"], [role="menuitem"], [role="option"], [role="tab"], a[href], input, select, textarea';
+
+/** Points across an element's own rect. A centre-only probe misses a partial cover. */
+function gridProbePoints(box: DOMRect, columns = 7, rows = 3): Array<[number, number]> {
+  const points: Array<[number, number]> = [];
+  for (let column = 0; column < columns; column += 1) {
+    for (let row = 0; row < rows; row += 1) {
+      const x = box.left + (box.width * (column + 0.5)) / columns;
+      const y = box.top + (box.height * (row + 0.5)) / rows;
+      if (x >= 0 && y >= 0 && x <= window.innerWidth && y <= window.innerHeight) {
+        points.push([x, y]);
+      }
+    }
+  }
+  return points;
+}
+
+/**
+ * The provider control Aside is sitting on top of at this point, if any.
+ *
+ * The stack at a point inside Aside reads [aside button, aside toolbar, aside host,
+ * ...page..., main, body, html]. Skipping Aside's own entries and looking for a
+ * control answers "am I covering something clickable" without knowing anything
+ * about the provider's markup. Ordinary page content — the message being read,
+ * the scroll container, body — contains no control at that point and yields
+ * nothing, so a normal selection produces no conflict at all.
+ */
+function coveredControlAt(stack: Element[]): HTMLElement | null {
+  let index = 0;
+  while (index < stack.length && isAsideOwned(stack[index])) {
+    index += 1;
+  }
+
+  // Nothing of Aside's was on top here, so this point belongs to the
+  // over-direction branch instead.
+  if (index === 0) {
+    return null;
+  }
+
+  for (let cursor = index; cursor < stack.length; cursor += 1) {
+    const element = stack[cursor];
+    if (isAsideOwned(element)) {
+      continue;
+    }
+    if (element === document.body || element === document.documentElement) {
+      break;
+    }
+    const control = element.closest<HTMLElement>(CONFLICT_CONTROL_SELECTOR);
+    if (control && !isAsideOwned(control)) {
+      return control;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Everything Aside is in visual conflict with, in both directions.
+ *
+ * The first version of this only looked upwards — "is something painted over
+ * me?" — which is the rarer case. `#aside-root` is fixed at z-index 2147483643
+ * and creates a stacking context, so against any realistic provider z-index it is
+ * Aside that ends up on top. On claude.ai that silenced the probe completely: it
+ * found Aside's own button topmost at every point, concluded all was well, and
+ * left Aside sitting over Claude's selection popup.
+ *
+ * Paint order answers both questions from the same hit test.
+ */
+function findLayoutConflicts(element: HTMLElement): HTMLElement[] {
+  if (typeof document.elementsFromPoint !== 'function') {
+    return [];
+  }
+
+  const box = element.getBoundingClientRect();
+  if (box.width <= 0 || box.height <= 0) {
+    return [];
+  }
+
+  const viewportArea = Math.max(window.innerWidth * window.innerHeight, 1);
+  const seen = new Set<Element>();
+  const found: HTMLElement[] = [];
+
+  gridProbePoints(box).forEach(([x, y]) => {
+    const stack = document.elementsFromPoint(x, y);
+    if (!stack.length) {
+      return;
+    }
+
+    let candidate: HTMLElement | null;
+    if (!isAsideOwned(stack[0])) {
+      // Something is painted over Aside. Reserve the floating container it
+      // belongs to, not the leaf that happened to be hit.
+      candidate = nearestPositionedAncestor(stack[0]) ?? (stack[0] as HTMLElement);
+      const rect = candidate.getBoundingClientRect();
+      // A full-page overlay or a scroll container is not a popup, and dodging one
+      // is impossible by definition.
+      if (rect.width * rect.height > viewportArea * MAX_OCCLUDER_VIEWPORT_FRACTION) {
+        return;
+      }
+    } else {
+      candidate = coveredControlAt(stack);
+    }
+
+    if (!candidate || seen.has(candidate) || isAsideOwned(candidate)) {
+      return;
+    }
+
+    const rect = candidate.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return;
+    }
+
+    seen.add(candidate);
+    found.push(candidate);
+  });
+
+  return found;
+}
+
+/**
+ * Provider nodes this selection has already been moved out of the way of.
+ *
+ * Elements, not rectangles, and remembered rather than recomputed per placement.
+ * Every re-entry path — scroll, resize, the layout observer — rebuilds `reserved`
+ * from `collectReservedRegions()`, which is selector-driven and by definition
+ * cannot see these (that is why the probe exists). Without a memory the toolbar is
+ * put straight back where it was just moved from, the probe moves it again, and
+ * the two take turns forever. Elements also re-measure themselves correctly after
+ * a scroll and report their own removal, which a stored rectangle cannot.
+ */
+let dodgedProviderNodes: HTMLElement[] = [];
+
+const MAX_REMEMBERED_CONFLICTS = 8;
+
+function liveRectsFor(nodes: HTMLElement[]): { rects: Rect[]; live: HTMLElement[] } {
+  const rects: Rect[] = [];
+  const live: HTMLElement[] = [];
+
+  nodes.forEach((node) => {
+    // A popup that closed stops being reserved. `isConnected` plus a non-zero box
+    // is the cheap liveness test; this runs on every scroll frame, so it
+    // deliberately avoids getComputedStyle.
+    if (!node.isConnected) {
+      return;
+    }
+    const box = node.getBoundingClientRect();
+    if (box.width <= 0 || box.height <= 0) {
+      return;
+    }
+    live.push(node);
+    rects.push(toRect(box));
+  });
+
+  return { rects, live };
+}
+
+function liveDodgedRects(): Rect[] {
+  const { rects, live } = liveRectsFor(dodgedProviderNodes);
+  dodgedProviderNodes = live;
+  return rects;
+}
+
+function rememberConflicts(into: HTMLElement[], found: HTMLElement[]): HTMLElement[] {
+  const merged = [...into];
+  found.forEach((node) => {
+    if (!merged.includes(node)) {
+      merged.push(node);
+    }
+  });
+  return merged.slice(-MAX_REMEMBERED_CONFLICTS);
+}
+
+let occlusionRecheckFrame: number | undefined;
+
+/**
+ * One re-place, on the frame after painting, if anything covered us.
+ *
+ * Exactly one: if the provider repositions its own popup in response to ours,
+ * a second pass would chase it around the screen.
+ */
+function scheduleOcclusionRecheck(anchor: DOMRect): void {
+  if (occlusionRecheckFrame !== undefined) {
+    return;
+  }
+
+  occlusionRecheckFrame = window.requestAnimationFrame(() => {
+    occlusionRecheckFrame = undefined;
+    if (!selectionToolbar || selectionToolbar.hidden) {
+      return;
+    }
+
+    const found = findLayoutConflicts(selectionToolbar);
+    if (!found.length) {
+      return;
+    }
+
+    dodgedProviderNodes = rememberConflicts(dodgedProviderNodes, found);
+    positionSelectionToolbar(anchor, true);
+  });
+}
+
+function positionSelectionToolbar(rect: DOMRect, isRetry = false): void {
   const toolbar = ensureSelectionToolbar();
   currentSelectionRect = rect;
+
+  // Make it measurable before deciding where it goes: guessing a width is how the
+  // toolbar used to end up on top of the provider's own selection menu.
   toolbar.hidden = false;
-  const estimatedWidth = 236;
-  const left = Math.max(
-    16,
-    Math.min(window.innerWidth - estimatedWidth - 16, rect.left + rect.width / 2 - estimatedWidth / 2)
-  );
-  toolbar.style.top = `${Math.max(16, rect.top - 56)}px`;
-  toolbar.style.left = `${left}px`;
+  toolbar.style.visibility = 'hidden';
+  const measured = toolbar.getBoundingClientRect();
+  const size = {
+    width: measured.width || 236,
+    height: measured.height || 40
+  };
+
+  const placement = findSafePlacement({
+    anchor: toRect(rect),
+    size,
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+    // Remembered conflicts are seeded on EVERY placement, not just the retry:
+    // otherwise the next scroll or provider mutation re-derives the position from
+    // selectors alone and undoes the dodge.
+    reserved: [...collectReservedRegions(), ...liveDodgedRects()],
+    // Both providers put their own selection popup above the selection. That is a
+    // convention this repo cannot verify, not a fact — so 'above' stays reachable
+    // and the detector still runs there; preferring 'below' just means the common
+    // case does not need detecting at all.
+    order: ['below', 'right', 'left', 'above']
+  });
+
+  if (!placement) {
+    // No safe spot around the selection. Rather than covering a native control or
+    // winning with z-index, collapse to the compact launcher in the left rail.
+    toolbar.hidden = true;
+    toolbar.style.visibility = '';
+    selectionToolbarCollapsed = true;
+    setCompactLauncherVisible(true);
+    return;
+  }
+
+  selectionToolbarCollapsed = false;
+  setCompactLauncherVisible(false);
+  toolbar.style.top = `${placement.top}px`;
+  toolbar.style.left = `${placement.left}px`;
+  toolbar.dataset.side = placement.side;
+  // Restore visibility BEFORE the hit test: elementsFromPoint skips a
+  // visibility:hidden element, so a recheck run inline with the measurement above
+  // would always report Aside itself on top and never see the occluder.
+  toolbar.style.visibility = '';
+
+  // Only the first pass re-checks; the retry must not schedule another, or a
+  // provider that repositions its popup in response would be chased forever.
+  if (!isRetry) {
+    scheduleOcclusionRecheck(rect);
+  }
 }
 
 // The toolbar is positioned with viewport coordinates, so it has to be re-anchored
@@ -1343,7 +2107,7 @@ function getLiveSelectionRect(): DOMRect | null {
 // The scroll listener is capturing, so it sees every scrollable element on the page.
 // Coalesce to one measurement per frame: getClientRects() forces layout.
 function scheduleSelectionToolbarSync(): void {
-  if (!selectionToolbar || selectionToolbar.hidden || toolbarSyncFrame !== undefined) {
+  if (!selectionToolbarNeedsSync() || toolbarSyncFrame !== undefined) {
     return;
   }
 
@@ -1354,73 +2118,18 @@ function scheduleSelectionToolbarSync(): void {
 }
 
 function syncSelectionToolbarToViewport(): void {
-  if (!selectionToolbar || selectionToolbar.hidden) {
+  if (!selectionToolbarNeedsSync()) {
     return;
   }
 
   const rect = getLiveSelectionRect();
   if (!rect || rect.bottom <= 0 || rect.top >= window.innerHeight) {
     hideSelectionToolbar();
-    restoreSuppressedSelectionActions();
     return;
   }
 
   currentSelectionRect = rect;
   positionSelectionToolbar(rect);
-}
-
-function isElementVisible(element: HTMLElement): boolean {
-  const rect = element.getBoundingClientRect();
-  const style = window.getComputedStyle(element);
-  return (
-    rect.width > 0 &&
-    rect.height > 0 &&
-    style.display !== 'none' &&
-    style.visibility !== 'hidden' &&
-    Number(style.opacity || '1') > 0.01
-  );
-}
-
-function isSelectionActionNearRect(element: HTMLElement, rect: DOMRect): boolean {
-  const elementRect = element.getBoundingClientRect();
-  const horizontalGap =
-    elementRect.left > rect.right
-      ? elementRect.left - rect.right
-      : rect.left > elementRect.right
-        ? rect.left - elementRect.right
-        : 0;
-  const verticalGap =
-    elementRect.top > rect.bottom
-      ? elementRect.top - rect.bottom
-      : rect.top > elementRect.bottom
-        ? rect.top - elementRect.bottom
-        : 0;
-
-  return horizontalGap <= 220 && verticalGap <= 140;
-}
-
-function syncAskTriggerVisibility(): void {
-  if (!currentSelectionDraft || !currentSelectionRect) {
-    hideAskButton();
-    return;
-  }
-
-  refreshSelectionActionButtons();
-  positionSelectionToolbar(currentSelectionRect);
-}
-
-function scheduleAskTriggerSync(delayMs = ASK_TRIGGER_SYNC_DELAY_MS): void {
-  window.clearTimeout(askTriggerTimer);
-  askTriggerTimer = window.setTimeout(() => {
-    syncAskTriggerVisibility();
-  }, delayMs);
-}
-
-function scheduleSelectionActionRefresh(delayMs = ASK_TRIGGER_SYNC_DELAY_MS): void {
-  window.clearTimeout(selectionActionRefreshTimer);
-  selectionActionRefreshTimer = window.setTimeout(() => {
-    refreshSelectionActionButtons();
-  }, delayMs);
 }
 
 function evaluateSelection(): void {
@@ -1462,8 +2171,6 @@ function evaluateSelection(): void {
     currentSelectionPayload = null;
     currentSelectionRect = draft.selectionRect;
     positionSelectionToolbar(draft.selectionRect);
-    scheduleSelectionActionRefresh(0);
-    scheduleAskTriggerSync();
   } catch {
     hideAskButton();
   } finally {
@@ -1471,112 +2178,316 @@ function evaluateSelection(): void {
   }
 }
 
-function normalizeButtonLabel(element: Element): string {
-  if (!(element instanceof HTMLElement)) {
-    return '';
-  }
-
-  return compactWhitespace(
-    element.getAttribute('aria-label') || element.innerText || element.textContent || ''
-  ).toLowerCase();
+/**
+ * Aside used to hide the provider's own selection actions to make room for itself.
+ * That behaviour is gone. This only removes the class an older build may still have
+ * left on a provider button, so an upgrade does not leave a native control hidden.
+ * It touches nothing else and runs once per document.
+ */
+function undoLegacySelectionSuppression(): void {
+  document
+    .querySelectorAll<HTMLElement>('.aside-selection-suppressed')
+    .forEach((element) => element.classList.remove('aside-selection-suppressed'));
 }
 
-function isLikelySelectionActionButton(element: Element): boolean {
-  const label = normalizeButtonLabel(element);
-  if (!label) {
-    return false;
-  }
-
-  return SELECTION_ACTION_PATTERNS.some((pattern) => pattern.test(label));
-}
-
-function containsLikelySelectionAction(element: Element): boolean {
-  if (isLikelySelectionActionButton(element)) {
-    return true;
-  }
-
-  return Array.from(element.querySelectorAll('button, [role="button"]')).some((candidate) =>
-    isLikelySelectionActionButton(candidate)
-  );
-}
-
-function refreshSelectionActionButtons(_root: ParentNode = document): void {
-  const candidates = Array.from(document.querySelectorAll<HTMLElement>('button, [role="button"]')).filter(
-    (element, index, elements) => {
-      return elements.indexOf(element) === index && isLikelySelectionActionButton(element);
-    }
-  );
-
-  restoreSuppressedSelectionActions();
-
-  const selectionRect = currentSelectionRect;
-  if (!currentSelectionDraft || !selectionRect) {
-    return;
-  }
-
-  const suppressAllWhileToolbarVisible = Boolean(selectionToolbar && !selectionToolbar.hidden);
-
-  selectionActionMutationMuted = true;
-  candidates.forEach((button) => {
-    if (
-      isElementVisible(button) &&
-      (suppressAllWhileToolbarVisible || isSelectionActionNearRect(button, selectionRect))
-    ) {
-      button.classList.add('aside-selection-suppressed');
-      suppressedSelectionActions.add(button);
-    }
-  });
-  discardSelfInflictedMutations();
-}
-
-function installSelectionActionObserver(): void {
-  selectionActionObserver?.disconnect();
-  selectionActionObserver = new MutationObserver((mutations) => {
-    if (selectionActionMutationMuted || !selectionToolbar || selectionToolbar.hidden || !currentSelectionDraft) {
-      return;
-    }
-
-    const shouldRefresh = mutations.some((mutation) => {
-      if (
-        mutation.target instanceof Element &&
-        mutation.target.closest(`#${SELECTION_TOOLBAR_ID}, .${PANEL_CLASS}, #${PANEL_TABBAR_ID}`)
-      ) {
+/**
+ * Watch for provider layout changes so Aside can re-measure and move itself.
+ *
+ * Deliberately observes only what affects geometry, never mutates what it sees, and
+ * ignores mutations inside Aside's own host so it cannot retrigger itself.
+ */
+function installNativeLayoutObserver(): void {
+  nativeLayoutObserver?.disconnect();
+  nativeLayoutObserver = new MutationObserver((mutations) => {
+    const relevant = mutations.some((mutation) => {
+      if (isAsideOwned(mutation.target)) {
         return false;
       }
-
-      if (mutation.type === 'attributes' && mutation.target instanceof Element) {
-        return isLikelySelectionActionButton(mutation.target);
-      }
-
-      return Array.from(mutation.addedNodes).some((node) => {
-        if (!(node instanceof Element)) {
-          return false;
-        }
-        if (node.closest(`#${SELECTION_TOOLBAR_ID}, .${PANEL_CLASS}, #${PANEL_TABBAR_ID}`)) {
-          return false;
-        }
-        return containsLikelySelectionAction(node);
-      });
+      return (
+        mutation.type === 'attributes' ||
+        mutation.addedNodes.length > 0 ||
+        mutation.removedNodes.length > 0
+      );
     });
 
-    if (shouldRefresh) {
-      scheduleSelectionActionRefresh(0);
+    if (relevant) {
+      scheduleLayoutSync();
     }
   });
 
-  selectionActionObserver.observe(document.body, {
+  nativeLayoutObserver.observe(document.body, {
     attributes: true,
-    attributeFilter: ['class', 'style', 'hidden', 'aria-hidden'],
+    attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'data-state'],
     childList: true,
     subtree: true
   });
 
   cleanupFns.push(() => {
-    selectionActionObserver?.disconnect();
-    selectionActionObserver = null;
-    window.clearTimeout(askTriggerTimer);
-    window.clearTimeout(selectionActionRefreshTimer);
+    nativeLayoutObserver?.disconnect();
+    nativeLayoutObserver = null;
+    if (layoutSyncFrame !== undefined) {
+      window.cancelAnimationFrame(layoutSyncFrame);
+      layoutSyncFrame = undefined;
+    }
+    if (occlusionRecheckFrame !== undefined) {
+      window.cancelAnimationFrame(occlusionRecheckFrame);
+      occlusionRecheckFrame = undefined;
+    }
+    if (railConflictFrame !== undefined) {
+      window.cancelAnimationFrame(railConflictFrame);
+      railConflictFrame = undefined;
+    }
   });
+}
+
+/** One measurement per frame, however many mutations arrive. */
+function scheduleLayoutSync(): void {
+  if (layoutSyncFrame !== undefined) {
+    return;
+  }
+
+  layoutSyncFrame = window.requestAnimationFrame(() => {
+    layoutSyncFrame = undefined;
+    positionTabBar();
+    syncSelectionToolbarToViewport();
+  });
+}
+
+function ensureCompactLauncher(): HTMLButtonElement {
+  if (!asideLauncher) {
+    document.getElementById(ASIDE_LAUNCHER_ID)?.remove();
+    asideLauncher = document.createElement('button');
+    asideLauncher.id = ASIDE_LAUNCHER_ID;
+    asideLauncher.type = 'button';
+    asideLauncher.hidden = true;
+    asideLauncher.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (currentSelectionDraft && currentSelectionRect) {
+        openDraftFromCurrentSelection('ask');
+        return;
+      }
+      const hiddenCard = [...handoffCards.values()].find((card) => card.hidden && !card.ended);
+      if (hiddenCard) {
+        showHandoffCard(hiddenCard);
+        return;
+      }
+      const firstMinimized = sortPanels().find((runtime) => runtime.state.minimized);
+      if (firstMinimized) {
+        expandPanel(firstMinimized.state.panelId);
+      }
+    });
+  }
+
+  return mountInExtensionHost(asideLauncher);
+}
+
+/**
+ * The compact entry used when there is no safe room for the full toolbar or rail.
+ * It is placed in verified free space; it never covers an interactive native control.
+ */
+function setCompactLauncherVisible(visible: boolean): void {
+  const launcher = ensureCompactLauncher();
+  if (!visible) {
+    launcher.hidden = true;
+    return;
+  }
+
+  const minimizedCount =
+    sortPanels().filter((runtime) => runtime.state.minimized).length +
+    [...handoffCards.values()].filter((card) => card.hidden && !card.ended).length;
+  launcher.textContent = minimizedCount ? `Aside (${minimizedCount})` : 'Aside';
+  launcher.setAttribute(
+    'aria-label',
+    minimizedCount ? `Aside: ${minimizedCount} minimized branches` : 'Aside branch actions'
+  );
+  launcher.hidden = false;
+
+  const size = launcher.getBoundingClientRect();
+  const slot = findLeftGutterSlot({
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+    readingColumn: readingColumnRect(),
+    // Including the selection toolbar's obstruction: the launcher is often shown
+    // *because* of it, so it must not be placed on top of it.
+    reserved: collectReservedRegions(true),
+    size: { width: Math.max(size.width, 72), height: Math.max(size.height, 28) },
+    minWidth: 64
+  });
+
+  if (slot) {
+    launcher.style.left = `${slot.left}px`;
+    launcher.style.top = `${slot.top}px`;
+    return;
+  }
+
+  // No gutter. Try the corners, still refusing to overlap anything the provider
+  // owns; if none is free, hide the on-page entry rather than dropping it on top
+  // of native chrome. The extension action remains the guaranteed way in.
+  const corner = findFreeCorner({
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+    size: { width: Math.max(size.width, 72), height: Math.max(size.height, 28) },
+    reserved: collectReservedRegions(true)
+  });
+
+  if (!corner) {
+    launcher.hidden = true;
+    return;
+  }
+
+  launcher.style.left = `${corner.left}px`;
+  launcher.style.top = `${corner.top}px`;
+}
+
+function readingColumnRect(): Rect | null {
+  const rect = provider.layout.getReadingColumnRect(document);
+  return rect && rect.width > 0 ? toRect(rect) : null;
+}
+
+/**
+ * Put the minimized rail in free LEFT-side whitespace.
+ *
+ * The provider's left navigation is a reserved rectangle, so the rail starts to the
+ * right of whatever chrome is present and shrinks to the space actually available.
+ * When the gutter is too tight to be readable the rail is replaced by the compact
+ * launcher rather than being forced back to the right edge over native controls.
+ */
+/**
+ * Provider nodes the rail has been moved out of the way of.
+ *
+ * Kept separately from the selection toolbar's: the rail is persistent UI in the
+ * gutter, the toolbar is transient and sits next to the text. What obstructs one
+ * says nothing about the other.
+ */
+let dodgedRailNodes: HTMLElement[] = [];
+
+let railConflictFrame: number | undefined;
+
+/**
+ * Is this point in the gutter genuinely empty?
+ *
+ * Stricter than the selection toolbar's test, and deliberately so. The toolbar is
+ * meant to sit beside the text, so only a covered *control* is a problem. The rail
+ * is meant to sit in whitespace outside the reading column, so anything the
+ * provider rendered there — a conversation title, a label, a heading, not just a
+ * control — means this is not whitespace.
+ *
+ * Free means: nothing but the document, or a layout wrapper the conversation
+ * itself lives inside. A sibling subtree is provider chrome.
+ */
+function railPointIsFree(element: Element, conversationContainer: HTMLElement | null): boolean {
+  if (element === document.body || element === document.documentElement) {
+    return true;
+  }
+  if (!conversationContainer) {
+    // With no conversation container to reason about, fall back to the weaker
+    // test rather than refusing every slot.
+    return !element.closest(CONFLICT_CONTROL_SELECTOR);
+  }
+  return element === conversationContainer || element.contains(conversationContainer);
+}
+
+function findRailConflicts(rail: HTMLElement): HTMLElement[] {
+  if (typeof document.elementsFromPoint !== 'function') {
+    return [];
+  }
+
+  const box = rail.getBoundingClientRect();
+  if (box.width <= 0 || box.height <= 0) {
+    return [];
+  }
+
+  const conversationContainer = provider.layout.getConversationScrollContainer(document);
+  const viewportArea = Math.max(window.innerWidth * window.innerHeight, 1);
+  const seen = new Set<Element>();
+  const found: HTMLElement[] = [];
+
+  gridProbePoints(box, 2, 5).forEach(([x, y]) => {
+    const stack = document.elementsFromPoint(x, y);
+    const beneath = stack.find((element) => !isAsideOwned(element));
+    if (!beneath || railPointIsFree(beneath, conversationContainer)) {
+      return;
+    }
+
+    const candidate = nearestPositionedAncestor(beneath) ?? (beneath as HTMLElement);
+    if (seen.has(candidate) || isAsideOwned(candidate)) {
+      return;
+    }
+
+    const rect = candidate.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return;
+    }
+    if (rect.width * rect.height > viewportArea * MAX_OCCLUDER_VIEWPORT_FRACTION) {
+      return;
+    }
+
+    seen.add(candidate);
+    found.push(candidate);
+  });
+
+  return found;
+}
+
+function scheduleRailConflictRecheck(): void {
+  if (railConflictFrame !== undefined) {
+    return;
+  }
+
+  railConflictFrame = window.requestAnimationFrame(() => {
+    railConflictFrame = undefined;
+    if (!tabBar || tabBar.hidden) {
+      return;
+    }
+
+    const found = findRailConflicts(tabBar);
+    if (!found.length) {
+      return;
+    }
+
+    dodgedRailNodes = rememberConflicts(dodgedRailNodes, found);
+    positionTabBar(true);
+  });
+}
+
+function positionTabBar(isRetry = false): void {
+  if (!tabBar || tabBar.hidden) {
+    return;
+  }
+
+  const minimizedCount =
+    sortPanels().filter((runtime) => runtime.state.minimized).length +
+    [...handoffCards.values()].filter((card) => card.hidden && !card.ended).length;
+  const { rects: railDodged, live } = liveRectsFor(dodgedRailNodes);
+  dodgedRailNodes = live;
+
+  const slot = findLeftGutterSlot({
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+    readingColumn: readingColumnRect(),
+    // Claude's left chrome matches none of the adapter's sidebar selectors on the
+    // live site, so without the measured conflicts the gutter calculation treats
+    // the whole left side as free whitespace and drops the rail onto it.
+    reserved: [...collectReservedRegions(false), ...railDodged],
+    size: { width: RAIL_WIDTH_PX, height: window.innerHeight }
+  });
+
+  if (!slot) {
+    tabBar.hidden = true;
+    tabBar.dataset.placement = 'compact';
+    setCompactLauncherVisible(minimizedCount > 0);
+    return;
+  }
+
+  setCompactLauncherVisible(false);
+  tabBar.dataset.placement = 'left-gutter';
+  tabBar.style.left = `${slot.left}px`;
+  tabBar.style.top = `${slot.top}px`;
+  tabBar.style.height = `${slot.height}px`;
+  tabBar.style.bottom = 'auto';
+  tabBar.style.setProperty('--sb-tab-width', `${slot.width}px`);
+
+  if (!isRetry) {
+    scheduleRailConflictRecheck();
+  }
 }
 
 function ensureTabBar(): HTMLDivElement {
@@ -1610,158 +2521,65 @@ function minimizeOtherPanels(exceptPanelId: string): void {
 }
 
 function getNonRootContainerUrl(url: string): string | undefined {
-  const containerUrl = getChatContainerBaseUrl(url);
+  return currentIdentity(url).containerUrl ?? undefined;
+}
 
-  try {
-    return new URL(containerUrl).pathname === '/' ? undefined : containerUrl;
-  } catch {
-    return undefined;
+/**
+ * The legacy branch context shape, kept so a record opened from the question
+ * database still has the fields older code paths read.
+ */
+function createContextForSelection(selection: SelectionPayload): BranchContext {
+  const blocks: ContextBlock[] = selection.selectedBlocks
+    .filter((block) => block.role === 'assistant')
+    .map((block) => ({
+      id: block.messageId,
+      role: block.role,
+      text: block.structuredText || block.text,
+      excerpt: block.excerpt,
+      included: true,
+      origin: 'touched' as const,
+      limitation: block.structuredText ? undefined : 'structure could not be read; whitespace was normalized'
+    }));
+
+  if (selection.precedingQuestion) {
+    const question = selection.precedingQuestion;
+    blocks.push({
+      id: question.messageId,
+      role: question.role,
+      text: question.structuredText || question.text,
+      excerpt: question.excerpt,
+      included: false,
+      origin: 'preceding-question'
+    });
   }
-}
 
-interface CreateDraftOptions {
-  entryAction: BranchEntryAction;
-  branchKind: BranchKind;
-  initialQuestion?: string;
-  autoStart?: boolean;
-  hostChatUrl?: string;
-}
-
-function createDraftState(selection: SelectionPayload, options: CreateDraftOptions): BranchPanelState {
-  const hostChatUrl = normalizeChatUrl(options.hostChatUrl ?? selection.rootChatUrl);
-  return {
-    panelId: randomId('panel'),
-    rootConversationId: getRootConversationId(hostChatUrl),
-    rootChatUrl: hostChatUrl,
-    rootProjectUrl: getNonRootContainerUrl(hostChatUrl),
-    selection,
-    focusPreview: clipText(selection.selectedText, 280),
-    branchKind: options.branchKind,
-    entryAction: options.entryAction,
-    surfaceMode: 'embedded',
-    launchUrl: undefined,
-    creationMode: 'pending',
-    title: DEFAULT_BRANCH_TITLE,
-    titleStatus: 'pending',
-    minimized: false,
-    status: 'draft',
-    statusLabel: 'Ask a focused follow-up about this selected passage.',
-    initialQuestion: options.initialQuestion,
-    debugLog: [
-      formatDebugLogEntry('Branch draft created', {
-        rootChatUrl: selection.rootChatUrl,
-        rootConversationId: selection.rootConversationId,
-        selectedTextLength: selection.selectedText.length,
-        branchKind: options.branchKind,
-        entryAction: options.entryAction,
-        selectedBlocks: selection.selectedBlocks.map((block) => ({
-          role: block.role,
-          turnIndex: block.turnIndex,
-          messageId: block.messageId
-        })),
-        branchBaseMessageId: selection.branchBaseMessageId
-      })
-    ],
-    createdAt: Date.now(),
-    updatedAt: Date.now()
-  };
-}
-
-function focusDraftQuestionInput(runtime: PanelRuntime): void {
-  if (!runtime.questionInput.isConnected) {
-    return;
-  }
-  if (runtime.state.status !== 'draft' && runtime.state.status !== 'failed') {
-    return;
-  }
-  runtime.questionInput.click();
-  runtime.questionInput.focus({ preventScroll: true });
-  runtime.questionInput.setSelectionRange(
-    runtime.questionInput.value.length,
-    runtime.questionInput.value.length
-  );
-}
-
-function scheduleDraftQuestionFocus(runtime: PanelRuntime): void {
-  const deadline = Date.now() + 4_000;
-  const focusUntilSettled = () => {
-    if (!panelRuntimes.has(runtime.state.panelId)) {
-      return;
-    }
-
-    if (runtime.state.status !== 'draft' && runtime.state.status !== 'failed') {
-      return;
-    }
-
-    focusDraftQuestionInput(runtime);
-    if (document.activeElement === runtime.questionInput || Date.now() >= deadline) {
-      return;
-    }
-
-    window.requestAnimationFrame(focusUntilSettled);
-  };
-
-  window.requestAnimationFrame(focusUntilSettled);
-  window.requestAnimationFrame(() => {
-    focusDraftQuestionInput(runtime);
-  });
-  [0, 50, 150, 350, 750, 1500, 3000].forEach((delayMs) => {
-    window.setTimeout(() => {
-      focusDraftQuestionInput(runtime);
-    }, delayMs);
+  const identity = currentIdentity(selection.rootChatUrl);
+  return createContext({
+    providerId: provider.id,
+    selectedPassage: selection.structuredSelectedText || selection.selectedText,
+    anchorText: selection.selectedText,
+    sourceLabel: identity.conversationId
+      ? `${provider.label} · conversation ${identity.conversationId}`
+      : `${provider.label} · this page`,
+    blocks
   });
 }
 
-function focusPendingDraftQuestionInput(): void {
-  if (!pendingDraftFocusPanelId) {
-    return;
-  }
-
-  const runtime = panelRuntimes.get(pendingDraftFocusPanelId);
-  if (!runtime || runtime.state.status !== 'draft') {
-    pendingDraftFocusPanelId = null;
-    return;
-  }
-
-  focusDraftQuestionInput(runtime);
-  if (document.activeElement === runtime.questionInput) {
-    pendingDraftFocusPanelId = null;
-  }
-}
-
-function createBranchDraft(selection: SelectionPayload, options: CreateDraftOptions): PanelRuntime {
-  const state = createDraftState(selection, options);
-  minimizeOtherPanels(state.panelId);
-  const runtime = createPanelRuntime(state);
-  if (state.entryAction === 'new_tab' && state.status === 'draft') {
-    pendingDraftFocusPanelId = state.panelId;
-    focusDraftQuestionInput(runtime);
-    scheduleDraftQuestionFocus(runtime);
-  }
-  renderTabs();
-  persistPanels();
-
-  if (options.initialQuestion) {
-    runtime.questionInput.value = options.initialQuestion;
-    runtime.state.initialQuestion = options.initialQuestion;
-    syncPanelUI(runtime);
-  }
-
-  if (options.autoStart && options.initialQuestion?.trim()) {
-    void startBranch(state.panelId, options.initialQuestion.trim());
-  }
-
-  return runtime;
-}
-
+/**
+ * A saved record from an earlier version of Aside, shown read-only.
+ *
+ * Nothing here sends, loads a provider frame or opens a window on its own. The
+ * two ways forward are explicit: open the saved provider conversation as plain
+ * navigation, or ask about the same passage as a new temporary handoff — which
+ * leaves this record untouched.
+ */
 function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   const element = document.createElement('div');
-  element.className = PANEL_CLASS;
+  element.className = `${PANEL_CLASS} aside-legacy-panel`;
   element.dataset.panelId = state.panelId;
 
   const header = document.createElement('div');
   header.className = 'aside-panel-header';
-
   const headingWrap = document.createElement('div');
   headingWrap.className = 'aside-panel-heading';
   const titleEl = document.createElement('h2');
@@ -1777,75 +2595,78 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   jumpButton.textContent = 'Jump to origin';
   const openTabHeaderButton = document.createElement('button');
   openTabHeaderButton.type = 'button';
-  openTabHeaderButton.textContent = 'Open branch';
+  openTabHeaderButton.textContent = 'Open conversation';
+  openTabHeaderButton.dataset.asideRole = 'legacy-open-conversation';
+  openTabHeaderButton.title = `Open the saved ${provider.label} conversation in a new tab. Nothing is sent.`;
+  const moreDetails = document.createElement('details');
+  moreDetails.className = 'aside-panel-more';
+  const moreSummary = document.createElement('summary');
+  moreSummary.textContent = 'More';
+  const moreMenu = document.createElement('div');
+  moreMenu.className = 'aside-panel-more-menu';
   const copyLogButton = document.createElement('button');
   copyLogButton.type = 'button';
   copyLogButton.textContent = 'Copy log';
-  copyLogButton.title = 'Copy a diagnostic report with the selected text, sent prompt, URLs, and automation steps.';
+  copyLogButton.title =
+    'Copy a redacted diagnostic report: URLs, status and steps, without your selected text or prompt.';
+  const copyLogWithContentButton = document.createElement('button');
+  copyLogWithContentButton.type = 'button';
+  copyLogWithContentButton.textContent = 'Copy log + text';
+  copyLogWithContentButton.title = 'Copy the diagnostic report including your selected text and the prompt.';
+  const selectLogMenuButton = document.createElement('button');
+  selectLogMenuButton.type = 'button';
+  selectLogMenuButton.textContent = 'Select log';
+  moreMenu.append(copyLogButton, copyLogWithContentButton, selectLogMenuButton);
+  moreDetails.append(moreSummary, moreMenu);
   const minimizeButton = document.createElement('button');
   minimizeButton.type = 'button';
   minimizeButton.textContent = 'Minimize';
   const closeButton = document.createElement('button');
   closeButton.type = 'button';
   closeButton.textContent = 'Close';
-  actions.append(jumpButton, openTabHeaderButton, copyLogButton, minimizeButton, closeButton);
+  actions.append(jumpButton, openTabHeaderButton, minimizeButton, moreDetails, closeButton);
   header.append(headingWrap, actions);
 
   const body = document.createElement('div');
   body.className = 'aside-panel-body';
 
+  const legacyNote = document.createElement('p');
+  legacyNote.className = 'aside-legacy-note';
+  legacyNote.textContent = 'Saved record from an earlier version of Aside. Read-only: nothing here is sent automatically.';
+
   const focus = document.createElement('div');
   focus.className = 'aside-focus';
   const focusLabel = document.createElement('small');
-  focusLabel.textContent = 'Selected local focus';
+  focusLabel.textContent = 'Selected passage';
   const focusTextEl = document.createElement('p');
+  focusTextEl.title = 'Click to expand or collapse the selected passage';
+  focusTextEl.addEventListener('click', () => {
+    focusTextEl.dataset.expanded = focusTextEl.dataset.expanded === 'true' ? 'false' : 'true';
+  });
   focus.append(focusLabel, focusTextEl);
 
-  const formEl = document.createElement('form');
-  formEl.className = 'aside-launcher';
-  const branchKindField = document.createElement('div');
-  branchKindField.className = 'aside-kind-toggle';
-  const persistentKindButton = document.createElement('button');
-  persistentKindButton.type = 'button';
-  persistentKindButton.textContent = 'Persistent';
-  const temporaryKindButton = document.createElement('button');
-  temporaryKindButton.type = 'button';
-  temporaryKindButton.textContent = 'Temporary';
-  const questionInput = document.createElement('textarea');
-  questionInput.placeholder = 'Ask a local question about this passage';
-  questionInput.autocomplete = 'off';
-  questionInput.autocapitalize = 'sentences';
-  questionInput.autofocus = state.entryAction === 'new_tab' && state.status === 'draft';
-  const launcherActions = document.createElement('div');
-  launcherActions.className = 'aside-launcher-actions';
-  const submitButton = document.createElement('button');
-  submitButton.type = 'submit';
-  submitButton.className = 'aside-panel-primary';
-  submitButton.textContent = 'Start branch';
-  branchKindField.append(persistentKindButton, temporaryKindButton);
-  launcherActions.append(submitButton);
-  formEl.append(branchKindField, questionInput, launcherActions);
+  const promptShell = document.createElement('details');
+  promptShell.className = 'aside-context';
+  const promptSummary = document.createElement('summary');
+  promptSummary.textContent = 'Prompt that was prepared for this branch';
+  const promptPre = document.createElement('pre');
+  promptPre.className = 'aside-context-preview';
+  promptShell.append(promptSummary, promptPre);
 
-  const iframeShell = document.createElement('div');
-  iframeShell.className = 'aside-frame-shell';
-  iframeShell.hidden = true;
-  const iframeEl = document.createElement('iframe');
-  iframeEl.className = 'aside-frame';
-  iframeEl.title = 'ChatGPT embedded branch';
-  iframeEl.setAttribute('loading', 'eager');
-  iframeEl.referrerPolicy = 'strict-origin-when-cross-origin';
-  iframeEl.src = 'about:blank';
-  const iframeOverlay = document.createElement('div');
-  iframeOverlay.className = 'aside-frame-overlay';
-  const iframeOverlayCard = document.createElement('div');
-  iframeOverlayCard.className = 'aside-frame-overlay-card';
-  const iframeOverlayTitle = document.createElement('p');
-  iframeOverlayTitle.className = 'aside-frame-overlay-title';
-  const iframeOverlayText = document.createElement('p');
-  iframeOverlayText.className = 'aside-frame-overlay-text';
-  iframeOverlayCard.append(iframeOverlayTitle, iframeOverlayText);
-  iframeOverlay.append(iframeOverlayCard);
-  iframeShell.append(iframeEl, iframeOverlay);
+  // Saved thread: what was read back from the branch conversation. Read-only
+  // evidence; opening it never opens a provider tab or sends anything.
+  const archiveEl = document.createElement('div');
+  archiveEl.className = 'aside-archive';
+  archiveEl.hidden = true;
+
+  const legacyActions = document.createElement('div');
+  legacyActions.className = 'aside-launcher-actions aside-legacy-actions';
+  const askAgainButton = document.createElement('button');
+  askAgainButton.type = 'button';
+  askAgainButton.className = 'aside-panel-primary';
+  askAgainButton.textContent = 'Ask about this passage (temporary handoff)';
+  askAgainButton.dataset.asideRole = 'legacy-ask-handoff';
+  legacyActions.append(askAgainButton);
 
   const debugLogShell = document.createElement('div');
   debugLogShell.className = 'aside-debug-log';
@@ -1853,9 +2674,9 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   const debugLogTitle = document.createElement('strong');
   debugLogTitle.textContent = 'Copyable debug log';
   const debugLogHelp = document.createElement('p');
-  debugLogHelp.textContent =
-    'Clipboard access was blocked, so select this log and paste it here. It may include selected text and the first prompt.';
+  debugLogHelp.textContent = 'Select this log and paste it where you need it.';
   const debugLogTextarea = document.createElement('textarea');
+  debugLogTextarea.dataset.asideRole = 'debug-log';
   debugLogTextarea.readOnly = true;
   debugLogTextarea.spellcheck = false;
   const debugLogActions = document.createElement('div');
@@ -1871,7 +2692,7 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   debugLogActions.append(selectDebugLogButton, closeDebugLogButton);
   debugLogShell.append(debugLogTitle, debugLogHelp, debugLogTextarea, debugLogActions);
 
-  body.append(focus, formEl, iframeShell, debugLogShell);
+  body.append(legacyNote, focus, promptShell, archiveEl, legacyActions, debugLogShell);
   element.append(header, body);
   mountInExtensionHost(element);
 
@@ -1882,35 +2703,33 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     statusEl,
     errorEl,
     focusTextEl,
-    formEl,
-    branchKindField,
-    persistentKindButton,
-    temporaryKindButton,
-    questionInput,
-    submitButton,
-    iframeShell,
-    iframeEl,
-    iframeOverlay,
-    iframeOverlayTitle,
-    iframeOverlayText,
+    promptShell,
+    promptPre,
+    archiveEl,
     debugLogShell,
     debugLogTextarea,
     copyLogButton,
     openTabHeaderButton,
-    frameReady: false,
-    frameStartSent: false
+    moreDetails
   };
-
-  questionInput.value = state.initialQuestion ?? '';
 
   jumpButton.addEventListener('click', () => {
     scrollToOrigin(runtime.state.selection);
   });
   openTabHeaderButton.addEventListener('click', () => {
-    void openBranchInNewTab(runtime.state.panelId);
+    void openSavedConversation(runtime.state.panelId);
   });
   copyLogButton.addEventListener('click', () => {
-    void copyBranchDebugLog(runtime.state.panelId);
+    moreDetails.open = false;
+    void copyBranchDebugLog(runtime.state.panelId, false);
+  });
+  copyLogWithContentButton.addEventListener('click', () => {
+    moreDetails.open = false;
+    void copyBranchDebugLog(runtime.state.panelId, true);
+  });
+  selectLogMenuButton.addEventListener('click', () => {
+    moreDetails.open = false;
+    showCopyableDebugLog(runtime, buildBranchDebugLogText(runtime, false));
   });
   selectDebugLogButton.addEventListener('click', () => {
     debugLogTextarea.focus();
@@ -1925,64 +2744,14 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   closeButton.addEventListener('click', () => {
     closePanel(runtime.state.panelId);
   });
-  iframeEl.addEventListener('load', () => {
-    appendPanelLog(runtime, 'Embedded branch frame load event', {
-      iframeSrc: iframeEl.src,
-      panelStatus: runtime.state.status
-    });
-    syncPanelUI(runtime);
-  });
-  formEl.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const question = questionInput.value.trim();
-    if (!question) {
-      return;
-    }
-    await startBranch(runtime.state.panelId, question);
-  });
-  persistentKindButton.addEventListener('click', () => {
-    runtime.state.branchKind = 'persistent';
-    runtime.state.updatedAt = Date.now();
-    persistLastUsedBranchKind('persistent');
-    syncPanelUI(runtime);
-    persistPanels();
-  });
-  temporaryKindButton.addEventListener('click', () => {
-    runtime.state.branchKind = 'temporary';
-    runtime.state.updatedAt = Date.now();
-    persistLastUsedBranchKind('temporary');
-    syncPanelUI(runtime);
-    persistPanels();
-  });
-  questionInput.addEventListener('input', () => {
-    runtime.state.initialQuestion = questionInput.value;
-    runtime.state.updatedAt = Date.now();
-    syncPanelUI(runtime);
-    persistPanelsSoon();
-  });
-  // Enter sends, Shift+Enter adds a line, matching the composer the user just came from.
-  // isComposing keeps IME candidate selection from submitting a half-typed question.
-  questionInput.addEventListener('keydown', (event) => {
-    if (event.key !== 'Enter' || event.shiftKey || event.isComposing) {
-      return;
-    }
-
-    event.preventDefault();
-    if (submitButton.disabled) {
-      return;
-    }
-
-    if (typeof formEl.requestSubmit === 'function') {
-      formEl.requestSubmit();
-      return;
-    }
-
-    formEl.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true }));
+  askAgainButton.addEventListener('click', () => {
+    // A new scratch session from the saved passage; the record is not changed.
+    minimizePanel(runtime.state.panelId);
+    void openHandoff('ask', runtime.state.selection, runtime.state.initialQuestion ?? '');
   });
 
   panelRuntimes.set(state.panelId, runtime);
   syncPanelUI(runtime);
-
   return runtime;
 }
 
@@ -2007,83 +2776,121 @@ function getDisplayTitle(state: BranchPanelState): string {
   return 'Naming branch...';
 }
 
-// A failed branch is the one state where the user most needs the form back, including a
-// branch that was promoted to a native window or that failed after a URL appeared.
-// Without this, "Close" was the only way out of a failure.
-function canShowForm(state: BranchPanelState): boolean {
-  return state.status === 'draft' || state.status === 'failed';
-}
-
-function canShowBranchKindToggle(state: BranchPanelState): boolean {
-  return canShowForm(state) && (state.entryAction === 'ask' || state.entryAction === 'new_tab');
-}
-
-function canShowFrame(state: BranchPanelState): boolean {
-  if (state.surfaceMode === 'native_window') {
-    return false;
+function captureLabelForState(state: BranchPanelState): string {
+  const archive = state.archive;
+  if (!archive || !archive.messages.length) {
+    return state.branchChatUrl ? 'Link only — nothing captured yet.' : '';
   }
-  return state.status !== 'draft' || Boolean(state.branchChatUrl) || Boolean(state.launchUrl);
+  const complete = archive.messages.filter((message) => !message.partial);
+  const last = complete.at(-1);
+  if (archive.capture === 'captured-through' && last) {
+    return `Captured through message ${last.ordinal + 1} of ${archive.messages.length}. Later changes at the provider are not guaranteed.`;
+  }
+  return `Partially captured: ${complete.length} complete of ${archive.messages.length} read.`;
+}
+
+/** The saved thread, read-only. */
+function renderArchiveSection(runtime: PanelRuntime): void {
+  const { state } = runtime;
+  const archive = state.archive;
+  const show = Boolean(archive && archive.messages.length) || Boolean(state.archiveOnly);
+  runtime.archiveEl.hidden = !show;
+  if (!show) {
+    return;
+  }
+  runtime.archiveEl.replaceChildren();
+  const heading = document.createElement('strong');
+  heading.textContent = state.archiveOnly ? 'Saved thread' : 'Saved so far';
+  runtime.archiveEl.append(heading);
+  const status = document.createElement('small');
+  status.className = 'aside-archive-status';
+  status.textContent = captureLabelForState(state);
+  runtime.archiveEl.append(status);
+  (archive?.messages ?? []).forEach((message) => {
+    const node = document.createElement('div');
+    node.className = 'aside-archive-message';
+    node.dataset.role = message.role;
+    node.dataset.partial = String(message.partial);
+    node.textContent = message.text;
+    runtime.archiveEl.append(node);
+  });
+  if (state.archiveOnly && !(archive?.messages.length)) {
+    const empty = document.createElement('p');
+    empty.textContent = state.branchChatUrl
+      ? 'No messages were captured for this question; only the provider conversation link was kept.'
+      : 'This question was never sent.';
+    runtime.archiveEl.append(empty);
+  }
+}
+
+/** One status line for a saved record, by what it is — never a live state. */
+function legacyStatusLine(state: BranchPanelState): string {
+  if (state.status === 'live' || state.branchChatUrl) {
+    return state.branchChatUrl
+      ? `Saved branch. Open its ${provider.label} conversation, or read what was saved below.`
+      : 'Saved branch.';
+  }
+  if (state.status === 'draft') {
+    return 'Unsent draft. Ask about it as a temporary handoff, or close it.';
+  }
+  return 'This branch was not completed.';
 }
 
 function syncPanelUI(runtime: PanelRuntime): void {
   const { state } = runtime;
-  const showForm = canShowForm(state);
-  const showFrame = canShowFrame(state);
-  const showOpenBranch = Boolean(
-    state.branchChatUrl || state.launchTabId || state.launchWindowId
-  );
-  const overlayVisible = state.status !== 'live';
-
   runtime.element.hidden = state.minimized;
   runtime.titleEl.textContent = getDisplayTitle(state);
-  runtime.statusEl.textContent = state.statusLabel;
+  const unsaved = unsavedPanelIds.has(state.panelId);
+  runtime.statusEl.textContent = unsaved
+    ? `${legacyStatusLine(state)} (not saved — this view is only in this tab)`
+    : legacyStatusLine(state);
+  runtime.element.dataset.unsaved = String(unsaved);
   runtime.errorEl.textContent = state.status === 'failed' ? state.errorMessage ?? '' : '';
   runtime.errorEl.style.display = runtime.errorEl.textContent ? 'block' : 'none';
   runtime.focusTextEl.textContent = state.focusPreview;
-
-  runtime.formEl.style.display = showForm ? 'flex' : 'none';
-  runtime.branchKindField.style.display = canShowBranchKindToggle(state) ? 'inline-flex' : 'none';
-  runtime.persistentKindButton.dataset.selected = String(state.branchKind === 'persistent');
-  runtime.temporaryKindButton.dataset.selected = String(state.branchKind === 'temporary');
-  runtime.questionInput.disabled = !showForm;
-  runtime.persistentKindButton.disabled = !showForm;
-  runtime.temporaryKindButton.disabled = !showForm;
-  runtime.submitButton.disabled =
-    !runtime.questionInput.value.trim() ||
-    state.status === 'creating_branch' ||
-    state.status === 'opening_branch';
-  runtime.submitButton.textContent = state.status === 'failed' ? 'Try again' : 'Start branch';
-  runtime.iframeShell.hidden = !showFrame;
-  runtime.iframeOverlay.hidden = !overlayVisible;
-  runtime.iframeOverlayTitle.textContent =
-    state.surfaceMode === 'native_window'
-      ? state.status === 'failed'
-        ? 'Native branch could not finish loading'
-        : state.status === 'live'
-          ? ''
-          : 'Branch continued in a native ChatGPT window'
-      : state.status === 'failed'
-      ? 'Branch could not finish loading'
-      : state.status === 'live'
-        ? ''
-        : 'Opening branch in this window';
-  runtime.iframeOverlayText.textContent =
-    state.status === 'failed'
-      ? state.errorMessage ?? state.statusLabel
-      : state.statusLabel;
-  runtime.openTabHeaderButton.style.display = showOpenBranch ? 'inline-flex' : 'none';
-  if (state.status === 'live') {
-    ensureLiveFrameLocation(runtime);
-  }
+  runtime.promptPre.textContent = state.initialPrompt ?? '';
+  runtime.promptShell.hidden = !state.initialPrompt;
+  renderArchiveSection(runtime);
+  runtime.openTabHeaderButton.style.display = state.branchChatUrl ? 'inline-flex' : 'none';
 }
 
 function renderTabs(): void {
   const container = ensureTabBar();
   container.innerHTML = '';
 
-  const minimized = sortPanels().filter((runtime) => runtime.state.minimized);
-  container.hidden = minimized.length === 0;
-  container.dataset.placement = 'edge';
+  const minimized = sortPanels().filter((runtime) => runtime.state.minimized && !runtime.state.closedView);
+  const questionCount = questionListCount();
+  const hiddenHandoffs = [...handoffCards.values()].filter((card) => card.hidden && !card.ended);
+  container.hidden = minimized.length === 0 && questionCount === 0 && hiddenHandoffs.length === 0;
+
+  if (questionCount > 0 || questionListEntries.length > 0) {
+    const listTab = document.createElement('div');
+    listTab.className = 'aside-tab aside-tab-questions';
+    const listButton = document.createElement('button');
+    listButton.type = 'button';
+    listButton.textContent = `Questions (${questionCount})`;
+    listButton.title = 'Questions asked from this page';
+    listButton.dataset.selected = String(questionListOpen);
+    listButton.addEventListener('click', () => toggleQuestionList());
+    listTab.append(listButton);
+    container.append(listTab);
+  }
+
+  // Scratch handoffs: session-only entries, never written to the panel store.
+  hiddenHandoffs.forEach((card) => {
+    const tab = document.createElement('div');
+    tab.className = 'aside-tab aside-tab-handoff';
+    tab.dataset.sessionId = card.sessionId;
+    const openButton = document.createElement('button');
+    openButton.type = 'button';
+    openButton.textContent = card.railLabel();
+    openButton.title = 'Temporary handoff (not saved in Aside)';
+    const badge = document.createElement('small');
+    badge.textContent = 'temporary';
+    openButton.addEventListener('click', () => showHandoffCard(card));
+    tab.append(openButton, badge);
+    container.append(tab);
+  });
 
   minimized.forEach((runtime) => {
     const tab = document.createElement('div');
@@ -2119,6 +2926,61 @@ function renderTabs(): void {
     tab.append(openButton, badge, closeButton);
     container.append(tab);
   });
+
+  positionTabBar();
+}
+
+/**
+ * The panel slot sits at the right of the viewport. Where the provider's
+ * composer (or a tool pane) is below it on the same side, the slot stops short
+ * of it instead of painting over a native control; the card's body scrolls.
+ */
+function fitSlotToFreeSpace(element: HTMLElement): void {
+  if (element.hidden) {
+    return;
+  }
+  element.style.maxHeight = '';
+  const card = element.getBoundingClientRect();
+  if (card.width <= 0 || card.height <= 0) {
+    return;
+  }
+  const blocking = provider.layout.reservedRegionSelectors
+    .filter((entry) => entry.kind === 'composer' || entry.kind === 'tool-panel')
+    .flatMap((entry) => {
+      try {
+        return Array.from(document.querySelectorAll<HTMLElement>(entry.selector));
+      } catch {
+        return [];
+      }
+    })
+    .filter((node) => !isAsideOwned(node))
+    .map((node) => node.getBoundingClientRect())
+    .filter(
+      (rect) =>
+        rect.width > 0 &&
+        rect.height > 0 &&
+        rect.left < card.right &&
+        rect.right > card.left &&
+        rect.top > card.top + 120 &&
+        rect.top < card.bottom
+    );
+  if (!blocking.length) {
+    return;
+  }
+  const limit = Math.floor(Math.min(...blocking.map((rect) => rect.top)) - card.top - 12);
+  if (limit < 160) {
+    // No room above the composer for a usable card: step aside to the rail
+    // rather than paint over the provider's control.
+    const handoffCard = [...handoffCards.values()].find((candidate) => candidate.element === element);
+    if (handoffCard) {
+      handoffCard.yieldSlot();
+      notifyAside('Not enough room to show the Aside card without covering the page. Make the window taller, then open it from the rail.');
+    } else {
+      element.style.maxHeight = `${Math.max(120, limit)}px`;
+    }
+    return;
+  }
+  element.style.maxHeight = `${limit}px`;
 }
 
 function syncMountedUi(): void {
@@ -2134,6 +2996,13 @@ function syncMountedUi(): void {
   sortPanels().forEach((runtime) => {
     mountInExtensionHost(runtime.element);
     syncPanelUI(runtime);
+    fitSlotToFreeSpace(runtime.element);
+  });
+  handoffCards.forEach((card) => {
+    if (!card.ended) {
+      mountInExtensionHost(card.element);
+      fitSlotToFreeSpace(card.element);
+    }
   });
 
   renderTabs();
@@ -2141,8 +3010,6 @@ function syncMountedUi(): void {
   if (highlightOverlay?.childElementCount) {
     mountInExtensionHost(highlightOverlay);
   }
-
-  focusPendingDraftQuestionInput();
 }
 
 function scheduleMountedUiSync(delayMs: number): void {
@@ -2156,6 +3023,7 @@ function createStateFromRestore(raw: BranchPanelState): BranchPanelState | null 
   if (!raw?.panelId || !raw.selection?.selectedText) {
     return null;
   }
+  legacyRawStates.set(raw.panelId, raw);
 
   const normalizedRootChatUrl = normalizeChatUrl(raw.rootChatUrl ?? raw.selection.rootChatUrl);
   const normalizedLaunchUrl = raw.launchUrl ? normalizeChatUrl(raw.launchUrl) : undefined;
@@ -2213,7 +3081,20 @@ function createStateFromRestore(raw: BranchPanelState): BranchPanelState | null 
     rootChatUrl: normalizedRootChatUrl,
     rootProjectUrl: raw.rootProjectUrl ?? getNonRootContainerUrl(normalizedRootChatUrl),
     selection: raw.selection,
-    focusPreview: raw.focusPreview || clipText(raw.selection.selectedText, 280),
+    // The context is a persisted field: without it the Context section is hidden
+    // after a reload and the prompt is silently rebuilt from defaults, putting
+    // back every block the user unticked.
+    context: sanitizeStoredContext(raw.context),
+    questionId: typeof raw.questionId === 'string' ? raw.questionId : undefined,
+    linkId: typeof raw.linkId === 'string' ? raw.linkId : undefined,
+    snapshotId: typeof raw.snapshotId === 'string' ? raw.snapshotId : undefined,
+    preferredSurface: raw.preferredSurface === 'native_window' ? 'native_window' : undefined,
+    excludedPlanIds: Array.isArray(raw.excludedPlanIds) ? raw.excludedPlanIds.filter((id) => typeof id === 'string') : undefined,
+    closedView: raw.closedView === true,
+    archiveOnly: raw.archiveOnly === true,
+    archive: sanitizeArchive(raw.archive),
+    focusPreview:
+      raw.focusPreview || clipText(raw.selection.structuredSelectedText || raw.selection.selectedText, 400),
     branchKind,
     entryAction,
     surfaceMode,
@@ -2244,44 +3125,45 @@ function createStateFromRestore(raw: BranchPanelState): BranchPanelState | null 
 
 async function restorePanels(): Promise<void> {
   const urlAtStart = lastKnownUrl;
-  const currentStorageKey = getConversationStorageKey(urlAtStart);
-  const restored = await readAllPersistedPanelBuckets();
+  const currentScopeKey = currentIdentity(urlAtStart).scopeKey;
+  const records = await listPanelRecords();
   if (urlAtStart !== lastKnownUrl) {
     return;
   }
 
-  restored
-    .flatMap(({ key, panels }) =>
-      panels
-        // Another tab can write a panel back after this page closed it; do not bring it
-        // back into a page the user already dismissed it from.
-        .filter((raw) => !closedPanelIds.has(raw?.panelId))
-        .filter((raw) => key === currentStorageKey || Boolean(raw?.minimized))
-        .map((raw) => {
-          const restoredState = createStateFromRestore(raw);
-          if (!restoredState) {
-            return null;
-          }
+  records
+    // Another tab can write a panel back after this page closed it; do not bring it
+    // back into a page the user already dismissed it from.
+    .filter((record) => !closedPanelIds.has(record.panelId))
+    // A closed view stays closed until the Owner reopens the question from the list.
+    .filter((record) => !record.state?.closedView)
+    // A panel belongs to this page if it shares the scope; otherwise only a
+    // minimized one is offered, and only as a rail tab.
+    .filter((record) => record.scopeKey === currentScopeKey || Boolean(record.state?.minimized))
+    .forEach((record) => {
+      const restoredState = createStateFromRestore(record.state);
+      if (!restoredState) {
+        return;
+      }
 
-          // Minimized tabs from other chats should remain available globally,
-          // but only the current chat gets its full panel restore state. The catch-all
-          // bucket is shared by every non-conversation page, so its panels stay in the
-          // rail instead of reopening on the home page, a project, or a branch window.
-          if (key !== currentStorageKey || isCatchAllPanelStorageKey(key)) {
-            restoredState.minimized = true;
-          }
-          return restoredState;
-        })
-    )
-    .filter((state): state is BranchPanelState => Boolean(state))
-    .filter((state, index, states) => states.findIndex((item) => item.panelId === state.panelId) === index)
-    .forEach((state) => {
-      if (!panelRuntimes.has(state.panelId)) {
-        createPanelRuntime(state);
+      // Panels from another scope, and anything in the shared catch-all scope,
+      // come back as rail tabs rather than reopening over the current page.
+      if (
+        record.scopeKey !== currentScopeKey ||
+        isCatchAllPanelStorageKey(getPanelStorageKeyForConversationId(record.scopeKey))
+      ) {
+        restoredState.minimized = true;
+      }
+
+      panelRevisions.set(record.panelId, record.rev);
+      if (!panelRuntimes.has(record.panelId)) {
+        createPanelRuntime(restoredState);
       }
     });
 
   syncMountedUi();
+  drainPendingPanelChanges();
+  void refreshQuestionList();
 }
 
 function minimizePanel(panelId: string): void {
@@ -2294,7 +3176,7 @@ function minimizePanel(panelId: string): void {
   runtime.state.updatedAt = Date.now();
   syncPanelUI(runtime);
   renderTabs();
-  persistPanels();
+  persistPanels(panelId);
 }
 
 function expandPanel(panelId: string): void {
@@ -2306,177 +3188,85 @@ function expandPanel(panelId: string): void {
   minimizeOtherPanels(panelId);
   runtime.state.minimized = false;
   runtime.state.updatedAt = Date.now();
+  yieldHandoffCards();
   syncPanelUI(runtime);
   renderTabs();
-  persistPanels();
+  persistPanels(panelId);
   scrollToOrigin(runtime.state.selection);
 }
 
+/**
+ * Close hides the view. It deletes nothing and cancels nothing: the question
+ * record, its saved thread and any run in flight are untouched, and the question
+ * is still listed for this page. Deletion is a separate, explicit action.
+ */
 function closePanel(panelId: string): void {
   const runtime = panelRuntimes.get(panelId);
   if (!runtime) {
     return;
   }
 
-  clearPanelWatchdog(runtime);
-  closedPanelIds.add(panelId);
-  runtime.iframeEl.src = 'about:blank';
+  runtime.state.closedView = true;
+  runtime.state.minimized = true;
+  runtime.state.updatedAt = Date.now();
   runtime.element.remove();
   panelRuntimes.delete(panelId);
   renderTabs();
-  persistPanels();
+  void refreshQuestionList();
+
+  // The view record is kept, marked closed, so a reload does not reopen it and
+  // a private (session-only) question is not lost merely by closing its view.
+  void writePanelRecord(runtime);
 }
 
 // Navigating away is not the same as closing: these panels stay in storage so the user
 // can come back to the conversation and find them again.
 function clearPanelsForCurrentConversation(): void {
   panelRuntimes.forEach((runtime) => {
-    clearPanelWatchdog(runtime);
-    runtime.iframeEl.src = 'about:blank';
     runtime.element.remove();
   });
   panelRuntimes.clear();
   renderTabs();
 }
 
-async function openBranchInNewTab(panelId: string): Promise<void> {
+/**
+ * Open a saved record's provider conversation as plain navigation in a new tab.
+ * It carries no prompt and starts nothing; the worker only accepts provider URLs.
+ */
+async function openSavedConversation(panelId: string): Promise<void> {
   const runtime = panelRuntimes.get(panelId);
-  if (!runtime) {
+  const url = runtime?.state.branchChatUrl;
+  if (!runtime || !url) {
     return;
   }
-
-  appendPanelLog(runtime, 'Open branch requested', {
-    branchChatUrl: runtime.state.branchChatUrl,
-    launchTabId: runtime.state.launchTabId,
-    launchWindowId: runtime.state.launchWindowId,
-    surfaceMode: runtime.state.surfaceMode
-  });
-
-  if (runtime.state.launchTabId || runtime.state.launchWindowId || runtime.state.branchChatUrl) {
-    const response = await focusNativeBranchWindow({
-      panelId,
-      launchTabId: runtime.state.launchTabId,
-      launchWindowId: runtime.state.launchWindowId,
-      branchChatUrl: runtime.state.branchChatUrl
-    });
-
-    if (response.ok) {
-      return;
-    }
-  }
-
-  if (runtime.state.branchChatUrl) {
-    window.open(runtime.state.branchChatUrl, '_blank', 'noopener,noreferrer');
+  appendPanelLog(runtime, 'Open saved conversation requested');
+  const response = await sendStoreMessage<{ ok: boolean; reason?: string }>({ type: 'OPEN_PROVIDER_URL', url });
+  if (!response?.ok) {
+    notifyAside(`The saved ${provider.label} conversation could not be opened.`);
   }
 }
 
-async function promotePersistentBranchToNativeWindow(runtime: PanelRuntime): Promise<void> {
-  if (
-    runtime.state.surfaceMode === 'native_window' ||
-    runtime.state.branchKind !== 'persistent' ||
-    !runtime.state.initialPrompt ||
-    !runtime.state.launchUrl
-  ) {
-    return;
-  }
+const REDACTED = '(redacted — use "Copy log + text" to include it)';
 
-  runtime.pendingFramePrompt = undefined;
-  runtime.state.surfaceMode = 'native_window';
-  runtime.state.status = 'opening_branch';
-  runtime.state.statusLabel = 'Continuing this branch in a native ChatGPT window...';
-  runtime.state.errorMessage = undefined;
-  runtime.state.updatedAt = Date.now();
-  appendPanelLog(runtime, 'Promoting persistent branch to a native ChatGPT window', {
-    launchUrl: runtime.state.launchUrl
-  });
-  syncPanelUI(runtime);
-  persistPanels();
-
-  const response = await createNativeBranchWindow({
-    panelId: runtime.state.panelId,
-    prompt: runtime.state.initialPrompt,
-    launchUrl: runtime.state.launchUrl,
-    branchKind: runtime.state.branchKind,
-    focusWindow: true,
-    arrangeSideBySide: true
-  });
-
-  if (!response.ok) {
-    appendPanelLog(runtime, 'Native branch window promotion failed', {
-      reason: response.reason
-    });
-    runtime.state.status = 'failed';
-    runtime.state.creationMode = 'failed';
-    runtime.state.statusLabel = 'Native branch recovery failed.';
-    runtime.state.errorMessage = response.reason ?? 'The native ChatGPT recovery window could not be opened.';
-    runtime.state.updatedAt = Date.now();
-    syncPanelUI(runtime);
-    persistPanels();
-    return;
-  }
-
-  runtime.state.launchTabId = response.tabId;
-  runtime.state.launchWindowId = response.windowId;
-  runtime.state.updatedAt = Date.now();
-  startPanelWatchdog(
-    runtime,
-    BRANCH_RESPONSE_TIMEOUT_MS,
-    'The native ChatGPT branch window stopped reporting back. Use Open branch to check it directly, or try again.'
-  );
-  appendPanelLog(runtime, 'Native branch recovery window created', {
-    launchTabId: response.tabId,
-    launchWindowId: response.windowId
-  });
-  syncPanelUI(runtime);
-  persistPanels();
-}
-
-async function openSelectionInNewTab(
-  selection: SelectionPayload,
-  branchKind: BranchKind
-): Promise<void> {
-  const launchUrl = normalizeChatUrl(getBranchLaunchUrl(selection.rootChatUrl));
-  const prompt = buildNativeBootstrapPrompt(selection).prompt;
-  const panelId = randomId('native');
-  persistLastUsedBranchKind(branchKind);
-  const response = await createNativeBranchWindow({
-    panelId,
-    prompt,
-    launchUrl,
-    branchKind,
-    focusWindow: true,
-    arrangeSideBySide: true
-  });
-
-  if (!response.ok) {
-    console.warn('[Aside] Failed to open native New-tab window', response.reason);
-    // The selection has already been cleared by this point, so falling back to an
-    // in-page draft is the only way the user keeps the passage they picked.
-    const runtime = createBranchDraft(selection, {
-      entryAction: 'ask',
-      branchKind
-    });
-    runtime.state.status = 'failed';
-    runtime.state.creationMode = 'failed';
-    runtime.state.statusLabel = 'New-tab could not open a ChatGPT window.';
-    runtime.state.errorMessage = `${
-      response.reason ?? 'The branch window could not be opened.'
-    } Ask here instead, or try New-tab again.`;
-    runtime.state.updatedAt = Date.now();
-    appendPanelLog(runtime, 'New-tab branch window could not be opened', {
-      reason: response.reason
-    });
-    syncPanelUI(runtime);
-    renderTabs();
-    persistPanels();
-  }
-}
-
-function buildBranchDebugLogText(runtime: PanelRuntime): string {
+/**
+ * Diagnostics are redacted by default. The selected passage and the generated prompt
+ * are the user's content — and for a private branch they are exactly the content that
+ * must not leave the session — so including them takes a second, explicit action.
+ */
+function buildBranchDebugLogText(runtime: PanelRuntime, includeContent = false): string {
   const { state } = runtime;
+  const redactable = (value: string | undefined | null): string =>
+    includeContent ? (value ?? '(none)') : REDACTED;
+
   return [
     'Aside Debug Log',
-    'This report may include the selected text and the first prompt so we can debug wrong-output failures.',
+    includeContent
+      ? 'CONTAINS YOUR CONTENT: the selected text and the first prompt are included below.'
+      : 'Content is redacted. Use "Copy log + text" if a maintainer needs the selected text and prompt.',
+    `build: ${BUILD_ID}`,
+    `workerBuild: ${workerBuildId ?? '(not reported)'}`,
+    `provider: ${provider.id}`,
+    `branchPrivacy: ${state.branchKind === 'temporary' ? provider.privacy.label : 'persistent'}`,
     `generatedAt: ${new Date().toISOString()}`,
     `panelId: ${state.panelId}`,
     `rootChatUrl: ${state.rootChatUrl}`,
@@ -2495,27 +3285,27 @@ function buildBranchDebugLogText(runtime: PanelRuntime): string {
     `titleStatus: ${state.titleStatus}`,
     `createdAt: ${new Date(state.createdAt).toISOString()}`,
     `updatedAt: ${new Date(state.updatedAt).toISOString()}`,
-    `focusPreview: ${state.focusPreview}`,
+    `focusPreview: ${redactable(state.focusPreview)}`,
     `selectedTextLength: ${state.selection.selectedText.length}`,
-    `initialQuestion: ${state.initialQuestion ?? '(none)'}`,
+    `initialQuestion: ${redactable(state.initialQuestion)}`,
     `branchBaseMessageId: ${state.selection.branchBaseMessageId}`,
-    `rangeQuotes: ${JSON.stringify(state.selection.rangeQuotes, null, 2)}`,
+    `rangeQuotes: ${includeContent ? JSON.stringify(state.selection.rangeQuotes, null, 2) : REDACTED}`,
     `selectedBlocks: ${JSON.stringify(
       state.selection.selectedBlocks.map((block) => ({
         role: block.role,
         turnIndex: block.turnIndex,
         messageId: block.messageId,
-        excerpt: block.excerpt
+        excerpt: includeContent ? block.excerpt : REDACTED
       })),
       null,
       2
     )}`,
     '',
     'SELECTED TEXT',
-    state.selection.selectedText,
+    redactable(state.selection.selectedText),
     '',
-    'FIRST PROMPT SENT TO CHATGPT',
-    state.initialPrompt ?? '(none)',
+    `FIRST PROMPT SENT TO ${provider.label.toUpperCase()}`,
+    redactable(state.initialPrompt),
     '',
     'AUTOMATION LOG',
     '',
@@ -2530,13 +3320,13 @@ function showCopyableDebugLog(runtime: PanelRuntime, logText: string): void {
   runtime.debugLogTextarea.select();
 }
 
-async function copyBranchDebugLog(panelId: string): Promise<void> {
+async function copyBranchDebugLog(panelId: string, includeContent = false): Promise<void> {
   const runtime = panelRuntimes.get(panelId);
   if (!runtime) {
     return;
   }
 
-  const logText = buildBranchDebugLogText(runtime);
+  const logText = buildBranchDebugLogText(runtime, includeContent);
   try {
     await navigator.clipboard.writeText(logText);
     appendPanelLog(runtime, 'Debug log copied to clipboard');
@@ -2558,276 +3348,101 @@ async function copyBranchDebugLog(panelId: string): Promise<void> {
     const copyError = error instanceof Error ? error.message : String(error);
     appendPanelLog(runtime, 'Debug log copy failed', copyError);
     runtime.state.statusLabel = 'Clipboard copy was blocked. Select the diagnostic log below and paste it here.';
-    showCopyableDebugLog(runtime, buildBranchDebugLogText(runtime));
+    showCopyableDebugLog(runtime, buildBranchDebugLogText(runtime, includeContent));
     syncPanelUI(runtime);
     persistPanels();
   }
 }
 
-function buildEmbeddedFrameUrl(launchUrl: string): string {
-  try {
-    const url = new URL(launchUrl);
-    url.hash = `aside-${Date.now()}`;
-    return url.toString();
-  } catch {
-    return launchUrl;
+/**
+ * A write accepted by the authority, made anywhere. Keeps every open tab in step
+ * instead of each one discovering the change on its next navigation.
+ */
+/**
+ * Broadcasts that arrived before this page finished restoring its panels.
+ *
+ * A tab opened while another tab is writing is the ordinary case, not an edge
+ * one: the two operations are concurrent by nature.
+ */
+const pendingPanelChanges = new Map<string, PanelChangedMessage>();
+
+function handlePanelChanged(message: PanelChangedMessage): void {
+  if (!message.panelId) {
+    return;
   }
+
+  if (message.deleted) {
+    const runtime = panelRuntimes.get(message.panelId);
+    if (runtime) {
+      runtime.element.remove();
+      panelRuntimes.delete(message.panelId);
+      renderTabs();
+    }
+    panelRevisions.delete(message.panelId);
+    unsavedPanelIds.delete(message.panelId);
+    return;
+  }
+
+  const known = panelRevisions.get(message.panelId) ?? 0;
+  if (message.rev <= known) {
+    return;
+  }
+
+  if (panelRuntimes.has(message.panelId) && message.state) {
+    adoptAuthoritativeState(message.panelId, message.state, message.rev);
+    return;
+  }
+
+  // Not mounted yet. Recording the revision and dropping the state loses the
+  // change for good: a restore already in flight lists an older snapshot, mounts
+  // it, and the panel then sits at a revision it never actually holds. Hold the
+  // change instead and apply it once this page knows its own panels.
+  pendingPanelChanges.set(message.panelId, message);
 }
 
-function clearPanelWatchdog(runtime: PanelRuntime): void {
-  if (runtime.watchdogId !== undefined) {
-    window.clearTimeout(runtime.watchdogId);
-    runtime.watchdogId = undefined;
+function drainPendingPanelChanges(): void {
+  if (!pendingPanelChanges.size) {
+    return;
   }
-}
 
-function startPanelWatchdog(runtime: PanelRuntime, timeoutMs: number, reason: string): void {
-  clearPanelWatchdog(runtime);
-  runtime.watchdogId = window.setTimeout(() => {
-    runtime.watchdogId = undefined;
+  const changes = [...pendingPanelChanges.values()];
+  pendingPanelChanges.clear();
 
-    if (panelRuntimes.get(runtime.state.panelId) !== runtime) {
+  const currentScopeKey = currentIdentity(lastKnownUrl).scopeKey;
+
+  changes.forEach((change) => {
+    if (change.deleted) {
+      handlePanelChanged(change);
       return;
     }
 
-    if (
-      runtime.state.status === 'live' ||
-      runtime.state.status === 'failed' ||
-      runtime.state.status === 'draft'
-    ) {
+    if (panelRuntimes.has(change.panelId)) {
+      handlePanelChanged(change);
       return;
     }
 
-    appendPanelLog(runtime, 'Branch watchdog fired', {
-      timeoutMs,
-      panelStatus: runtime.state.status,
-      frameReady: runtime.frameReady,
-      frameStartSent: runtime.frameStartSent
-    });
-    applyBranchPanelEvent(runtime, { kind: 'failed', reason });
-  }, timeoutMs);
-}
-
-function loadEmbeddedBranchFrame(runtime: PanelRuntime, launchUrl: string): void {
-  runtime.frameReady = false;
-  runtime.frameStartSent = false;
-  startPanelWatchdog(
-    runtime,
-    FRAME_HANDSHAKE_TIMEOUT_MS,
-    'The embedded ChatGPT branch window did not finish loading. ChatGPT may be refusing to be embedded here — try again, or use New-tab to run this branch in its own window.'
-  );
-  const iframeUrl = buildEmbeddedFrameUrl(launchUrl);
-  const previousSrc = runtime.iframeEl.src;
-
-  // Retrying reuses the same iframe, and the cache-busting differs only in the fragment.
-  // A fragment-only src change is a same-document navigation: no load event, so the frame
-  // never posts SB_FRAME_READY again and the retry would sit there until the watchdog.
-  // Going through about:blank forces a real document load.
-  if (previousSrc && previousSrc !== 'about:blank') {
-    runtime.iframeEl.src = 'about:blank';
-  }
-
-  window.setTimeout(() => {
-    if (panelRuntimes.get(runtime.state.panelId) !== runtime) {
+    if (!change.state || closedPanelIds.has(change.panelId)) {
       return;
     }
-    runtime.iframeEl.src = iframeUrl;
-  }, 0);
 
-  appendPanelLog(runtime, 'Loading embedded branch frame', {
-    targetUrl: launchUrl,
-    iframeSrc: iframeUrl,
-    previousSrc: previousSrc || null,
-    panelStatus: runtime.state.status
+    // A panel created in another tab for this same conversation: mount it here
+    // rather than waiting for a reload to notice it.
+    const restoredState = createStateFromRestore(change.state);
+    if (!restoredState) {
+      return;
+    }
+    if (change.scopeKey !== currentScopeKey) {
+      if (!restoredState.minimized) {
+        return;
+      }
+      restoredState.minimized = true;
+    }
+
+    panelRevisions.set(change.panelId, change.rev);
+    createPanelRuntime(restoredState);
   });
-}
 
-function ensureLiveFrameLocation(runtime: PanelRuntime): void {
-  const desiredUrl = runtime.state.branchChatUrl;
-  if (!desiredUrl || runtime.pendingFramePrompt) {
-    return;
-  }
-
-  // Restoring a page used to give every minimized branch from every conversation its own
-  // eagerly loading chatgpt.com iframe. Load the frame when the panel is actually shown.
-  if (runtime.state.minimized) {
-    return;
-  }
-
-  if (runtime.frameStartSent || runtime.frameReady) {
-    return;
-  }
-
-  const currentSrc = runtime.iframeEl.src;
-  if (!currentSrc || currentSrc === 'about:blank') {
-    runtime.iframeEl.src = desiredUrl;
-    return;
-  }
-
-  if (normalizeChatUrl(currentSrc) !== normalizeChatUrl(desiredUrl)) {
-    runtime.iframeEl.src = desiredUrl;
-  }
-}
-
-function postToEmbeddedFrame(runtime: PanelRuntime, message: FrameStartBranchMessage): void {
-  const targetWindow = runtime.iframeEl.contentWindow;
-  if (!targetWindow) {
-    return;
-  }
-
-  let targetOrigin = '*';
-  try {
-    targetOrigin = new URL(runtime.state.launchUrl ?? runtime.state.rootChatUrl).origin;
-  } catch {
-    targetOrigin = '*';
-  }
-
-  targetWindow.postMessage(message, targetOrigin);
-}
-
-function tryDispatchPendingFrameStart(runtime: PanelRuntime): void {
-  if (!runtime.pendingFramePrompt || runtime.frameStartSent || !runtime.frameReady || !runtime.state.launchUrl) {
-    return;
-  }
-
-  const prompt = runtime.pendingFramePrompt;
-  runtime.frameStartSent = true;
-  runtime.state.status = 'opening_branch';
-  runtime.state.statusLabel = 'Sending the local branch question inside the branch window...';
-  runtime.state.updatedAt = Date.now();
-  appendPanelLog(runtime, 'Dispatching embedded branch start command', {
-    launchUrl: runtime.state.launchUrl,
-    promptLength: prompt.length
-  });
-  startPanelWatchdog(
-    runtime,
-    BRANCH_RESPONSE_TIMEOUT_MS,
-    'The branch window stopped responding before the answer was ready. Try again, or use Open branch to continue it directly in ChatGPT.'
-  );
-  syncPanelUI(runtime);
-  persistPanels();
-
-  postToEmbeddedFrame(runtime, {
-    source: 'aside',
-    target: 'frame',
-    type: 'SB_FRAME_START_BRANCH',
-    panelId: runtime.state.panelId,
-    prompt,
-    launchUrl: runtime.state.launchUrl,
-    branchKind: runtime.state.branchKind
-  });
-}
-
-function findRuntimeByFrameWindow(source: MessageEventSource | null): PanelRuntime | null {
-  if (!source) {
-    return null;
-  }
-
-  for (const runtime of panelRuntimes.values()) {
-    if (runtime.iframeEl.contentWindow === source) {
-      return runtime;
-    }
-  }
-
-  return null;
-}
-
-function isTrustedBranchOrigin(origin: string, runtime?: PanelRuntime): boolean {
-  if (!origin || origin === 'null') {
-    return false;
-  }
-
-  if (origin === window.location.origin) {
-    return true;
-  }
-
-  const launchUrl = runtime?.state.launchUrl ?? runtime?.state.branchChatUrl;
-  if (!launchUrl) {
-    return false;
-  }
-
-  try {
-    return new URL(launchUrl).origin === origin;
-  } catch {
-    return false;
-  }
-}
-
-function handleEmbeddedFrameMessage(event: MessageEvent<FrameIncomingMessage>): void {
-  const data = event.data;
-  if (
-    !data ||
-    typeof data !== 'object' ||
-    data.source !== 'aside' ||
-    data.target !== 'parent'
-  ) {
-    return;
-  }
-
-  const runtime = findRuntimeByFrameWindow(event.source);
-  if (!runtime) {
-    return;
-  }
-
-  // The window identity check above already rules out unrelated frames; the origin check
-  // keeps a navigated-away branch frame from driving the panel.
-  if (!isTrustedBranchOrigin(event.origin, runtime)) {
-    appendPanelLog(runtime, 'Ignored branch frame message from an unexpected origin', {
-      origin: event.origin
-    });
-    return;
-  }
-
-  if (data.type === 'SB_FRAME_READY') {
-    runtime.frameReady = true;
-    appendPanelLog(runtime, 'Embedded branch frame ready', {
-      currentUrl: data.currentUrl,
-      panelStatus: runtime.state.status,
-      hasPendingPrompt: Boolean(runtime.pendingFramePrompt),
-      iframeSrc: runtime.iframeEl.src
-    });
-    tryDispatchPendingFrameStart(runtime);
-    return;
-  }
-
-  if (data.type === 'SB_FRAME_EVENT') {
-    if (data.panelId !== runtime.state.panelId) {
-      return;
-    }
-
-    // A panel that has moved on to a native window is no longer driven by its old frame;
-    // a late event from that frame would otherwise overwrite the current branch state.
-    if (runtime.state.surfaceMode !== 'embedded') {
-      appendPanelLog(runtime, 'Ignored a branch frame event for a panel that is no longer embedded', {
-        eventKind: data.event.kind,
-        surfaceMode: runtime.state.surfaceMode
-      });
-      return;
-    }
-
-    applyBranchPanelEvent(runtime, data.event);
-  }
-}
-
-function handleForwardedBranchPanelEvent(message: ForwardBranchPanelEventMessage): void {
-  const runtime = panelRuntimes.get(message.panelId);
-  if (!runtime) {
-    return;
-  }
-
-  // Only a native-window branch reports through the background. Retrying a failed native
-  // branch switches the panel back to an embedded frame and leaves the old window open;
-  // without this guard a late event from that orphan could mark the new branch live with
-  // the previous conversation's URL.
-  if (runtime.state.surfaceMode !== 'native_window') {
-    appendPanelLog(runtime, 'Ignored a background branch event for an embedded panel', {
-      eventKind: message.event.kind,
-      surfaceMode: runtime.state.surfaceMode
-    });
-    return;
-  }
-
-  applyBranchPanelEvent(runtime, message.event);
+  syncMountedUi();
 }
 
 function installRuntimeMessageListener(): void {
@@ -2836,217 +3451,49 @@ function installRuntimeMessageListener(): void {
   }
 
   const runtimeMessageListener = (
-    message: RunBranchPromptInTabMessage | ForwardBranchPanelEventMessage,
-    _sender: chrome.runtime.MessageSender,
+    message: PanelChangedMessage | QuestionChangedMessage | HandoffChangedMessage | HandoffScrollToAnchorMessage | { type?: unknown },
+    sender: chrome.runtime.MessageSender,
     sendResponse: (response?: unknown) => void
   ) => {
-    if (!isTopFrame() || !message || typeof message !== 'object' || !('type' in message)) {
+    // Only this extension's worker talks to the page; never another tab.
+    if (!isTopFrame() || sender.id !== chrome.runtime.id || sender.tab) {
+      return false;
+    }
+    if (!message || typeof message !== 'object' || !('type' in message)) {
       return false;
     }
 
-    if (message.type === 'BRANCH_PANEL_EVENT') {
-      handleForwardedBranchPanelEvent(message);
-      sendResponse({ ok: true });
-      return false;
-    }
-
-    if (message.type === 'RUN_BRANCH_PROMPT_IN_TAB') {
-      if (automationTaskRunning) {
-        sendResponse({
-          ok: false,
-          reason: 'Another branch automation is already running in this ChatGPT window.'
-        });
+    switch (message.type) {
+      case 'PANEL_CHANGED':
+        handlePanelChanged(message as PanelChangedMessage);
+        sendResponse({ ok: true });
+        return false;
+      case 'QUESTION_CHANGED':
+        void refreshQuestionList();
+        sendResponse({ ok: true });
+        return false;
+      case 'HANDOFF_CHANGED':
+        handleHandoffChanged(message as HandoffChangedMessage);
+        sendResponse({ ok: true });
+        return false;
+      case 'HANDOFF_SCROLL_TO_ANCHOR': {
+        const card = handoffCards.get((message as HandoffScrollToAnchorMessage).sessionId);
+        sendResponse({ anchor: card ? jumpToHandoffPassage(card.session) : 'not-found' });
         return false;
       }
-
-      void runBranchPromptAutomation(message, 'background');
-      sendResponse({ ok: true });
-      return false;
+      case 'RUN_BRANCH_PROMPT_IN_TAB':
+        // A worker from an older build asking for the retired automatic run.
+        sendResponse({ ok: false, code: 'retired', buildId: BUILD_ID });
+        return false;
+      default:
+        return false;
     }
-
-    return false;
   };
 
   chrome.runtime.onMessage.addListener(runtimeMessageListener);
   cleanupFns.push(() => {
     chrome.runtime.onMessage.removeListener(runtimeMessageListener);
   });
-}
-
-async function startBranch(panelId: string, question: string): Promise<void> {
-  const runtime = panelRuntimes.get(panelId);
-  if (!runtime) {
-    return;
-  }
-
-  const prompt = buildLocalInitialPrompt(runtime.state.selection, question).prompt;
-  const launchUrl = normalizeChatUrl(getBranchLaunchUrl(runtime.state.rootChatUrl));
-
-  if (!launchUrl) {
-    runtime.state.initialQuestion = question;
-    runtime.state.status = 'failed';
-    runtime.state.creationMode = 'failed';
-    runtime.state.statusLabel = 'Local branch creation failed.';
-    runtime.state.errorMessage = 'Could not determine a launch URL for this ChatGPT branch.';
-    runtime.state.updatedAt = Date.now();
-    syncPanelUI(runtime);
-    persistPanels();
-    return;
-  }
-
-  appendPanelLog(runtime, 'Start branch requested', {
-    questionLength: question.length,
-    rootChatUrl: runtime.state.rootChatUrl,
-    launchUrl,
-    branchKind: runtime.state.branchKind,
-    entryAction: runtime.state.entryAction,
-    selectedTextLength: runtime.state.selection.selectedText.length,
-    selectedAssistantBlockIds: runtime.state.selection.selectedBlocks
-      .filter((block) => block.role === 'assistant')
-      .map((block) => block.messageId),
-    promptLength: prompt.length
-  });
-  if (runtime.state.branchChatUrl) {
-    // The previous attempt already created a conversation. Keep the link in the log so a
-    // retry does not erase the only way back to something the user may need to delete.
-    appendPanelLog(runtime, 'Replacing a branch that already has a conversation URL', {
-      previousBranchChatUrl: runtime.state.branchChatUrl
-    });
-  }
-
-  runtime.state.initialQuestion = question;
-  runtime.state.initialPrompt = prompt;
-  runtime.state.surfaceMode = 'embedded';
-  runtime.state.launchUrl = launchUrl;
-  runtime.state.branchChatUrl = undefined;
-  runtime.state.launchTabId = undefined;
-  runtime.state.launchWindowId = undefined;
-  runtime.state.creationMode =
-    runtime.state.branchKind === 'temporary' ? 'local_temporary' : 'local_persistent';
-  runtime.state.title = DEFAULT_BRANCH_TITLE;
-  runtime.state.titleStatus = 'pending';
-  runtime.state.status = 'creating_branch';
-  runtime.state.statusLabel = 'Loading the embedded ChatGPT branch window...';
-  runtime.state.errorMessage = undefined;
-  runtime.state.updatedAt = Date.now();
-  persistLastUsedBranchKind(runtime.state.branchKind);
-  runtime.pendingFramePrompt = prompt;
-  runtime.frameReady = false;
-  runtime.frameStartSent = false;
-
-  minimizeOtherPanels(panelId);
-  loadEmbeddedBranchFrame(runtime, launchUrl);
-  syncPanelUI(runtime);
-  renderTabs();
-  persistPanels();
-}
-
-function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): void {
-  switch (event.kind) {
-    case 'status':
-      appendPanelLog(runtime, 'Embedded branch status', {
-        status: event.status,
-        statusLabel: event.statusLabel
-      });
-      runtime.state.status = event.status;
-      runtime.state.statusLabel = event.statusLabel;
-      runtime.state.updatedAt = Date.now();
-      syncPanelUI(runtime);
-      persistPanels();
-      return;
-
-    case 'debug-log':
-      appendPanelLogEntries(runtime, [event.message]);
-      syncPanelUI(runtime);
-      persistPanelsSoon();
-      return;
-
-    case 'title':
-      appendPanelLog(runtime, 'Branch title detected', event.title);
-      runtime.state.title = event.title;
-      runtime.state.titleStatus = 'ready';
-      runtime.state.updatedAt = Date.now();
-      syncPanelUI(runtime);
-      renderTabs();
-      persistPanels();
-      return;
-
-    case 'live':
-      clearPanelWatchdog(runtime);
-      runtime.pendingFramePrompt = undefined;
-      runtime.state.launchTabId = event.launchTabId ?? runtime.state.launchTabId;
-      runtime.state.launchWindowId = event.launchWindowId ?? runtime.state.launchWindowId;
-      runtime.state.branchChatUrl = event.branchChatUrl
-        ? normalizeChatUrl(event.branchChatUrl)
-        : runtime.state.branchChatUrl;
-      appendPanelLog(runtime, 'Branch is live', {
-        branchChatUrl: runtime.state.branchChatUrl,
-        launchTabId: runtime.state.launchTabId,
-        launchWindowId: runtime.state.launchWindowId,
-        surfaceMode: runtime.state.surfaceMode
-      });
-      runtime.state.status = 'live';
-      runtime.state.creationMode =
-        runtime.state.branchKind === 'temporary' ? 'local_temporary' : 'local_persistent';
-      runtime.state.statusLabel =
-        runtime.state.surfaceMode === 'native_window'
-          ? 'Branch continued in a native ChatGPT window.'
-          : 'Branch answer is ready in this window.';
-      runtime.state.errorMessage = undefined;
-      runtime.state.updatedAt = Date.now();
-      syncPanelUI(runtime);
-      renderTabs();
-      persistPanels();
-      return;
-
-    case 'failed':
-      clearPanelWatchdog(runtime);
-      appendPanelLog(runtime, 'Branch reported failure', {
-        reason: event.reason,
-        branchChatUrl: event.branchChatUrl,
-        launchTabId: event.launchTabId,
-        launchWindowId: event.launchWindowId,
-        surfaceMode: runtime.state.surfaceMode
-      });
-      runtime.state.launchTabId = event.launchTabId ?? runtime.state.launchTabId;
-      runtime.state.launchWindowId = event.launchWindowId ?? runtime.state.launchWindowId;
-      runtime.state.branchChatUrl = event.branchChatUrl
-        ? normalizeChatUrl(event.branchChatUrl)
-        : runtime.state.branchChatUrl;
-      if (
-        runtime.state.branchKind === 'persistent' &&
-        runtime.state.surfaceMode === 'embedded' &&
-        /never became a persistent chat url/i.test(event.reason)
-      ) {
-        // If the URL turned up late, the branch really did succeed. Re-sending here
-        // would post the same question a second time and leave two conversations.
-        if (runtime.state.branchChatUrl) {
-          appendPanelLog(runtime, 'Persistent branch URL arrived late; keeping the existing branch', {
-            branchChatUrl: runtime.state.branchChatUrl
-          });
-          applyBranchPanelEvent(runtime, {
-            kind: 'live',
-            branchChatUrl: runtime.state.branchChatUrl
-          });
-          return;
-        }
-
-        void promotePersistentBranchToNativeWindow(runtime);
-        return;
-      }
-
-      runtime.pendingFramePrompt = undefined;
-      runtime.state.status = 'failed';
-      runtime.state.creationMode = 'failed';
-      runtime.state.statusLabel =
-        runtime.state.surfaceMode === 'native_window'
-          ? 'Native branch creation failed.'
-          : 'Local branch creation failed.';
-      runtime.state.errorMessage = event.reason;
-      runtime.state.updatedAt = Date.now();
-      syncPanelUI(runtime);
-      persistPanels();
-  }
 }
 
 function clearHighlightOverlay(): void {
@@ -3057,7 +3504,15 @@ function clearHighlightOverlay(): void {
   highlightOverlayTimer = undefined;
 }
 
-function renderHighlightRects(rects: DOMRect[]): void {
+/**
+ * Draw the origin highlight in Aside's own overlay.
+ *
+ * `outlineRect` used to be a class added to the provider's own message element —
+ * a write to a provider-owned node, on an attribute the layout observer watches,
+ * undone by a bare timer that a cleanup within the next 2.2s would leave behind
+ * on the page permanently.
+ */
+function renderHighlightRects(rects: DOMRect[], outlineRect?: DOMRect): void {
   clearHighlightOverlay();
   highlightOverlay = document.createElement('div');
   highlightOverlay.id = HIGHLIGHT_OVERLAY_ID;
@@ -3070,6 +3525,17 @@ function renderHighlightRects(rects: DOMRect[]): void {
     highlight.style.height = `${rect.height}px`;
     highlightOverlay?.append(highlight);
   });
+
+  if (outlineRect) {
+    const outline = document.createElement('div');
+    outline.className = 'aside-origin-outline';
+    outline.style.top = `${outlineRect.top}px`;
+    outline.style.left = `${outlineRect.left}px`;
+    outline.style.width = `${outlineRect.width}px`;
+    outline.style.height = `${outlineRect.height}px`;
+    highlightOverlay.append(outline);
+  }
+
   mountInExtensionHost(highlightOverlay);
   highlightOverlayTimer = window.setTimeout(clearHighlightOverlay, 2200);
 }
@@ -3147,37 +3613,37 @@ function afterScrollSettles(callback: () => void): void {
   }
 }
 
-function scrollToOrigin(selection: SelectionPayload): void {
-  const target = findTurnElementByAnchor(selection);
-  if (!target) {
-    window.scrollTo({ top: selection.fallbackScrollY, behavior: 'smooth' });
-    return;
-  }
-
-  const exactRange = findQuotedTextRangeInElement(target, {
-    selectedText: selection.selectedText,
-    rangeQuotes: selection.rangeQuotes
-  });
-
-  if (exactRange) {
-    const firstRect = getFirstRangeRect(exactRange);
+/**
+ * Bring a saved passage back into view, validated rather than guessed: an exact
+ * match of the passage with its recorded context, or its message when only the
+ * message is identifiable. A duplicate phrase elsewhere is never used to claim
+ * success.
+ */
+function scrollToOrigin(selection: SelectionPayload): AnchorResult {
+  const found = locatePassage(selection);
+  if (found.status === 'exact') {
+    const firstRect = getFirstRangeRect(found.range);
     if (firstRect) {
-      target.classList.add('aside-origin-flash');
-      window.setTimeout(() => target.classList.remove('aside-origin-flash'), 2200);
-      scrollRectIntoView(firstRect, target);
+      scrollRectIntoView(firstRect, found.element);
       afterScrollSettles(() => {
-        renderHighlightRects(Array.from(exactRange.getClientRects()).map((rect) => rect as DOMRect));
+        renderHighlightRects(
+          Array.from(found.range.getClientRects()).map((rect) => rect as DOMRect),
+          found.element.getBoundingClientRect()
+        );
       });
-      return;
+      return 'exact';
     }
+    found.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    return 'exact';
   }
-
-  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  target.classList.add('aside-origin-flash');
-  window.setTimeout(() => target.classList.remove('aside-origin-flash'), 2200);
-  afterScrollSettles(() => {
-    renderHighlightRects([target.getBoundingClientRect()]);
-  });
+  if (found.status === 'message-only') {
+    found.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    afterScrollSettles(() => {
+      renderHighlightRects([found.element.getBoundingClientRect()]);
+    });
+    return 'message-only';
+  }
+  return found.status;
 }
 
 async function handleUrlChange(): Promise<void> {
@@ -3191,8 +3657,8 @@ async function handleUrlChange(): Promise<void> {
   const token = ++pendingUrlChangeToken;
   const isStale = () => token !== pendingUrlChangeToken;
 
-  const currentConversationId = getRootConversationId(lastKnownUrl);
-  const nextConversationId = getRootConversationId(nextUrl);
+  const currentConversationId = currentIdentity(lastKnownUrl).scopeKey;
+  const nextConversationId = currentIdentity(nextUrl).scopeKey;
 
   if (nextConversationId === currentConversationId) {
     lastKnownUrl = nextUrl;
@@ -3232,6 +3698,7 @@ async function handleUrlChange(): Promise<void> {
   }
 
   clearPanelsForCurrentConversation();
+  syncHandoffCardsToScope();
   hideAskButton();
   lastKnownUrl = nextUrl;
   await restorePanels();
@@ -3296,19 +3763,18 @@ function installUrlObservers(): void {
 function initTopFrame(): void {
   installThemeObserver();
   ensureStyles();
-  ensureFrameAutomationStyles();
   installRuntimeMessageListener();
   syncMountedUi();
   void (async () => {
     await migrateLegacyPanelStorage();
-    await loadLastUsedBranchKind();
     await restorePanels();
+    await restoreHandoffs();
     syncMountedUi();
     scheduleMountedUiSync(350);
     scheduleMountedUiSync(1500);
   })();
-  installSelectionActionObserver();
-  refreshSelectionActionButtons();
+  undoLegacySelectionSuppression();
+  installNativeLayoutObserver();
 
   const selectionListener = () => {
     window.clearTimeout(selectionTimer);
@@ -3324,21 +3790,21 @@ function initTopFrame(): void {
   const resizeListener = () => {
     syncMountedUi();
     syncSelectionToolbarToViewport();
-    scheduleAskTriggerSync(0);
   };
   const pageshowListener = () => {
     syncMountedUi();
     scheduleMountedUiSync(350);
   };
+  // Leaving the page (for the native chat, the toolbar popup, another tab) is
+  // when a debounced draft must reach the worker, so every view agrees.
   const focusListener = () => {
-    focusPendingDraftQuestionInput();
+    flushHandoffDrafts();
   };
   const visibilityListener = () => {
     if (document.visibilityState === 'visible') {
-      focusPendingDraftQuestionInput();
       return;
     }
-
+    flushHandoffDrafts();
     // Debounced writes would otherwise be lost if the tab is discarded while hidden.
     void flushPersistedPanels();
   };
@@ -3346,11 +3812,23 @@ function initTopFrame(): void {
     void flushPersistedPanels();
   };
   const keydownListener = (event: KeyboardEvent) => {
-    if (event.key === 'Escape') {
-      const latestVisible = getVisiblePanels().at(-1);
-      if (latestVisible) {
-        minimizePanel(latestVisible.state.panelId);
-      }
+    if (event.key !== 'Escape' || event.defaultPrevented) {
+      return;
+    }
+
+    // Escape belongs to whatever the user is actually in. Only act when focus is
+    // inside Aside's own UI, and never preventDefault: the provider still needs
+    // Escape to dismiss its menus, cancel IME composition and blur its composer.
+    const target = event.target;
+    const insideAside =
+      target instanceof Node && Boolean(extensionHost && extensionHost.contains(target));
+    if (!insideAside) {
+      return;
+    }
+
+    const latestVisible = getVisiblePanels().at(-1);
+    if (latestVisible) {
+      minimizePanel(latestVisible.state.panelId);
     }
   };
 
@@ -3362,19 +3840,11 @@ function initTopFrame(): void {
   window.addEventListener('scroll', scrollListener, scrollListenerOptions);
   window.addEventListener('resize', resizeListener);
   window.addEventListener('pageshow', pageshowListener);
-  window.addEventListener('focus', focusListener);
+  window.addEventListener('blur', focusListener);
   document.addEventListener('visibilitychange', visibilityListener);
   window.addEventListener('pagehide', pagehideListener);
   document.addEventListener('keydown', keydownListener);
   installUrlObservers();
-
-  const frameMessageListener = (event: MessageEvent<FrameIncomingMessage>) => {
-    handleEmbeddedFrameMessage(event);
-  };
-  window.addEventListener('message', frameMessageListener);
-  cleanupFns.push(() => {
-    window.removeEventListener('message', frameMessageListener);
-  });
 
   cleanupFns.push(() => document.removeEventListener('selectionchange', selectionListener));
   cleanupFns.push(() => document.removeEventListener('mouseup', mouseupListener));
@@ -3387,1598 +3857,621 @@ function initTopFrame(): void {
   });
   cleanupFns.push(() => window.removeEventListener('resize', resizeListener));
   cleanupFns.push(() => window.removeEventListener('pageshow', pageshowListener));
-  cleanupFns.push(() => window.removeEventListener('focus', focusListener));
+  cleanupFns.push(() => window.removeEventListener('blur', focusListener));
   cleanupFns.push(() => document.removeEventListener('visibilitychange', visibilityListener));
   cleanupFns.push(() => window.removeEventListener('pagehide', pagehideListener));
   cleanupFns.push(() => document.removeEventListener('keydown', keydownListener));
+
+  // The page role is confirmed asynchronously, so a selection can already exist
+  // by the time the listeners are in place: evaluate it once instead of waiting
+  // for the next selection change.
+  if (!(window.getSelection()?.isCollapsed ?? true)) {
+    selectionListener();
+  }
 }
 
-function getDeepQueryRoots(root: ParentNode = document): ParentNode[] {
-  const roots: ParentNode[] = [];
-  const seen = new Set<Node>();
 
-  const visit = (candidate: ParentNode | null | undefined): void => {
-    if (!candidate) {
-      return;
+
+
+/**
+ * A non-blocking notice in Aside's own host. Never window.alert on a provider
+ * page: a modal dialog freezes the provider's UI and the Owner's other work.
+ */
+let noticeTimer: number | undefined;
+function notifyAside(message: string): void {
+  console.warn(`[Aside] ${message}`);
+  const host = ensureExtensionHost();
+  let notice = host.querySelector<HTMLDivElement>('.aside-notice');
+  if (!notice) {
+    notice = document.createElement('div');
+    notice.className = 'aside-notice';
+    notice.setAttribute('role', 'status');
+    host.append(notice);
+  }
+  notice.textContent = message;
+  notice.hidden = false;
+  window.clearTimeout(noticeTimer);
+  noticeTimer = window.setTimeout(() => {
+    if (notice) {
+      notice.hidden = true;
     }
-
-    const node = candidate as unknown as Node;
-    if (seen.has(node)) {
-      return;
-    }
-    seen.add(node);
-    roots.push(candidate);
-
-    const traversalRoot =
-      candidate instanceof Document
-        ? candidate.documentElement
-        : candidate instanceof ShadowRoot || candidate instanceof Element
-          ? candidate
-          : null;
-    if (!traversalRoot) {
-      return;
-    }
-
-    const walker = document.createTreeWalker(traversalRoot, NodeFilter.SHOW_ELEMENT);
-    let current: Node | null = traversalRoot;
-    while (current) {
-      if (current instanceof HTMLElement && current.shadowRoot?.mode === 'open') {
-        visit(current.shadowRoot);
-      }
-      current = walker.nextNode();
-    }
-  };
-
-  visit(root);
-  return roots;
+  }, 6_000);
 }
 
-function queryOne<T extends Element = HTMLElement>(selectors: string[], root: ParentNode = document): T | null {
-  const searchRoots = getDeepQueryRoots(root);
-  for (const selector of selectors) {
-    for (const searchRoot of searchRoots) {
-      const match = searchRoot.querySelector<T>(selector);
-      if (match) {
-        return match;
-      }
-    }
+/* ================================================================== *
+ * Question records: the panel as a view of the canonical database.
+ * ================================================================== */
+
+function sanitizeArchive(raw: unknown): BranchPanelState['archive'] {
+  if (!raw || typeof raw !== 'object') {
+    return undefined;
   }
-  return null;
-}
-
-function queryMany<T extends Element = HTMLElement>(selectors: string[], root: ParentNode = document): T[] {
-  const results: T[] = [];
-  const seen = new Set<Element>();
-  const searchRoots = getDeepQueryRoots(root);
-  selectors.forEach((selector) => {
-    searchRoots.forEach((searchRoot) => {
-      Array.from(searchRoot.querySelectorAll<T>(selector)).forEach((match) => {
-        if (seen.has(match)) {
-          return;
-        }
-        seen.add(match);
-        results.push(match);
-      });
-    });
-  });
-  return results;
-}
-
-function getComposerCandidates(): Array<HTMLElement | HTMLTextAreaElement> {
-  const selectors = [
-    '#prompt-textarea',
-    'textarea#prompt-textarea',
-    'textarea[placeholder]',
-    'textarea',
-    'div[contenteditable="true"][role="textbox"]',
-    'div[contenteditable="true"][data-testid]',
-    'div[role="textbox"][contenteditable="true"]'
-  ];
-  const seen = new Set<Element>();
-  const candidates: Array<HTMLElement | HTMLTextAreaElement> = [];
-
-  queryMany<HTMLElement | HTMLTextAreaElement>(selectors).forEach((candidate) => {
-    if (seen.has(candidate)) {
-      return;
-    }
-    seen.add(candidate);
-    candidates.push(candidate);
-  });
-  return candidates;
-}
-
-function isDisabledElement(element: Element): boolean {
-  if (element instanceof HTMLButtonElement || element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-    return element.disabled;
+  const candidate = raw as { messages?: unknown; capture?: unknown };
+  if (!Array.isArray(candidate.messages)) {
+    return undefined;
   }
-
-  return element.getAttribute('aria-disabled') === 'true';
-}
-
-function scoreComposerCandidate(candidate: HTMLElement | HTMLTextAreaElement): number {
-  if (!isElementVisible(candidate) || isDisabledElement(candidate)) {
-    return Number.NEGATIVE_INFINITY;
-  }
-
-  if (candidate.getAttribute('readonly') === 'true' || candidate.hasAttribute('readonly')) {
-    return Number.NEGATIVE_INFINITY;
-  }
-
-  const rect = candidate.getBoundingClientRect();
-  if (rect.width < 120 || rect.height < 24) {
-    return Number.NEGATIVE_INFINITY;
-  }
-
-  const label = compactWhitespace(
-    [
-      candidate.id,
-      candidate.getAttribute('name'),
-      candidate.getAttribute('placeholder'),
-      candidate.getAttribute('aria-label'),
-      candidate.getAttribute('data-testid'),
-      candidate.getAttribute('role')
-    ]
-      .filter(Boolean)
-      .join(' ')
-  ).toLowerCase();
-
-  let score = 0;
-  if (candidate.id === 'prompt-textarea') {
-    score += 500;
-  }
-  if (candidate.closest('form')) {
-    score += 120;
-  }
-  if (candidate instanceof HTMLTextAreaElement) {
-    score += 80;
-  }
-  if (candidate.matches('div[contenteditable="true"]')) {
-    score += 40;
-  }
-  if (candidate.getAttribute('role') === 'textbox') {
-    score += 40;
-  }
-  if (/prompt|message|ask|chatgpt|question|send|发送|提问|问题|消息/.test(label)) {
-    score += 140;
-  }
-  if (candidate.getAttribute('placeholder')) {
-    score += 30;
-  }
-
-  score += Math.min(200, Math.round(rect.width / 4));
-  score += Math.min(120, Math.round(rect.height * 2));
-  score += Math.max(0, Math.round(rect.top / 3));
-  score += Math.max(0, Math.round((window.innerHeight - Math.max(0, window.innerHeight - rect.bottom)) / 6));
-
-  return score;
-}
-
-function describeComposerCandidate(candidate: HTMLElement | HTMLTextAreaElement): Record<string, unknown> {
-  const rect = candidate.getBoundingClientRect();
-  return {
-    tag: candidate.tagName,
-    id: candidate.id || null,
-    name: candidate.getAttribute('name'),
-    placeholder: candidate.getAttribute('placeholder'),
-    ariaLabel: candidate.getAttribute('aria-label'),
-    dataTestId: candidate.getAttribute('data-testid'),
-    role: candidate.getAttribute('role'),
-    hasForm: Boolean(candidate.closest('form')),
-    rect: {
-      top: Math.round(rect.top),
-      left: Math.round(rect.left),
-      width: Math.round(rect.width),
-      height: Math.round(rect.height)
-    },
-    score: scoreComposerCandidate(candidate)
-  };
-}
-
-function findComposer(): HTMLElement | HTMLTextAreaElement | null {
-  const candidates = getComposerCandidates()
-    .map((candidate) => ({
-      candidate,
-      score: scoreComposerCandidate(candidate)
-    }))
-    .filter((entry) => Number.isFinite(entry.score))
-    .sort((left, right) => right.score - left.score);
-
-  return candidates[0]?.candidate ?? null;
-}
-
-async function waitForComposer(timeoutMs = 20_000): Promise<HTMLElement | HTMLTextAreaElement> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const composer = findComposer();
-    if (composer) {
-      return composer;
-    }
-    await sleep(250);
-  }
-
-  throw new Error('ChatGPT composer did not appear in time.');
-}
-
-function getComposerValueLength(composer: HTMLElement | HTMLTextAreaElement): number {
-  return composer instanceof HTMLTextAreaElement
-    ? composer.value.length
-    : compactWhitespace(composer.textContent || '').length;
-}
-
-function refreshComposerReference(
-  composer: HTMLElement | HTMLTextAreaElement
-): HTMLElement | HTMLTextAreaElement {
-  return findComposer() ?? composer;
-}
-
-async function focusComposerForFollowUp(timeoutMs = 5_000): Promise<void> {
-  const composer = await waitForComposer(timeoutMs);
-  composer.click();
-  composer.focus();
-
-  if (composer instanceof HTMLTextAreaElement) {
-    const nextPosition = composer.value.length;
-    composer.setSelectionRange(nextPosition, nextPosition);
-  }
-
-  recordAutomationLog('Composer focused for manual follow-up', {
-    composerCandidate: describeComposerCandidate(composer)
-  });
-}
-
-function describeComposerCandidateForLog(
-  composer: HTMLElement | HTMLTextAreaElement,
-  fallback?: Record<string, unknown>
-): Record<string, unknown> {
-  if (composer.isConnected) {
-    const description = describeComposerCandidate(composer);
-    const rect = description.rect as Record<string, number> | undefined;
-    if (rect && ((rect.width ?? 0) > 0 || (rect.height ?? 0) > 0)) {
-      return description;
-    }
-  }
-
-  return fallback ?? describeComposerCandidate(composer);
-}
-
-function fillComposer(
-  composer: HTMLElement | HTMLTextAreaElement,
-  prompt: string,
-  inputType: 'insertText' | 'insertFromPaste' = 'insertText'
-): void {
-  composer.click();
-  composer.focus();
-
-  if (composer instanceof HTMLTextAreaElement) {
-    composer.setSelectionRange(0, composer.value.length);
-    composer.dispatchEvent(
-      new InputEvent('beforeinput', {
-        bubbles: true,
-        cancelable: true,
-        data: prompt,
-        inputType
-      })
-    );
-    try {
-      composer.setRangeText(prompt, 0, composer.value.length, 'end');
-    } catch {
-      // Fall back to the native setter below if setRangeText is unavailable.
-    }
-    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-    setter?.call(composer, prompt);
-    composer.dispatchEvent(
-      new InputEvent('input', {
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-        data: prompt,
-        inputType
-      })
-    );
-    composer.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'a', code: 'KeyA' }));
-    composer.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'a', code: 'KeyA' }));
-    composer.dispatchEvent(new Event('change', { bubbles: true }));
-    return;
-  }
-
-  const selection = window.getSelection();
-  const range = document.createRange();
-  range.selectNodeContents(composer);
-  selection?.removeAllRanges();
-  selection?.addRange(range);
-
-  try {
-    if (prompt) {
-      document.execCommand('insertText', false, prompt);
-    } else {
-      // insertText with an empty string is a no-op, so deleting the selection is the
-      // only way to actually empty a contenteditable composer.
-      document.execCommand('delete');
-    }
-  } catch {
-    composer.textContent = prompt;
-  }
-
-  composer.dispatchEvent(
-    new InputEvent('input', {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      data: prompt,
-      inputType
-    })
-  );
-}
-
-function countSignificantChars(value: string): number {
-  return value.replace(/\s+/g, '').length;
-}
-
-// A ProseMirror composer renders the prompt's blank lines as separate paragraphs, so its
-// textContent has no separator at all where the prompt had a newline. Comparing raw or
-// whitespace-collapsed lengths therefore always came up short and the composer was filled
-// twice on every branch. Compare the characters that actually matter instead.
-function getComposerSignificantLength(composer: HTMLElement | HTMLTextAreaElement): number {
-  return countSignificantChars(
-    composer instanceof HTMLTextAreaElement ? composer.value : composer.textContent ?? ''
-  );
-}
-
-async function fillComposerWithStrategies(
-  composer: HTMLElement | HTMLTextAreaElement,
-  prompt: string
-): Promise<{
-  composer: HTMLElement | HTMLTextAreaElement;
-  strategy: 'insertText' | 'insertFromPaste';
-  valueLength: number;
-}> {
-  const strategies: Array<'insertText' | 'insertFromPaste'> = ['insertText', 'insertFromPaste'];
-  let activeComposer = composer;
-  let bestResult = {
-    composer: activeComposer,
-    strategy: strategies[0],
-    valueLength: getComposerValueLength(activeComposer)
-  };
-
-  for (const strategy of strategies) {
-    fillComposer(activeComposer, prompt, strategy);
-    await sleep(120);
-    activeComposer = refreshComposerReference(activeComposer);
-    const valueLength = getComposerValueLength(activeComposer);
-    recordAutomationLog('Composer fill strategy attempted', {
-      strategy,
-      valueLength,
-      significantLength: getComposerSignificantLength(activeComposer),
-      expectedSignificantLength: countSignificantChars(prompt),
-      composerCandidate: describeComposerCandidateForLog(activeComposer)
-    });
-
-    if (valueLength >= bestResult.valueLength) {
-      bestResult = {
-        composer: activeComposer,
-        strategy,
-        valueLength
-      };
-    }
-
-    if (getComposerSignificantLength(activeComposer) >= countSignificantChars(prompt)) {
-      return {
-        composer: activeComposer,
-        strategy,
-        valueLength
-      };
-    }
-  }
-
-  return bestResult;
-}
-
-function getSendButtonCandidates(scope: ParentNode): HTMLElement[] {
-  return queryMany<HTMLElement>(
-    [
-      'button',
-      '[role="button"]',
-      'input[type="submit"]',
-      'input[type="image"]',
-      '[data-testid="send-button"]'
-    ],
-    scope
-  );
-}
-
-function describeSendButtonCandidate(
-  candidate: HTMLElement,
-  composer?: HTMLElement | HTMLTextAreaElement | null,
-  score = scoreSendButtonCandidate(candidate, composer)
-): Record<string, unknown> {
-  const rect = candidate.getBoundingClientRect();
-  const profile = getSendCandidateProfile(candidate, composer);
-  return {
-    tag: candidate.tagName,
-    role: candidate.getAttribute('role'),
-    type: candidate instanceof HTMLButtonElement ? candidate.type : null,
-    ariaLabel: candidate.getAttribute('aria-label'),
-    title: candidate.getAttribute('title'),
-    dataTestId: candidate.getAttribute('data-testid'),
-    label: getActionLabel(candidate),
-    disabled: isDisabledElement(candidate),
-    explicitSend: profile.explicitSend,
-    negative: profile.negative,
-    temporaryChat: profile.temporaryChat,
-    submitLike: profile.submitLike,
-    sameForm: profile.sameForm,
-    rect: {
-      top: Math.round(rect.top),
-      left: Math.round(rect.left),
-      width: Math.round(rect.width),
-      height: Math.round(rect.height)
-    },
-    score
-  };
-}
-
-function getTemporaryChatControlCandidates(scope: ParentNode): HTMLElement[] {
-  const selectors = [
-    'button[aria-label*="临时聊天"]',
-    'button[title*="临时聊天"]',
-    '[role="button"][aria-label*="临时聊天"]',
-    '[role="button"][title*="临时聊天"]',
-    'button[aria-label*="temporary" i]',
-    'button[title*="temporary" i]',
-    '[role="button"][aria-label*="temporary" i]',
-    '[role="button"][title*="temporary" i]'
-  ];
-  const seen = new Set<HTMLElement>();
-  const matches = queryMany<HTMLElement>(selectors, scope);
-  const buttons = getSendButtonCandidates(scope).filter((candidate) => isTemporaryChatControl(candidate));
-
-  return [...matches, ...buttons].filter((candidate) => {
-    if (seen.has(candidate)) {
-      return false;
-    }
-    seen.add(candidate);
-    return true;
-  });
-}
-
-function getComposerSearchScopes(
-  composer?: HTMLElement | HTMLTextAreaElement | null
-): ParentNode[] {
-  const scopes: ParentNode[] = [];
-  const localScope = composer?.closest('form') ?? composer?.parentElement ?? null;
-  if (localScope) {
-    scopes.push(localScope);
-  }
-  scopes.push(document);
-  return scopes;
-}
-
-function findDirectTemporaryChatControl(
-  composer?: HTMLElement | HTMLTextAreaElement | null,
-  targetState: 'active' | 'any' = 'any'
-): HTMLElement | null {
-  const activeSelectors = [
-    'button[aria-label*="临时聊天"][aria-pressed="true"]',
-    'button[aria-label*="临时聊天"][aria-checked="true"]',
-    '[role="button"][aria-label*="临时聊天"][aria-pressed="true"]',
-    '[role="button"][aria-label*="临时聊天"][aria-checked="true"]',
-    'button[aria-label*="temporary" i][aria-pressed="true"]',
-    'button[aria-label*="temporary" i][aria-checked="true"]',
-    '[role="button"][aria-label*="temporary" i][aria-pressed="true"]',
-    '[role="button"][aria-label*="temporary" i][aria-checked="true"]'
-  ];
-  const anySelectors = [
-    'button[aria-label*="临时聊天"]',
-    'button[title*="临时聊天"]',
-    '[role="button"][aria-label*="临时聊天"]',
-    '[role="button"][title*="临时聊天"]',
-    'button[aria-label*="temporary" i]',
-    'button[title*="temporary" i]',
-    '[role="button"][aria-label*="temporary" i]',
-    '[role="button"][title*="temporary" i]'
-  ];
-
-  for (const scope of getComposerSearchScopes(composer)) {
-    const direct =
-      targetState === 'active'
-        ? queryOne<HTMLElement>(activeSelectors, scope)
-        : queryOne<HTMLElement>(anySelectors, scope);
-    if (direct) {
-      return direct;
-    }
-  }
-
-  return null;
-}
-
-function scoreTemporaryChatCandidate(
-  candidate: HTMLElement,
-  composer?: HTMLElement | HTMLTextAreaElement | null
-): number {
-  if (isDisabledElement(candidate) || !isTemporaryChatControl(candidate)) {
-    return Number.NEGATIVE_INFINITY;
-  }
-
-  const rect = candidate.getBoundingClientRect();
-  const composerRect = composer?.getBoundingClientRect();
-  const inferredState = inferTemporaryChatState(candidate);
-  let score = 0;
-
-  if (isElementVisible(candidate)) {
-    score += 120;
-  }
-  if (composer?.closest('form') && candidate.closest('form') === composer.closest('form')) {
-    score += 250;
-  }
-  if (candidate instanceof HTMLButtonElement && candidate.type === 'submit') {
-    score += 120;
-  }
-  if (inferredState === 'active') {
-    score += 180;
-  }
-  if (inferredState === 'inactive') {
-    score += 60;
-  }
-  if (composerRect) {
-    const horizontalGap = Math.abs(rect.left - composerRect.right);
-    const verticalGap = Math.abs(rect.top - composerRect.top);
-    score += Math.max(0, 200 - Math.round(horizontalGap));
-    score += Math.max(0, 140 - Math.round(verticalGap));
-  }
-
-  return score;
-}
-
-function describeTemporaryChatCandidate(
-  candidate: HTMLElement,
-  composer?: HTMLElement | HTMLTextAreaElement | null,
-  score = scoreTemporaryChatCandidate(candidate, composer)
-): Record<string, unknown> {
-  return {
-    ...describeSendButtonCandidate(candidate, composer, score),
-    inferredState: inferTemporaryChatState(candidate)
-  };
-}
-
-function activateControl(candidate: HTMLElement): void {
-  candidate.focus();
-  const rect = candidate.getBoundingClientRect();
-  const eventInit: MouseEventInit = {
-    bubbles: true,
-    cancelable: true,
-    composed: true,
-    clientX: rect.left + Math.max(1, rect.width / 2),
-    clientY: rect.top + Math.max(1, rect.height / 2)
-  };
-
-  if (window.PointerEvent) {
-    ['pointerdown', 'pointerup'].forEach((type) => {
-      candidate.dispatchEvent(
-        new window.PointerEvent(type, {
-          ...eventInit,
-          pointerId: 1,
-          pointerType: 'mouse',
-          isPrimary: true
-        })
+  const messages: CapturedMessage[] = candidate.messages
+    .filter((message): message is CapturedMessage => {
+      const entry = message as Partial<CapturedMessage> | null;
+      return (
+        Boolean(entry) &&
+        (entry!.role === 'user' || entry!.role === 'assistant') &&
+        typeof entry!.text === 'string' &&
+        typeof entry!.ordinal === 'number'
       );
-    });
-  }
-
-  ['mousedown', 'mouseup', 'click'].forEach((type) => {
-    candidate.dispatchEvent(new MouseEvent(type, eventInit));
-  });
-}
-
-function getRankedTemporaryChatControls(
-  composer?: HTMLElement | HTMLTextAreaElement | null
-): Array<{ candidate: HTMLElement; score: number }> {
-  const seen = new Set<HTMLElement>();
-  return getComposerSearchScopes(composer)
-    .flatMap((scope) => getTemporaryChatControlCandidates(scope))
-    .filter((candidate) => {
-      if (seen.has(candidate)) {
-        return false;
-      }
-      seen.add(candidate);
-      return true;
     })
-    .map((candidate) => ({
-      candidate,
-      score: scoreTemporaryChatCandidate(candidate, composer)
-    }))
-    .filter((entry) => Number.isFinite(entry.score))
-    .sort((left, right) => right.score - left.score);
+    .map((message) => ({
+      role: message.role,
+      text: message.text,
+      partial: message.partial === true,
+      providerMessageId: typeof message.providerMessageId === 'string' ? message.providerMessageId : null,
+      ordinal: message.ordinal
+    }));
+  const capture =
+    candidate.capture === 'captured-through' || candidate.capture === 'partial' ? candidate.capture : 'link-only';
+  return { messages, capture };
 }
 
-async function ensurePersistentChatMode(
-  composer: HTMLElement | HTMLTextAreaElement
-): Promise<void> {
-  const directActiveControl = findDirectTemporaryChatControl(composer, 'active');
-  const directAnyControl = directActiveControl ?? findDirectTemporaryChatControl(composer, 'any');
-  const candidates = getRankedTemporaryChatControls(composer);
-  recordAutomationLog('Detected temporary chat controls', {
-    directActiveControl: directActiveControl
-      ? describeTemporaryChatCandidate(directActiveControl, composer)
-      : null,
-    directAnyControl: directAnyControl ? describeTemporaryChatCandidate(directAnyControl, composer) : null,
-    candidates: candidates
-      .slice(0, 8)
-      .map((entry) => describeTemporaryChatCandidate(entry.candidate, composer, entry.score))
-  });
+/* ---------------- capture watcher (runs in the branch page) ---------------- */
 
-  const primaryCandidate = directActiveControl ?? directAnyControl ?? candidates[0]?.candidate ?? null;
-  const primaryScore = primaryCandidate ? scoreTemporaryChatCandidate(primaryCandidate, composer) : undefined;
+/* ---------------- source-scoped question list ---------------- */
 
-  if (!primaryCandidate) {
-    return;
+function ensureQuestionList(): HTMLDivElement {
+  if (!questionListEl) {
+    questionListEl = document.createElement('div');
+    questionListEl.id = 'aside-qlist';
+    questionListEl.className = 'aside-panel aside-qlist-panel';
+    questionListEl.hidden = true;
   }
-
-  const primaryState = inferTemporaryChatState(primaryCandidate);
-
-  if (primaryState === 'inactive') {
-    recordAutomationLog('Temporary chat control is present but inactive', {
-      control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore),
-      toggledOff: false
-    });
-    return;
-  }
-
-  if (primaryState === 'unknown') {
-    // Clicking a toggle whose state we cannot read could switch temporary chat ON, which
-    // is the outcome this function exists to avoid. Leave it alone and let the missing
-    // /c/ URL downstream be the signal if the chat really was temporary.
-    recordAutomationLog('Temporary chat control state is unreadable; leaving it untouched', {
-      control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore)
-    });
-    return;
-  }
-
-  recordAutomationLog('Temporary chat mode appears active; disabling it before send', {
-    control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore),
-    toggledOff: false
-  });
-  // A bare .click() is ignored by toggles that listen for pointer events, which is why
-  // the temporary-chat path already uses the full synthetic activation sequence.
-  activateControl(primaryCandidate);
-
-  const deadline = Date.now() + 4_000;
-  while (Date.now() < deadline) {
-    const refreshedActive = findDirectTemporaryChatControl(composer, 'active');
-    const refreshedAny = refreshedActive ?? findDirectTemporaryChatControl(composer, 'any');
-    if (!refreshedAny) {
-      recordAutomationLog('Temporary chat control disappeared after toggle', {
-        toggledOff: true
-      });
-      return;
-    }
-
-    const nextState = inferTemporaryChatState(refreshedAny);
-    if (nextState === 'inactive') {
-      recordAutomationLog('Temporary chat mode disabled successfully', {
-        control: describeTemporaryChatCandidate(refreshedAny, composer),
-        toggledOff: true
-      });
-      return;
-    }
-
-    await sleep(200);
-  }
-
-  throw new Error(
-    'ChatGPT is in temporary-chat mode; persistent branch creation cannot continue.'
-  );
+  return mountInExtensionHost(questionListEl);
 }
 
-async function ensureTemporaryChatMode(
-  composer: HTMLElement | HTMLTextAreaElement
-): Promise<TemporaryChatVerification> {
-  const directActiveControl = findDirectTemporaryChatControl(composer, 'active');
-  const directAnyControl = directActiveControl ?? findDirectTemporaryChatControl(composer, 'any');
-  const candidates = getRankedTemporaryChatControls(composer);
-  recordAutomationLog('Detected temporary chat controls for temporary branch', {
-    directActiveControl: directActiveControl
-      ? describeTemporaryChatCandidate(directActiveControl, composer)
-      : null,
-    directAnyControl: directAnyControl ? describeTemporaryChatCandidate(directAnyControl, composer) : null,
-    candidates: candidates
-      .slice(0, 8)
-      .map((entry) => describeTemporaryChatCandidate(entry.candidate, composer, entry.score))
-  });
-
-  const primaryCandidate = directActiveControl ?? directAnyControl ?? candidates[0]?.candidate ?? null;
-  const primaryScore = primaryCandidate ? scoreTemporaryChatCandidate(primaryCandidate, composer) : undefined;
-
-  if (!primaryCandidate) {
-    throw new Error(
-      'The temporary-chat control could not be found, so this branch was not sent. Turn temporary chat on in ChatGPT and try again, or switch this branch to Persistent.'
-    );
-  }
-
-  const primaryState = inferTemporaryChatState(primaryCandidate);
-  if (primaryState === 'active') {
-    recordAutomationLog('Temporary chat mode is already active', {
-      control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore)
-    });
-    return 'confirmed';
-  }
-
-  if (primaryState === 'unknown') {
-    // Fail closed: a temporary branch exists so the passage stays out of chat history,
-    // and guessing here is how it ends up saved.
-    throw new Error(
-      'ChatGPT did not report whether temporary chat is on, so this branch was not sent. Turn temporary chat on in ChatGPT and try again, or switch this branch to Persistent.'
-    );
-  }
-
-  recordAutomationLog('Temporary chat mode appears inactive; enabling it before send', {
-    control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore)
-  });
-  activateControl(primaryCandidate);
-
-  const deadline = Date.now() + 4_000;
-  while (Date.now() < deadline) {
-    const refreshedActive = findDirectTemporaryChatControl(composer, 'active');
-    const refreshedAny = refreshedActive ?? findDirectTemporaryChatControl(composer, 'any');
-    if (!refreshedAny) {
-      recordAutomationLog('Temporary chat control disappeared after activation; proceeding optimistically', {
-        verification: 'assumed'
-      });
-      return 'assumed';
-    }
-
-    const nextState = inferTemporaryChatState(refreshedAny);
-    if (nextState === 'active') {
-      recordAutomationLog('Temporary chat mode enabled successfully', {
-        control: describeTemporaryChatCandidate(refreshedAny, composer)
-      });
-      return 'confirmed';
-    }
-
-    await sleep(200);
-  }
-
-  recordAutomationLog('Temporary chat mode could not be confirmed after activation; proceeding optimistically', {
-    control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore),
-    verification: 'assumed'
-  });
-  return 'assumed';
+function questionListCount(): number {
+  return questionListEntries.filter((entry) => entry.question.lifecycle === 'active').length;
 }
 
-async function ensureBranchKindMode(
-  branchKind: BranchKind,
-  composer: HTMLElement | HTMLTextAreaElement
-): Promise<TemporaryChatVerification> {
-  if (branchKind === 'temporary') {
-    return ensureTemporaryChatMode(composer);
-  }
-
-  await ensurePersistentChatMode(composer);
-  return 'confirmed';
-}
-
-function scoreSendButtonCandidate(
-  candidate: HTMLElement,
-  composer?: HTMLElement | HTMLTextAreaElement | null
-): number {
-  if (!isElementVisible(candidate) || isDisabledElement(candidate)) {
-    return Number.NEGATIVE_INFINITY;
-  }
-
-  const profile = getSendCandidateProfile(candidate, composer);
-  const rect = candidate.getBoundingClientRect();
-  const composerRect = composer?.getBoundingClientRect();
-  let score = 0;
-
-  if (!isAcceptableSendControl(profile)) {
-    return Number.NEGATIVE_INFINITY;
-  }
-
-  if (candidate.getAttribute('data-testid') === 'send-button') {
-    score += 900;
-  }
-  if (profile.submitLike) {
-    score += 500;
-  }
-  if (profile.explicitSend) {
-    score += 400;
-  }
-  if (profile.sameForm) {
-    score += 200;
-  }
-  if (!profile.label && candidate.querySelector('svg')) {
-    score += 60;
-  }
-  if (composerRect) {
-    const horizontalGap = Math.abs(rect.left - composerRect.right);
-    const verticalGap = Math.abs(rect.top - composerRect.top);
-    score += Math.max(0, 220 - Math.round(horizontalGap));
-    score += Math.max(0, 140 - Math.round(verticalGap));
-    if (profile.sameForm) {
-      score += Math.max(0, 180 - Math.round(horizontalGap * 1.4));
-    }
-  }
-
-  return score;
-}
-
-function getRankedSendButtons(
-  composer?: HTMLElement | HTMLTextAreaElement | null
-): Array<{ candidate: HTMLElement; score: number }> {
-  const scopes: ParentNode[] = [];
-  const localScope = composer?.closest('form') ?? composer?.parentElement ?? null;
-  if (localScope) {
-    scopes.push(localScope);
-  }
-  scopes.push(document);
-
-  const seen = new Set<HTMLElement>();
-  const ranked = scopes
-    .flatMap((scope) => getSendButtonCandidates(scope))
-    .filter((candidate) => {
-      if (seen.has(candidate)) {
-        return false;
-      }
-      seen.add(candidate);
-      return true;
-    })
-    .map((candidate) => ({
-      candidate,
-      score: scoreSendButtonCandidate(candidate, composer)
-    }))
-    .filter((entry) => Number.isFinite(entry.score))
-    .sort((left, right) => right.score - left.score);
-
-  const sameForm = ranked.filter((entry) => getSendCandidateProfile(entry.candidate, composer).sameForm);
-  if (sameForm.length) {
-    const nonSameForm = ranked.filter((entry) => !getSendCandidateProfile(entry.candidate, composer).sameForm);
-    return [...sameForm, ...nonSameForm];
-  }
-
-  return ranked;
-}
-
-async function waitForAcceptedGenerationSignalOrNull(
-  baselineTurnCount: number,
-  initialUrl: string,
-  timeoutMs = 2_500
-): Promise<'persistent_url' | 'stop_button' | 'transcript_growth' | null> {
-  try {
-    return await waitForAcceptedGenerationSignal(baselineTurnCount, initialUrl, timeoutMs);
-  } catch {
-    return null;
-  }
-}
-
-function findStopButton(): HTMLButtonElement | null {
-  return queryOne<HTMLButtonElement>([
-    'button[aria-label*="Stop"]',
-    'button[aria-label*="stop"]',
-    'button[aria-label*="停止"]'
-  ]);
-}
-
-function isPersistentConversationUrl(url: string): boolean {
-  try {
-    return /\/c\/[^/?#]+/.test(new URL(url).pathname);
-  } catch {
-    return false;
-  }
-}
-
-async function waitForAcceptedGenerationSignal(
-  baselineTurnCount: number,
-  initialUrl: string,
-  timeoutMs = 12_000
-): Promise<'persistent_url' | 'stop_button' | 'transcript_growth'> {
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    const currentUrl = normalizeChatUrl(window.location.href);
-    if (currentUrl !== initialUrl && isPersistentConversationUrl(currentUrl)) {
-      return 'persistent_url';
-    }
-
-    if (findStopButton()) {
-      return 'stop_button';
-    }
-
-    if (countTranscriptTurns(document) > baselineTurnCount) {
-      return 'transcript_growth';
-    }
-
-    await sleep(250);
-  }
-
-  throw new Error(
-    'ChatGPT did not start generating the branch question. No persistent chat URL, stop button, or new transcript turn appeared.'
-  );
-}
-
-async function submitComposer(
-  prompt: string,
-  branchKind: BranchKind
-): Promise<{
-  acceptedSignal: 'persistent_url' | 'stop_button' | 'transcript_growth';
-  temporaryVerification: TemporaryChatVerification;
-}> {
-  recordAutomationLog('Submitting first branch prompt', {
-    promptLength: prompt.length,
-    currentUrl: normalizeChatUrl(window.location.href)
-  });
-  const initialUrl = normalizeChatUrl(window.location.href);
-  const baselineTurnCount = countTranscriptTurns(document);
-  let composer = await waitForComposer();
-  let composerSnapshot = describeComposerCandidate(composer);
-  let form = composer.closest('form');
-  recordAutomationLog('Composer found for first branch prompt', {
-    composerTag: composer.tagName,
-    composerCandidate: composerSnapshot,
-    baselineTurnCount,
-    hasForm: form instanceof HTMLFormElement
-  });
-  const fillResult = await fillComposerWithStrategies(composer, prompt);
-  composer = fillResult.composer;
-  composerSnapshot = describeComposerCandidateForLog(composer, composerSnapshot);
-  form = composer.closest('form');
-  recordAutomationLog('Composer filled for first branch prompt', {
-    strategy: fillResult.strategy,
-    valueLength: fillResult.valueLength,
-    composerCandidate: composerSnapshot
-  });
-  await sleep(450);
-  const temporaryVerification = await ensureBranchKindMode(branchKind, composer);
-
-  // Toggling temporary chat navigates ChatGPT to a fresh chat and remounts the composer.
-  // Without re-checking, the prompt that was typed a moment ago is silently gone and the
-  // send button click posts nothing at all.
-  composer = refreshComposerReference(composer);
-  const significantAfterToggle = getComposerSignificantLength(composer);
-  const expectedSignificant = countSignificantChars(prompt);
-
-  // Only react to the composer actually losing the prompt: a rich-text composer can
-  // normalize its content and come back a little short, and refilling on that would cost
-  // a needless round trip on every branch.
-  if (significantAfterToggle < expectedSignificant / 2) {
-    // The toggle can itself be a submit control, in which case the composer is empty
-    // because the prompt was already sent. Refilling there would ask twice.
-    const alreadyAccepted = await waitForAcceptedGenerationSignalOrNull(
-      baselineTurnCount,
-      initialUrl,
-      0
-    );
-
-    if (alreadyAccepted) {
-      recordAutomationLog('Chat-mode toggle submitted the prompt; not refilling', {
-        acceptedSignal: alreadyAccepted,
-        branchKind
-      });
-      return { acceptedSignal: alreadyAccepted, temporaryVerification };
-    }
-
-    recordAutomationLog('Composer lost the prompt after the chat-mode toggle; refilling', {
-      significantLength: significantAfterToggle,
-      expectedSignificantLength: expectedSignificant,
-      branchKind
-    });
-    const refill = await fillComposerWithStrategies(composer, prompt);
-    composer = refill.composer;
-    fillResult.composer = refill.composer;
-    fillResult.strategy = refill.strategy;
-    fillResult.valueLength = refill.valueLength;
-    composerSnapshot = describeComposerCandidateForLog(composer, composerSnapshot);
-    form = composer.closest('form');
-  }
-
-  const logVisibleButtonContext = (label: string) => {
-    const currentComposer = refreshComposerReference(composer);
-    const currentSnapshot = describeComposerCandidateForLog(currentComposer, composerSnapshot);
-    recordAutomationLog(label, {
-      composerCandidate: currentSnapshot,
-      buttonCandidates: getSendButtonCandidates(document)
-        .filter((candidate) => isElementVisible(candidate))
-        .slice(0, 16)
-        .map((candidate) => describeSendButtonCandidate(candidate, currentComposer)),
-      temporaryChatCandidates: getRankedTemporaryChatControls(currentComposer)
-        .slice(0, 8)
-        .map((entry) => describeTemporaryChatCandidate(entry.candidate, currentComposer, entry.score)),
-      temporaryVerification
-    });
-  };
-
-  let significantLengthBeforeSend = 0;
-
-  const attemptClickSendButton = async (
-    stage: 'primary' | 'final_rescan',
-    timeoutMs = 3_500
-  ): Promise<'persistent_url' | 'stop_button' | 'transcript_growth' | null> => {
-    composer = refreshComposerReference(composer);
-    composerSnapshot = describeComposerCandidateForLog(composer, composerSnapshot);
-    form = composer.closest('form');
-    const rankedSendButtons = getRankedSendButtons(composer);
-    const sendButton = rankedSendButtons[0]?.candidate ?? null;
-    recordAutomationLog(
-      stage === 'primary'
-        ? 'Resolved send button for first branch prompt'
-        : 'Resolved send button after fallback re-scan',
-      {
-        found: Boolean(sendButton),
-        sendButtonLabel: sendButton ? getActionLabel(sendButton) : '(none)',
-        sendButton: sendButton
-          ? describeSendButtonCandidate(sendButton, composer, rankedSendButtons[0]?.score)
-          : null,
-        composerCandidate: composerSnapshot,
-        sendButtonCandidates: rankedSendButtons
-          .slice(0, 8)
-          .map((entry) => describeSendButtonCandidate(entry.candidate, composer, entry.score))
-      }
-    );
-
-    if (!sendButton) {
-      return null;
-    }
-
-    recordAutomationLog(
-      stage === 'primary'
-        ? 'Clicking ChatGPT send button for first branch prompt'
-        : 'Clicking send button after fallback re-scan',
-      {
-        sendButtonLabel: getActionLabel(sendButton),
-        sendButton: describeSendButtonCandidate(sendButton, composer, rankedSendButtons[0]?.score)
-      }
-    );
-    significantLengthBeforeSend = getComposerSignificantLength(composer);
-    activateControl(sendButton);
-
-    const signal = await waitForAcceptedGenerationSignalOrNull(
-      baselineTurnCount,
-      initialUrl,
-      timeoutMs
-    );
-    if (signal) {
-      recordAutomationLog('ChatGPT accepted the prompt after send button click', {
-        stage,
-        acceptedSignal: signal,
-        currentUrl: normalizeChatUrl(window.location.href)
-      });
-      return signal;
-    }
-
-    recordAutomationLog('No generation signal appeared after send button click', {
-      stage,
-      timeoutMs,
-      currentUrl: normalizeChatUrl(window.location.href)
-    });
-    return null;
-  };
-
-  // ChatGPT clears the composer as soon as it accepts a prompt. If that already happened,
-  // every remaining fallback would post the same question a second time. Requiring that
-  // the composer held the prompt immediately before the click keeps a composer that was
-  // merely remounted from looking like a successful send.
-  const promptLooksAccepted = (): boolean =>
-    significantLengthBeforeSend > 0 &&
-    getComposerSignificantLength(refreshComposerReference(composer)) === 0;
-
-  const waitOutAcceptedPrompt = async (
-    stage: string
-  ): Promise<{
-    acceptedSignal: 'persistent_url' | 'stop_button' | 'transcript_growth';
-    temporaryVerification: TemporaryChatVerification;
-  }> => {
-    recordAutomationLog('Composer was cleared after submit; waiting instead of resending', {
-      stage,
-      currentUrl: normalizeChatUrl(window.location.href)
-    });
-    const acceptedSignal = await waitForAcceptedGenerationSignal(baselineTurnCount, initialUrl);
-    return { acceptedSignal, temporaryVerification };
-  };
-
-  const primarySendSignal = await attemptClickSendButton('primary');
-  if (primarySendSignal) {
-    return { acceptedSignal: primarySendSignal, temporaryVerification };
-  }
-
-  if (promptLooksAccepted()) {
-    return waitOutAcceptedPrompt('after_send_button');
-  }
-
-  logVisibleButtonContext('No enabled send button produced a generation signal near the composer');
-  recordAutomationLog('Dispatching Enter key fallback for first branch prompt', {
-    hasForm: form instanceof HTMLFormElement
-  });
-  // Record what the composer held before each attempt, not just before the button click:
-  // on a page where Enter is the only way to send, this is the signal that tells the next
-  // fallback the prompt is already gone.
-  significantLengthBeforeSend = getComposerSignificantLength(composer);
-  ['keydown', 'keypress', 'keyup'].forEach((eventType) => {
-    composer.dispatchEvent(
-      new KeyboardEvent(eventType, {
-        bubbles: true,
-        cancelable: true,
-        key: 'Enter',
-        code: 'Enter'
-      })
-    );
-  });
-
-  const enterSignal = await waitForAcceptedGenerationSignalOrNull(
-    baselineTurnCount,
-    initialUrl,
-    2_500
-  );
-  if (enterSignal) {
-    recordAutomationLog('ChatGPT accepted the prompt after Enter fallback', {
-      acceptedSignal: enterSignal,
-      currentUrl: normalizeChatUrl(window.location.href)
-    });
-    return { acceptedSignal: enterSignal, temporaryVerification };
-  }
-
-  recordAutomationLog('No generation signal appeared after Enter fallback', {
-    currentUrl: normalizeChatUrl(window.location.href)
-  });
-
-  if (promptLooksAccepted()) {
-    return waitOutAcceptedPrompt('after_enter_fallback');
-  }
-
-  if (form instanceof HTMLFormElement) {
-    recordAutomationLog('Attempting guarded synthetic submit fallback for first branch prompt', {
-      action: 'dispatch-submit-event'
-    });
-    significantLengthBeforeSend = getComposerSignificantLength(refreshComposerReference(composer));
-    form.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true }));
-    const syntheticSignal = await waitForAcceptedGenerationSignalOrNull(
-      baselineTurnCount,
-      initialUrl,
-      2_500
-    );
-    if (syntheticSignal) {
-      recordAutomationLog('ChatGPT accepted the prompt after guarded synthetic submit', {
-        acceptedSignal: syntheticSignal,
-        currentUrl: normalizeChatUrl(window.location.href)
-      });
-      return { acceptedSignal: syntheticSignal, temporaryVerification };
-    }
-
-    recordAutomationLog('No generation signal appeared after guarded synthetic submit', {
-      currentUrl: normalizeChatUrl(window.location.href)
-    });
-  }
-
-  if (promptLooksAccepted()) {
-    return waitOutAcceptedPrompt('after_synthetic_submit');
-  }
-
-  const rescannedSignal = await attemptClickSendButton('final_rescan', 4_500);
-  if (rescannedSignal) {
-    return { acceptedSignal: rescannedSignal, temporaryVerification };
-  }
-
-  logVisibleButtonContext('All embedded submit strategies were attempted without a generation signal');
-
-  const acceptedSignal = await waitForAcceptedGenerationSignal(baselineTurnCount, initialUrl);
-  recordAutomationLog('ChatGPT accepted first branch prompt', {
-    baselineTurnCount,
-    currentTurnCount: countTranscriptTurns(document),
-    acceptedSignal,
-    currentUrl: normalizeChatUrl(window.location.href),
-    stopButtonVisible: Boolean(findStopButton())
-  });
-  return { acceptedSignal, temporaryVerification };
-}
-
-// A temporary chat never gets a /c/<id> URL. ChatGPT rewrites the URL a beat after it
-// starts generating, so sampling it the instant submitComposer returns cannot see a leak.
-async function watchForPersistentConversationUrl(timeoutMs: number): Promise<string | undefined> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const currentUrl = normalizeChatUrl(window.location.href);
-    if (isPersistentConversationUrl(currentUrl)) {
-      return currentUrl;
-    }
-    await sleep(250);
-  }
-
-  return undefined;
-}
-
-async function waitForConversationUrlAfterSubmit(launchUrl: string, timeoutMs = 20_000): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const currentUrl = normalizeChatUrl(window.location.href);
-    if (isPersistentConversationUrl(currentUrl)) {
-      recordAutomationLog('Persistent branch conversation URL detected', { branchChatUrl: currentUrl });
-      return currentUrl;
-    }
-    await sleep(300);
-  }
-
-  const currentUrl = normalizeChatUrl(window.location.href) || launchUrl;
-  recordAutomationLog('Persistent branch conversation URL was not detected before timeout', {
-    launchUrl,
-    currentUrl
-  });
-  throw new Error(
-    `ChatGPT started responding, but the branch never became a persistent chat URL. It stayed at ${currentUrl}.`
-  );
-}
-
-let activeAutomationPanelId: string | undefined;
-let activeAutomationTransport: AutomationTransport | undefined;
-let automationTaskRunning = false;
-let titleWatcherId: number | undefined;
-let observedBranchTitle = '';
-
-// Only ever removes our own prompt. By the time a branch fails the user may already be
-// typing in that window, and wiping their text would be far worse than the stray prompt.
-// A temporary branch that produced a /c/ URL is in the user's permanent history. Report
-// the URL rather than a bare failure, so the panel can offer to open and delete it.
-async function reportTemporaryBranchLeak(
-  branchChatUrl: string,
-  temporaryVerification: TemporaryChatVerification
-): Promise<void> {
-  recordAutomationLog('Temporary branch landed in a persistent conversation', {
-    temporaryVerification,
-    branchChatUrl
-  });
-
-  await sendAutomationEvent({
-    kind: 'failed',
-    reason:
-      temporaryVerification === 'assumed'
-        ? 'ChatGPT saved this branch as a normal conversation because temporary mode could not be confirmed. Open the branch to review or delete it.'
-        : 'ChatGPT saved this branch as a normal conversation even though temporary mode looked active. Open the branch to review or delete it.',
-    branchChatUrl
-  });
-}
-
-function clearComposerAfterFailure(prompt: string): void {
-  try {
-    const marker = compactWhitespace(prompt).slice(0, 60);
-    if (!marker) {
-      return;
-    }
-
-    const composer = findComposer();
-    if (!composer) {
-      return;
-    }
-
-    const current = compactWhitespace(
-      composer instanceof HTMLTextAreaElement ? composer.value : composer.textContent ?? ''
-    );
-    if (!current.startsWith(marker)) {
-      return;
-    }
-
-    fillComposer(composer, '');
-    recordAutomationLog('Cleared the unsent branch prompt out of the composer after a failure');
-  } catch {
-    // Never let cleanup mask the original failure.
-  }
-}
-
-async function sendAutomationEvent(event: BranchPanelEvent): Promise<void> {
-  if (!activeAutomationPanelId || !activeAutomationTransport) {
-    return;
-  }
-
-  if (activeAutomationTransport === 'frame') {
-    if (isTopFrame()) {
-      return;
-    }
-
-    window.parent.postMessage(
-      {
-        source: 'aside',
-        target: 'parent',
-        type: 'SB_FRAME_EVENT',
-        panelId: activeAutomationPanelId,
-        event
-      } satisfies FrameBranchEventMessage,
-      window.location.origin
-    );
-    return;
-  }
-
+async function refreshQuestionList(): Promise<void> {
   if (!hasRuntimeAccess()) {
     return;
   }
+  const scopeKey = currentIdentity(lastKnownUrl).scopeKey;
+  const result = await listQuestionsForScope(scopeKey);
+  questionListEntries = result?.questions ?? [];
+  questionListSourceId = result?.sourceId ?? null;
+  renderQuestionListPanel();
+  renderTabs();
+}
 
+function renderQuestionListPanel(): void {
+  const container = ensureQuestionList();
+  container.hidden = !questionListOpen;
+  if (!questionListOpen) {
+    return;
+  }
+  renderQuestionList(
+    container,
+    questionListEntries,
+    questionListSourceId,
+    questionListFilter,
+    {
+      open: (questionId) => {
+        void openQuestionFromRecord(questionId);
+      },
+      resolve: (entry) => void applyLifecycle(entry, 'ResolveQuestion'),
+      reopen: (entry) => void applyLifecycle(entry, 'ReopenQuestion'),
+      archive: (entry) => void applyLifecycle(entry, 'ArchiveQuestion'),
+      rename: (entry, title) => {
+        void runCommand({ type: 'RenameQuestion', questionId: entry.question.id, baseRev: entry.question.rev, title }).then(
+          () => {
+            const runtime = [...panelRuntimes.values()].find((candidate) => candidate.state.questionId === entry.question.id);
+            if (runtime) {
+              runtime.state.title = title;
+              runtime.state.titleStatus = 'ready';
+              syncPanelUI(runtime);
+              persistPanels(runtime.state.panelId);
+            }
+            return refreshQuestionList();
+          }
+        );
+      },
+      remove: (entry) => void deleteQuestionEverywhere(entry.question.id),
+      exportSource: (sourceId) => void exportSourceAsMarkdown(sourceId),
+      openLibrary: () => {
+        void sendStoreMessage({ type: 'OPEN_LIBRARY' });
+      }
+    },
+    (filter) => {
+      questionListFilter = filter;
+      renderQuestionListPanel();
+    }
+  );
+}
+
+function toggleQuestionList(): void {
+  questionListOpen = !questionListOpen;
+  if (questionListOpen) {
+    yieldHandoffCards();
+  }
+  renderQuestionListPanel();
+  if (questionListOpen) {
+    void refreshQuestionList();
+  }
+}
+
+async function applyLifecycle(entry: QuestionListEntry, type: 'ResolveQuestion' | 'ReopenQuestion' | 'ArchiveQuestion'): Promise<void> {
+  await runCommand({ type, questionId: entry.question.id, baseRev: entry.question.rev });
+  await refreshQuestionList();
+}
+
+/** Explicit deletion: the record, its owned rows, and any panel view of it. */
+async function deleteQuestionEverywhere(questionId: string): Promise<void> {
+  const outcome = await runCommand({ type: 'DeleteQuestion', questionId, descendants: 'reparent' });
+  if (!outcome || outcome.status === 'error') {
+    notifyAside('Aside could not record the deletion; nothing was removed.');
+    return;
+  }
+  const runtime = [...panelRuntimes.values()].find((candidate) => candidate.state.questionId === questionId);
+  if (runtime) {
+    closedPanelIds.add(runtime.state.panelId);
+    runtime.element.remove();
+    panelRuntimes.delete(runtime.state.panelId);
+    void deletePanelRecord(runtime.state.panelId);
+  }
+  // A closed view of this question may still be stored; remove it too.
+  const records = await listPanelRecords();
+  for (const record of records) {
+    if (record.state?.questionId === questionId && !panelRuntimes.has(record.panelId)) {
+      panelRevisions.set(record.panelId, record.rev);
+      void deletePanelRecord(record.panelId);
+    }
+  }
+  questionRevs.delete(questionId);
+  draftRevs.delete(questionId);
+  renderTabs();
+  await refreshQuestionList();
+}
+
+async function exportSourceAsMarkdown(sourceId: string): Promise<void> {
+  const result = await exportSourceMarkdown(sourceId);
+  if (!result) {
+    notifyAside('Export failed: the question database was unreachable.');
+    return;
+  }
   try {
-    await chrome.runtime.sendMessage({
-      type: 'BRANCH_AUTOMATION_EVENT',
-      panelId: activeAutomationPanelId,
-      event
-    });
+    const blob = new Blob([result.markdown], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = result.filename;
+    anchor.style.display = 'none';
+    mountInExtensionHost(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  } catch {
+    try {
+      await navigator.clipboard.writeText(result.markdown);
+      notifyAside('Download was blocked here; the Markdown was copied to your clipboard instead.');
+    } catch {
+      notifyAside('Export could not be downloaded or copied on this page. Use the library page instead.');
+    }
+  }
+}
+
+/** Reopen a question: an existing view if there is one, else a view of the record. */
+async function openQuestionFromRecord(questionId: string): Promise<void> {
+  const mounted = [...panelRuntimes.values()].find((runtime) => runtime.state.questionId === questionId);
+  if (mounted) {
+    expandPanel(mounted.state.panelId);
+    return;
+  }
+
+  const records = await listPanelRecords();
+  const record = records.find((entry) => entry.state?.questionId === questionId);
+  if (record) {
+    const restored = createStateFromRestore(record.state);
+    if (restored) {
+      restored.closedView = false;
+      restored.minimized = false;
+      // A stored live frame is not reloaded on reopen; the saved thread is shown
+      // and continuing is an explicit action.
+      if (restored.status === 'live' || restored.status === 'failed') {
+        restored.archiveOnly = true;
+      }
+      closedPanelIds.delete(record.panelId);
+      panelRevisions.set(record.panelId, record.rev);
+      minimizeOtherPanels(restored.panelId);
+      const runtime = createPanelRuntime(restored);
+      syncMountedUi();
+      persistPanels(runtime.state.panelId);
+      scrollToOrigin(runtime.state.selection);
+      return;
+    }
+  }
+
+  const bundle = await fetchBundle(questionId);
+  if (!bundle) {
+    notifyAside('This question no longer exists.');
+    await refreshQuestionList();
+    return;
+  }
+  const state = createStateFromBundle(bundle);
+  if (!state) {
+    notifyAside('This question cannot be shown here: its saved selection is incomplete.');
+    return;
+  }
+  minimizeOtherPanels(state.panelId);
+  createPanelRuntime(state);
+  questionRevs.set(questionId, bundle.question.rev);
+  draftRevs.set(questionId, bundle.draft?.rev ?? 1);
+  const link = bundle.links.at(-1);
+  if (link) {
+    linkRevs.set(link.id, link.rev);
+  }
+  syncMountedUi();
+  persistPanels(state.panelId);
+  scrollToOrigin(state.selection);
+}
+
+/** A panel view built from the canonical record alone. */
+function createStateFromBundle(bundle: QuestionBundle): BranchPanelState | null {
+  const { question, anchor, source } = bundle;
+  if (!anchor || !source) {
+    return null;
+  }
+  const link = bundle.links.at(-1);
+  const snapshot = bundle.snapshots.at(-1);
+  const rootChatUrl = normalizeChatUrl(source.url);
+  const selection: SelectionPayload = {
+    rootConversationId: source.scopeKey,
+    rootChatUrl,
+    selectedText: anchor.exact,
+    structuredSelectedText: anchor.selectedText,
+    selectedBlocks: [
+      {
+        messageId: anchor.messageId,
+        role: anchor.role,
+        turnIndex: anchor.turnIndex,
+        text: anchor.exact,
+        structuredText: anchor.selectedText,
+        excerpt: anchor.selectedText.slice(0, 160)
+      }
+    ],
+    branchBaseMessageId: anchor.messageId,
+    rangeQuotes: { exact: anchor.exact, prefix: anchor.prefix, suffix: anchor.suffix },
+    fallbackScrollY: anchor.scrollHint
+  };
+  const sent = Boolean(snapshot);
+  return {
+    panelId: randomId('panel'),
+    rootConversationId: source.scopeKey,
+    rootChatUrl,
+    rootProjectUrl: getNonRootContainerUrl(rootChatUrl),
+    selection,
+    context: createContextForSelection(selection),
+    questionId: question.id,
+    linkId: link?.id,
+    snapshotId: snapshot?.id,
+    excludedPlanIds: bundle.draft?.excludedBlockIds,
+    focusPreview: clipText(anchor.selectedText, 280),
+    branchKind: 'persistent',
+    entryAction: question.entryAction,
+    surfaceMode: 'embedded',
+    launchUrl: undefined,
+    branchChatUrl: link?.conversationUrl ?? undefined,
+    creationMode: sent ? 'local_persistent' : 'pending',
+    title: question.title,
+    titleStatus: 'ready',
+    minimized: false,
+    status: sent ? (link?.run === 'failed' ? 'failed' : 'live') : 'draft',
+    statusLabel: sent
+      ? link?.conversationUrl
+        ? 'Saved thread. Continue at the provider when you need more.'
+        : 'Saved thread.'
+      : 'Ask a focused follow-up about this selected passage.',
+    errorMessage: link?.run === 'failed' ? 'The last attempt failed. You can try again.' : undefined,
+    archiveOnly: sent,
+    archive: {
+      messages: bundle.messages.map((message) => ({
+        role: message.role,
+        text: message.text,
+        partial: message.partial,
+        providerMessageId: message.providerMessageId,
+        ordinal: message.ordinal
+      })),
+      capture: link?.capture ?? 'link-only'
+    },
+    initialQuestion: bundle.draft?.text ?? snapshot?.question,
+    initialPrompt: snapshot?.prompt,
+    debugLog: [formatDebugLogEntry('Panel view opened from the question record', { questionId: question.id })],
+    createdAt: question.createdAt,
+    updatedAt: Date.now()
+  };
+}
+
+/* ================================================================== *
+ * Scratch handoffs: the card in the source page, one per session.
+ * ================================================================== */
+
+const handoffCards = new Map<string, HandoffCard>();
+
+async function sendHandoff(message: HandoffRequest): Promise<HandoffResponse | null> {
+  if (!hasRuntimeAccess()) {
+    return null;
+  }
+  try {
+    return (await chrome.runtime.sendMessage(message)) as HandoffResponse;
   } catch (error) {
     if (!isInvalidatedError(error)) {
-      console.warn('[Aside] Failed to forward automation event', error);
+      console.warn('[Aside] Handoff message failed');
     }
+    return null;
   }
 }
 
-function findBranchTitleFromTranscript(): string | null {
-  // The envelope is always on the branch's own answer, so there is no reason to rebuild
-  // the text of every turn on a 1.2s interval.
-  for (const text of getRecentAssistantTexts(3)) {
-    const parsed = stripHiddenTitle(text);
-    if (parsed.title) {
-      return parsed.title;
-    }
-  }
-
-  return null;
+function currentScopeKey(): string {
+  return currentIdentity(lastKnownUrl).scopeKey;
 }
 
-const TITLE_MARKER_PATTERN = /\[\[BRANCH_TITLE:.*?\]\]\s*/i;
-const TITLE_MARKER_OPENING = '[[BRANCH_TITLE:';
+function jumpToHandoffPassage(session: ScratchHandoff): AnchorResult {
+  if (currentScopeKey() !== session.source.scopeKey) {
+    return 'different-conversation';
+  }
+  return scrollToOrigin(session.selection);
+}
 
-// The envelope can arrive split across text nodes while the answer streams, and React
-// re-renders the message afterwards and puts it straight back. So this handles the split
-// case and is safe to call repeatedly.
-function stripTitleEnvelopeFromVisibleMessage(): void {
-  const candidates = queryMany<HTMLElement>([
-    '[data-message-author-role="assistant"] [data-message-content]',
-    'article[data-message-author-role="assistant"] [data-message-content]',
-    '[data-message-author-role="assistant"] .markdown',
-    '[data-message-author-role="assistant"] .prose'
-  ]);
-
-  candidates.forEach((candidate) => {
-    if (!candidate.textContent?.includes(TITLE_MARKER_OPENING)) {
-      return;
-    }
-
-    const walker = document.createTreeWalker(candidate, NodeFilter.SHOW_TEXT);
-    const nodes: Text[] = [];
-    while (walker.nextNode()) {
-      nodes.push(walker.currentNode as Text);
-    }
-
-    const combined = nodes.map((node) => node.nodeValue ?? '').join('');
-    const match = combined.match(TITLE_MARKER_PATTERN);
-    if (!match || match.index === undefined) {
-      return;
-    }
-
-    const markerStart = match.index;
-    const markerEnd = markerStart + match[0].length;
-
-    let cursor = 0;
-    nodes.forEach((node) => {
-      const value = node.nodeValue ?? '';
-      const nodeStart = cursor;
-      const nodeEnd = cursor + value.length;
-      cursor = nodeEnd;
-
-      if (nodeEnd <= markerStart || nodeStart >= markerEnd) {
-        return;
+function handoffDeps(): HandoffCardDeps {
+  return {
+    buildId: BUILD_ID,
+    mount: (element) => {
+      mountInExtensionHost(element);
+    },
+    notify: notifyAside,
+    send: sendHandoff,
+    writeClipboard: (text) => writeClipboardText(text, ensureExtensionHost()),
+    jumpToPassage: jumpToHandoffPassage,
+    openLibrary: () => {
+      void sendStoreMessage({ type: 'OPEN_LIBRARY' });
+    },
+    onVisibilityChange: () => {
+      renderTabs();
+    },
+    onDisposed: (card) => {
+      if (handoffCards.get(card.sessionId) === card) {
+        handoffCards.delete(card.sessionId);
       }
+      renderTabs();
+    }
+  };
+}
 
-      const from = Math.max(0, markerStart - nodeStart);
-      const to = Math.min(value.length, markerEnd - nodeStart);
-      node.nodeValue = value.slice(0, from) + value.slice(to);
-    });
+/** Hide every visible card without recording a preference: something else took the slot. */
+function yieldHandoffCards(except?: HandoffCard): void {
+  handoffCards.forEach((card) => {
+    if (card !== except && !card.hidden) {
+      card.yieldSlot();
+    }
   });
 }
 
-function stopTitleWatcher(): void {
-  if (titleWatcherId) {
-    window.clearInterval(titleWatcherId);
-    titleWatcherId = undefined;
+/** One visible thing at a time in the panel slot. */
+function showHandoffCard(card: HandoffCard): void {
+  yieldHandoffCards(card);
+  getVisiblePanels().forEach((runtime) => minimizePanel(runtime.state.panelId));
+  if (questionListOpen) {
+    questionListOpen = false;
+    renderQuestionListPanel();
   }
+  card.show();
+  fitSlotToFreeSpace(card.element);
+  renderTabs();
 }
 
-function startTitleWatcher(): void {
-  if (titleWatcherId) {
-    return;
+function mountHandoffCard(session: ScratchHandoff, options: { memoryOnly: boolean }): HandoffCard {
+  const existing = handoffCards.get(session.sessionId);
+  if (existing) {
+    existing.adoptSession(session, { keepLocalDraft: true });
+    return existing;
   }
-
-  const startedAt = Date.now();
-  titleWatcherId = window.setInterval(() => {
-    const title = findBranchTitleFromTranscript();
-    if (title && title !== observedBranchTitle) {
-      observedBranchTitle = title;
-      void sendAutomationEvent({ kind: 'title', title });
-    }
-
-    // Keep stripping: the marker is detected in the first streamed chunk, and every
-    // later re-render of that message re-inserts it.
-    stripTitleEnvelopeFromVisibleMessage();
-
-    if (Date.now() - startedAt > TITLE_MARKER_WATCH_TIMEOUT_MS) {
-      stopTitleWatcher();
-    }
-  }, 1200);
+  const card = new HandoffCard(session, handoffDeps(), { memoryOnly: options.memoryOnly });
+  handoffCards.set(session.sessionId, card);
+  card.element.hidden = true;
+  card.mount();
+  return card;
 }
 
-async function runBranchPromptAutomation(
-  message: FrameStartBranchMessage | RunBranchPromptInTabMessage,
-  transport: AutomationTransport
-): Promise<void> {
-  if (automationTaskRunning) {
-    return;
-  }
-  activeAutomationPanelId = message.panelId;
-  activeAutomationTransport = transport;
-  observedBranchTitle = '';
-  automationTaskRunning = true;
-  recordAutomationLog('Resuming frame task', {
-    taskStatus: 'submitting-prompt',
-    branchKind: message.branchKind,
-    launchUrl: message.launchUrl,
-    currentUrl: normalizeChatUrl(window.location.href)
+/** A new scratch session from a selection. Different questions never share one. */
+async function openHandoff(entry: HandoffEntry, selection: SelectionPayload, question?: string): Promise<void> {
+  const draft: HandoffDraft = {
+    question: question ?? (entry === 'why' ? WHY_QUESTION : ''),
+    excludedBlockIds: [],
+    background: ''
+  };
+  const response = await sendHandoff({
+    type: 'HANDOFF_CREATE',
+    buildId: BUILD_ID,
+    providerId: provider.id,
+    entry,
+    scopeKey: currentScopeKey(),
+    sourceUrl: normalizeChatUrl(window.location.href),
+    selection,
+    draft,
+    sourceTitle: compactWhitespace(document.title).slice(0, 120)
   });
+  if (!response) {
+    notifyAside('Aside could not reach its extension worker. Reload this page to use it.');
+    return;
+  }
+  if (response.code === 'stale-client') {
+    notifyAside("Aside's page and background builds differ: press Reload on Aside in chrome://extensions, then reload this page.");
+    return;
+  }
+  if (!response.ok || !response.session) {
+    notifyAside('This passage could not be prepared. Select it again and retry.');
+    return;
+  }
+  const card = mountHandoffCard(response.session, {
+    memoryOnly: response.memoryOnly === true || response.code === 'storage-unavailable'
+  });
+  showHandoffCard(card);
+  card.focusQuestion();
+}
 
-  try {
-    await sendAutomationEvent({
-      kind: 'status',
-      status: 'opening_branch',
-      statusLabel:
-        transport === 'background'
-          ? 'Sending the local branch question in a native ChatGPT window...'
-          : 'Sending the local branch question in this branch window...'
-    });
-
-    if (transport === 'background') {
-      recordAutomationLog('Allowing the native ChatGPT window to settle before submit', {
-        delayMs: 1200,
-        currentUrl: normalizeChatUrl(window.location.href)
-      });
-      await sleep(1200);
+/** Cards for this tab's active sessions, after a reload or a navigation. */
+async function restoreHandoffs(): Promise<void> {
+  const response = await sendHandoff({ type: 'HANDOFF_LIST_FOR_TAB', buildId: BUILD_ID });
+  if (!response?.ok || !response.sessions) {
+    if (response?.code === 'stale-client') {
+      reportStaleClient(null, 'service worker', response.buildId);
     }
-
-    const { acceptedSignal, temporaryVerification } = await submitComposer(
-      message.prompt,
-      message.branchKind
-    );
-    const immediateBranchUrl = isPersistentConversationUrl(normalizeChatUrl(window.location.href))
-      ? normalizeChatUrl(window.location.href)
-      : undefined;
-
-    if (message.branchKind === 'temporary') {
-      if (immediateBranchUrl) {
-        await reportTemporaryBranchLeak(immediateBranchUrl, temporaryVerification);
-        return;
-      }
-
-      recordAutomationLog('Temporary branch accepted generation signal', {
-        acceptedSignal,
-        temporaryVerification,
-        currentUrl: normalizeChatUrl(window.location.href)
+    return;
+  }
+  const scope = currentScopeKey();
+  let shown = false;
+  response.sessions
+    .slice()
+    // Defence in depth: the worker lists only this provider's sessions.
+    .filter((session) => session.providerId === provider.id)
+    .sort((left, right) => left.updatedAt - right.updatedAt)
+    .forEach((session) => {
+      const card = mountHandoffCard(session, {
+        memoryOnly: response.memoryOnly === true || response.code === 'storage-unavailable'
       });
-      // Go live now and keep watching: ChatGPT rewrites the URL a beat after it starts
-      // generating, and holding the panel behind the loading overlay for that whole
-      // window would tax every temporary branch that works fine.
-      await sendAutomationEvent({ kind: 'live' });
-      startTitleWatcher();
-      void (async () => {
-        const leakedUrl = await watchForPersistentConversationUrl(TEMPORARY_LEAK_WATCH_MS);
-        if (leakedUrl) {
-          await reportTemporaryBranchLeak(leakedUrl, temporaryVerification);
-        }
-      })();
-
-      if (transport === 'background') {
-        try {
-          await focusComposerForFollowUp();
-        } catch (error) {
-          recordAutomationLog('Follow-up composer focus did not complete', {
-            reason: error instanceof Error ? error.message : String(error)
-          });
-        }
+      const eligible = session.source.scopeKey === scope && !session.hidden;
+      if (eligible && !shown && !getVisiblePanels().length && !questionListOpen) {
+        shown = true;
+        showHandoffCard(card);
+      } else if (!card.hidden) {
+        card.yieldSlot();
       }
+    });
+  renderTabs();
+}
+
+/** A card whose conversation is no longer on screen steps aside. */
+function syncHandoffCardsToScope(): void {
+  const scope = currentScopeKey();
+  handoffCards.forEach((card) => {
+    if (!card.hidden && card.session.source.scopeKey !== scope) {
+      card.yieldSlot();
+    }
+  });
+}
+
+function flushHandoffDrafts(): void {
+  handoffCards.forEach((card) => {
+    void card.flushDraft();
+  });
+}
+
+function handleHandoffChanged(message: HandoffChangedMessage): void {
+  const card = handoffCards.get(message.sessionId);
+  if (!card) {
+    return;
+  }
+  if (message.session) {
+    if (message.session.providerId !== provider.id) {
       return;
     }
-
-    await sendAutomationEvent({
-      kind: 'status',
-      status: 'opening_branch',
-      statusLabel: 'Waiting for ChatGPT to create a persistent branch URL...'
-    });
-    recordAutomationLog('Waiting for persistent branch URL after accepted generation signal', {
-      acceptedSignal,
-      launchUrl: message.launchUrl,
-      currentUrl: normalizeChatUrl(window.location.href)
-    });
-    const branchChatUrl = await waitForConversationUrlAfterSubmit(
-      message.launchUrl ?? normalizeChatUrl(window.location.href)
-    );
-    await sendAutomationEvent({ kind: 'live', branchChatUrl });
-    startTitleWatcher();
-    if (transport === 'background') {
-      try {
-        await focusComposerForFollowUp();
-      } catch (error) {
-        recordAutomationLog('Follow-up composer focus did not complete', {
-          reason: error instanceof Error ? error.message : String(error)
-        });
-      }
-    }
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : 'Unknown frame error';
-    const currentUrl = normalizeChatUrl(window.location.href);
-    const branchChatUrl = isPersistentConversationUrl(currentUrl) ? currentUrl : undefined;
-    recordAutomationLog('Frame task failed', {
-      reason,
-      branchChatUrl: branchChatUrl ?? null
-    });
-
-    // Leaving the prompt sitting in the user's real composer is worse than useless: the
-    // next thing they type appends to a 3KB machine prompt they never wrote.
-    clearComposerAfterFailure(message.prompt);
-
-    await sendAutomationEvent({
-      kind: 'failed',
-      reason,
-      branchChatUrl
-    });
-  } finally {
-    automationTaskRunning = false;
+    card.adoptSession(message.session, { keepLocalDraft: true, fromEvent: true });
+    renderTabs();
+    return;
   }
+  const label = routeFor(card.session.providerId).label;
+  card.markEnded(
+    message.reason === 'target-closed'
+      ? `The ${label} tab for this question was closed, so the temporary question was cleared from Aside.`
+      : 'Cleared from Aside.'
+  );
 }
 
 function cleanup(): void {
   cleanupFns.forEach((fn) => fn());
   cleanupFns = [];
-  stopTitleWatcher();
+
+  // Everything Aside put on the page goes: an in-place extension update runs
+  // this and then a new content script, and a surviving host would leave dead
+  // views the new one does not own. Scratch sessions are not ended here; the
+  // worker still holds them for the next content script.
+  [...handoffCards.values()].forEach((card) => card.detach());
+  handoffCards.clear();
+  panelRuntimes.clear();
+  extensionHost?.remove();
+  document.getElementById(EXTENSION_HOST_ID)?.remove();
+  extensionHost = null;
+  delete document.documentElement.dataset.asideTheme;
 }
 
-function initEmbeddedFrame(): void {
-  ensureFrameAutomationStyles();
+/**
+ * Bind every provider-specific module to the adapter that owns this document.
+ * Returns false when Aside must not run here at all — a marketing page, the auth
+ * flow, or settings — so no UI is mounted and no listeners are installed.
+ */
+function bindProviderForDocument(): boolean {
+  const adapter = findChatAdapterForUrl(window.location.href);
+  if (!adapter) {
+    return false;
+  }
 
-  const postReady = () => {
-    window.parent.postMessage(
-      {
-        source: 'aside',
-        target: 'parent',
-        type: 'SB_FRAME_READY',
-        currentUrl: normalizeChatUrl(window.location.href)
-      } satisfies FrameReadyMessage,
-      window.location.origin
-    );
-  };
+  provider = adapter;
+  setActiveTranscriptAdapter(adapter.transcript);
+  setActiveScopeResolver(() => {
+    const url = adapter.normalizeUrl(window.location.href);
+    return {
+      rootConversationId: adapter.identify(url, sessionDiscriminator).scopeKey,
+      rootChatUrl: url
+    };
+  });
 
-  const frameMessageListener = (event: MessageEvent<FrameStartBranchMessage>) => {
-    // Only the embedding page may start a branch here, and only from our own origin.
-    if (event.source !== window.parent || event.origin !== window.location.origin) {
-      return;
-    }
+  return true;
+}
 
-    const data = event.data;
-    if (
-      !data ||
-      typeof data !== 'object' ||
-      data.source !== 'aside' ||
-      data.target !== 'frame' ||
-      data.type !== 'SB_FRAME_START_BRANCH'
-    ) {
-      return;
-    }
-
-    void runBranchPromptAutomation(data, 'frame');
-  };
-
-  window.addEventListener('message', frameMessageListener);
-  window.addEventListener('pageshow', postReady);
-  cleanupFns.push(() => window.removeEventListener('message', frameMessageListener));
-  cleanupFns.push(() => window.removeEventListener('pageshow', postReady));
-
-  postReady();
+/**
+ * A page Aside opened as a native destination stays exactly as the provider
+ * made it: no toolbar, no rail, no restored views, nothing injected. The
+ * worker knows the role before the provider document exists, because the tab
+ * is registered while it is still blank.
+ */
+async function pageRole(): Promise<'page' | 'target'> {
+  const response = await sendHandoff({ type: 'HANDOFF_ROLE', buildId: BUILD_ID });
+  return response?.role === 'target' ? 'target' : 'page';
 }
 
 function init(): void {
   window.__asideCleanup?.();
   window.__asideCleanup = cleanup;
 
-  if (isTopFrame()) {
-    initTopFrame();
+  // Only the top document of a provider page: Aside no longer runs in frames.
+  if (!isTopFrame() || !bindProviderForDocument()) {
     return;
   }
 
-  initEmbeddedFrame();
+  void pageRole().then((role) => {
+    if (role === 'target') {
+      return;
+    }
+    initTopFrame();
+  });
 }
 
 init();

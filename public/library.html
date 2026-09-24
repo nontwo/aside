@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Aside library</title>
+    <style>
+      :root { color-scheme: light dark; --bg: #ffffff; --fg: #111827; --muted: #6b7280; --line: rgba(15,23,42,.12); --card: rgba(15,23,42,.03); --accent: #111827; --accent-fg: #fff; }
+      @media (prefers-color-scheme: dark) { :root { --bg: #0f1115; --fg: #e5e7eb; --muted: #9ca3af; --line: rgba(255,255,255,.12); --card: rgba(255,255,255,.04); --accent: #e5e7eb; --accent-fg: #0f1115; } }
+      body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+      header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 14px 20px; border-bottom: 1px solid var(--line); }
+      header h1 { font-size: 16px; margin: 0 12px 0 0; }
+      header input[type=search] { flex: 1; min-width: 200px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--fg); }
+      main { display: grid; grid-template-columns: minmax(220px, 300px) 1fr; gap: 0; min-height: calc(100vh - 60px); }
+      @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+      nav { border-right: 1px solid var(--line); padding: 12px; overflow: auto; }
+      section { padding: 16px 20px; overflow: auto; }
+      button { font: inherit; padding: 6px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+      button[data-selected="true"], button.primary { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+      .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      .source { display: block; width: 100%; text-align: left; margin: 0 0 6px; padding: 8px 10px; border-radius: 10px; }
+      .source small, .q small, .meta { color: var(--muted); display: block; }
+      .q { padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; margin: 0 0 10px; background: var(--card); }
+      .q h3 { margin: 0 0 4px; font-size: 14px; }
+      .msg { padding: 8px 10px; border-left: 3px solid var(--line); margin: 8px 0; white-space: pre-wrap; word-break: break-word; }
+      .msg[data-role="user"] { border-left-color: var(--accent); }
+      .msg[data-partial="true"]::after { content: " (partial)"; color: var(--muted); }
+      pre { white-space: pre-wrap; word-break: break-word; background: var(--card); padding: 10px; border-radius: 10px; }
+      details { margin: 8px 0; }
+      .empty { color: var(--muted); }
+      .warn { color: #b45309; }
+      footer { padding: 12px 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+      .hidden { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Aside library</h1>
+      <input id="search" type="search" placeholder="Search titles, drafts and saved answers" aria-label="Search" />
+      <div class="row" id="filters" role="group" aria-label="Status filter"></div>
+      <button id="backup" title="Download a JSON backup of ordinary (non-private) questions">Backup</button>
+      <label><button id="restore-button" type="button">Restore…</button><input id="restore" type="file" accept="application/json" class="hidden" /></label>
+    </header>
+    <main>
+      <nav id="sources" aria-label="Sources"></nav>
+      <section id="content"><p class="empty">Pick a source on the left, or search.</p></section>
+    </main>
+    <footer id="about"></footer>
+    <script src="assets/library.js"></script>
+  </body>
+</html>

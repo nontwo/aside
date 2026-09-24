@@ -1,9 +1,4 @@
-import {
-  buildLocalInitialPrompt,
-  buildNativeBootstrapPrompt,
-  stripHiddenTitle
-} from '../src/shared/prompts';
-import type { SelectionPayload } from '../src/shared/types';
+import { answerContract, buildPrompt, TEMPLATE_VERSION } from '../src/context/template';
 import {
   getBranchLaunchUrl,
   getChatContainerBaseUrl,
@@ -12,89 +7,7 @@ import {
   isSameChatContainer
 } from '../src/shared/utils';
 
-function makeSelection(): SelectionPayload {
-  return {
-    rootConversationId: 'conv-1',
-    rootChatUrl: 'https://chatgpt.com/c/conv-1',
-    selectedText: 'convexity assumption guarantees the relaxation stays tight',
-    selectedBlocks: [
-      {
-        messageId: 'assistant-7',
-        role: 'assistant',
-        turnIndex: 7,
-        text: 'The convexity assumption guarantees the relaxation stays tight and keeps optimization stable.',
-        excerpt: 'convexity assumption guarantees'
-      }
-    ],
-    branchBaseMessageId: 'assistant-7',
-    rangeQuotes: {
-      exact: 'convexity assumption guarantees the relaxation stays tight',
-      prefix: 'The ',
-      suffix: ' and keeps'
-    },
-    fallbackScrollY: 420
-  };
-}
-
-describe('prompt builders', () => {
-  it('builds a local-only prompt from selected passage and touched assistant answer', () => {
-    const selection = makeSelection();
-    const localPrompt = buildLocalInitialPrompt(selection, 'Why does this matter?');
-
-    expect(localPrompt.prompt).toContain('Use only the local context below');
-    expect(localPrompt.prompt).toContain('SELECTED PASSAGE');
-    expect(localPrompt.prompt).toContain(selection.selectedText);
-    expect(localPrompt.prompt).toContain('LOCAL SOURCE ANSWER 1');
-    expect(localPrompt.prompt).toContain(selection.selectedBlocks[0].text);
-    expect(localPrompt.prompt).toContain('Why does this matter?');
-    expect(localPrompt.prompt).not.toContain('full conversation history');
-    expect(localPrompt.prompt).not.toContain('native branch');
-  });
-
-  it('does not include non-assistant selected blocks as source answers', () => {
-    const selection = makeSelection();
-    selection.selectedBlocks.push({
-      messageId: 'user-8',
-      role: 'user',
-      turnIndex: 8,
-      text: 'This user turn should not be copied into the local source answer.',
-      excerpt: 'This user turn should not be copied'
-    });
-
-    const localPrompt = buildLocalInitialPrompt(selection, 'Explain locally.');
-
-    expect(localPrompt.prompt).toContain(selection.selectedBlocks[0].text);
-    expect(localPrompt.prompt).not.toContain('This user turn should not be copied');
-  });
-
-  it('builds a native bootstrap prompt that only stages the branch', () => {
-    const selection = makeSelection();
-    const bootstrapPrompt = buildNativeBootstrapPrompt(selection);
-
-    expect(bootstrapPrompt.prompt).toContain('Ready for your question.');
-    expect(bootstrapPrompt.prompt).toContain('BRANCH TASK');
-    expect(bootstrapPrompt.prompt).toContain(selection.selectedText);
-    expect(bootstrapPrompt.prompt).toContain(selection.selectedBlocks[0].text);
-    expect(bootstrapPrompt.prompt).not.toContain('USER QUESTION');
-    expect(bootstrapPrompt.prompt).not.toContain('full conversation history');
-  });
-
-  it('removes the hidden title envelope from assistant text', () => {
-    const parsed = stripHiddenTitle('[[BRANCH_TITLE: why convexity matters]]\nThis is the answer.');
-
-    expect(parsed.title).toBe('why convexity matters');
-    expect(parsed.cleanText).toBe('This is the answer.');
-  });
-
-  it('removes leading reasoning status before the hidden title envelope', () => {
-    const parsed = stripHiddenTitle(
-      '已思考 6s\n[[BRANCH_TITLE: 人民币亏损换算日元]]\n按当前大致汇率计算。'
-    );
-
-    expect(parsed.title).toBe('人民币亏损换算日元');
-    expect(parsed.cleanText).toBe('按当前大致汇率计算。');
-  });
-
+describe('chat container URLs', () => {
   it('preserves the chat container path for project or custom-gpt chats', () => {
     expect(
       getChatContainerBaseUrl(
@@ -149,5 +62,40 @@ describe('prompt builders', () => {
         'https://chatgpt.com/c/branch'
       )
     ).toBe(false);
+  });
+});
+
+describe('prompt semantics (template 3)', () => {
+  const contract = answerContract();
+
+  it('is short: six instruction lines', () => {
+    expect(TEMPLATE_VERSION).toBe('3.0.0');
+    expect(contract.split('\n')).toHaveLength(6);
+  });
+
+  it('treats quotations as fallible evidence, not instructions', () => {
+    expect(contract).toMatch(/fallible evidence/);
+    expect(contract).toMatch(/not instructions/);
+  });
+
+  it('allows relevant knowledge without inventing source facts', () => {
+    expect(contract).toMatch(/Use relevant knowledge/);
+    expect(contract).toMatch(/do not invent facts about the source/);
+  });
+
+  it('asks for assumptions, corrections and missing material to be stated', () => {
+    expect(contract).toMatch(/State any assumption/);
+    expect(contract).toMatch(/correct the passage where it is wrong/);
+    expect(contract).toMatch(/say what is missing/);
+  });
+
+  it('matches the question language and requested depth', () => {
+    expect(contract).toMatch(/language and the depth/);
+  });
+
+  it('never asks for a title, a summary, a ready handshake or hidden reasoning', () => {
+    const prompt = buildPrompt({ contextText: 'CONTEXT', question: 'Why?' });
+    expect(prompt).not.toMatch(/BRANCH_TITLE|title line|summary line|ready for your question|reasoning steps|chain of thought/i);
+    expect(prompt.endsWith('QUESTION\nWhy?')).toBe(true);
   });
 });

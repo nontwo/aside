@@ -1,0 +1,331 @@
+import type { ChatRole } from '../types';
+import { compactWhitespace } from '../utils';
+import { CLAUDE_ORIGINS } from './origins';
+import type { ConversationIdentity, ProviderAdapter } from './types';
+
+/**
+ * Claude adapter.
+ *
+ * SELECTOR PROVENANCE — read before editing.
+ *
+ * Every selector here is a *candidate*, ordered so that stable, semantic hooks
+ * (data-testid, aria-label, role) are tried before class-name heuristics. Claude's
+ * interface is mid-migration: the Cowork/new-chat experience and the previous
+ * experience can both be served depending on account rollout, and Incognito is
+ * documented as living in the previous experience. Aside therefore never assumes a
+ * single captured DOM, re-detects after navigation and remount, and reports a
+ * capability as unavailable rather than guessing.
+ *
+ * These selectors are exercised against sanitized fixtures in the offline smoke
+ * harness. They have NOT been verified against a live logged-in Claude account in
+ * this change; see the capability matrix in the pull request.
+ */
+
+const ORIGINS: string[] = [...CLAUDE_ORIGINS];
+
+// Claude marks user turns with a test id and renders assistant turns in a
+// font-claude-message container. Both forms are matched, plus the generic
+// data-testid message hooks, so a rollout that changes one does not break both.
+const MESSAGE_SELECTOR = [
+  '[data-testid="user-message"]',
+  '[data-testid="assistant-message"]',
+  '[data-test-render-count] .font-claude-message',
+  '.font-claude-message',
+  '[data-is-streaming]'
+].join(',');
+
+const CONTENT_SELECTORS = [
+  '.standard-markdown',
+  '[class*="standard-markdown"]',
+  '.font-claude-message',
+  '[class*="prose"]',
+  '.whitespace-pre-wrap'
+];
+
+const STRUCTURED_CONTENT_SELECTOR = [
+  '.standard-markdown',
+  '[class*="standard-markdown"]',
+  '[class*="prose"]',
+  'p',
+  'li',
+  'pre',
+  'code',
+  'table',
+  'blockquote',
+  'h1',
+  'h2',
+  'h3'
+].join(',');
+
+const NON_CONTENT_SELECTOR = [
+  'script',
+  'style',
+  'noscript',
+  'button',
+  'textarea',
+  'input',
+  'select',
+  'option',
+  'svg',
+  '[role="menu"]',
+  '[role="tooltip"]',
+  '[data-radix-popper-content-wrapper]',
+  // Claude renders artifacts and tool output in their own panes; their text is not
+  // part of the answer the user selected.
+  '[data-testid="artifact-panel"]',
+  '[class*="artifact-block-cell"]',
+  '.katex-mathml',
+  '.MathJax_Assistive_MathML',
+  '.mjx-assistive-mml',
+  'mjx-assistive-mml',
+  'annotation',
+  'annotation-xml',
+  '.sr-only',
+  '.visually-hidden'
+].join(',');
+
+const ASSISTANT_LABEL_PATTERNS = [
+  /^claude\s*(says?|said)?\s*[:：]\s*/i,
+  /^claude\s*说\s*[:：]\s*/i,
+  /^assistant\s*[:：]\s*/i
+];
+
+const ASSISTANT_STATUS_PATTERNS = [
+  /^thinking(?:\.\.\.|…)?$/i,
+  /^思考中(?:\.\.\.|…)?$/i,
+  /^pondering(?:\.\.\.|…)?$/i,
+  /^analy[sz]ing(?:\.\.\.|…)?$/i,
+  /^分析中(?:\.\.\.|…)?$/i,
+  /^searching(?:\s+the\s+web)?(?:\.\.\.|…)?$/i,
+  /^正在搜索(?:网络|网页)?(?:\.\.\.|…)?$/i,
+  /^researching(?:\.\.\.|…)?$/i,
+  /^thought for\s*\d+\s*s(?:econds?)?$/i,
+  /^已思考\s*\d+\s*[秒s]?$/i
+];
+
+const CONVERSATION_PATH = /^\/chat\/([^/?#]+)/;
+const PROJECT_PATH = /^\/project\/([^/?#]+)/;
+
+/**
+ * Routes on claude.ai that are not a chat surface. Aside must not mount on the
+ * marketing site, the auth flow, or settings.
+ */
+const NON_CHAT_PATHS = [
+  /^\/login/,
+  /^\/magic-link/,
+  /^\/settings/,
+  /^\/api\//,
+  /^\/admin/,
+  /^\/referral/,
+  /^\/upgrade/,
+  /^\/pricing/
+];
+
+function parseUrl(url: string): URL | null {
+  try {
+    return new URL(url);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeUrl(url: string): string {
+  const parsed = parseUrl(url);
+  if (!parsed) {
+    return url;
+  }
+  parsed.hash = '';
+  parsed.search = '';
+  return parsed.toString();
+}
+
+function isConversationUrl(url: string): boolean {
+  const parsed = parseUrl(url);
+  return Boolean(parsed && CONVERSATION_PATH.test(parsed.pathname));
+}
+
+function identify(url: string, sessionDiscriminator: string): ConversationIdentity {
+  const parsed = parseUrl(url);
+  if (!parsed) {
+    return {
+      providerId: 'claude',
+      conversationId: null,
+      containerId: null,
+      conversationUrl: null,
+      launchUrl: `${ORIGINS[0]}/new`,
+      rootLaunchUrl: `${ORIGINS[0]}/new`,
+      containerUrl: null,
+      urlPrivacyHint: 'unknown',
+      scopeKey: `claude:session:${sessionDiscriminator}`
+    };
+  }
+
+  const conversationId = parsed.pathname.match(CONVERSATION_PATH)?.[1] ?? null;
+  const projectId = parsed.pathname.match(PROJECT_PATH)?.[1] ?? null;
+  const origin = parsed.origin;
+
+  const containerUrl = projectId ? `${origin}/project/${projectId}` : null;
+  // A new chat inside a project starts from the project page; otherwise /new.
+  const launchUrl = containerUrl ?? `${origin}/new`;
+  const rootLaunchUrl = `${origin}/new`;
+
+  // Claude does not expose a documented incognito query parameter, so the URL tells
+  // us nothing about privacy either way. Saying 'unknown' keeps callers from
+  // treating an addressable /chat/<id> URL as proof of persistence.
+  const urlPrivacyHint = 'unknown';
+
+  const scopeKey = conversationId
+    ? `claude:chat:${conversationId}`
+    : projectId
+      ? `claude:project:${projectId}:${sessionDiscriminator}`
+      : `claude:session:${sessionDiscriminator}`;
+
+  return {
+    providerId: 'claude',
+    conversationId,
+    containerId: projectId,
+    conversationUrl: conversationId ? normalizeUrl(url) : null,
+    launchUrl,
+    rootLaunchUrl,
+    containerUrl,
+    urlPrivacyHint,
+    scopeKey
+  };
+}
+
+function inferRole(element: HTMLElement): ChatRole | null {
+  const testId = element.getAttribute('data-testid');
+  if (testId === 'user-message') {
+    return 'user';
+  }
+  if (testId === 'assistant-message') {
+    return 'assistant';
+  }
+
+  if (element.classList.contains('font-claude-message')) {
+    return 'assistant';
+  }
+
+  // Streaming assistant turns carry data-is-streaming on their container.
+  if (element.hasAttribute('data-is-streaming')) {
+    return 'assistant';
+  }
+
+  // Fall back to a nested hook so a wrapper element still resolves.
+  if (element.querySelector('[data-testid="user-message"]')) {
+    return 'user';
+  }
+  if (
+    element.querySelector('[data-testid="assistant-message"]') ??
+    element.querySelector('.font-claude-message')
+  ) {
+    return 'assistant';
+  }
+
+  return null;
+}
+
+function stripAssistantLabel(text: string): string {
+  let next = compactWhitespace(text);
+  for (const pattern of ASSISTANT_LABEL_PATTERNS) {
+    next = next.replace(pattern, '').trim();
+  }
+  return next;
+}
+
+function isStatusText(text: string): boolean {
+  const normalized = compactWhitespace(stripAssistantLabel(text));
+  if (!normalized) {
+    return true;
+  }
+
+  if (
+    normalized.length <= 64 &&
+    /(thinking|pondering|analy[sz]ing|searching|researching|thought for|思考中|分析中|正在搜索)/i.test(
+      normalized
+    ) &&
+    !/[。.!?]/.test(normalized)
+  ) {
+    return true;
+  }
+
+  return ASSISTANT_STATUS_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+export const claudeAdapter: ProviderAdapter = {
+  id: 'claude',
+  label: 'Claude',
+  origins: ORIGINS,
+
+  matches(url) {
+    const parsed = parseUrl(url);
+    return Boolean(parsed && ORIGINS.includes(parsed.origin));
+  },
+
+  isChatSurface(url) {
+    const parsed = parseUrl(url);
+    if (!parsed || !ORIGINS.includes(parsed.origin)) {
+      return false;
+    }
+    return !NON_CHAT_PATHS.some((pattern) => pattern.test(parsed.pathname));
+  },
+
+  identify,
+  normalizeUrl,
+  isConversationUrl,
+
+  transcript: {
+    messageSelector: MESSAGE_SELECTOR,
+    contentSelectors: CONTENT_SELECTORS,
+    structuredContentSelector: STRUCTURED_CONTENT_SELECTOR,
+    nonContentSelector: NON_CONTENT_SELECTOR,
+    inferRole,
+    stripAssistantLabel,
+    isStatusText
+  },
+
+  layout: {
+    nativeSelectionToolbarSelectors: [
+      '[data-testid="selection-toolbar"]',
+      '[role="toolbar"]',
+      '[class*="selection-menu"]'
+    ],
+    reservedRegionSelectors: [
+      { kind: 'sidebar', selector: 'nav[aria-label], [data-testid="menu-sidebar"], aside' },
+      { kind: 'composer', selector: 'fieldset div[contenteditable="true"], form' },
+      { kind: 'header', selector: 'header' },
+      {
+        kind: 'tool-panel',
+        // Artifact / file preview panes occupy the right side and must stay clear.
+        selector: '[data-testid="artifact-panel"], [class*="artifact"], [data-testid="file-preview"]'
+      }
+    ],
+    getConversationScrollContainer(doc) {
+      const candidates = [
+        doc.querySelector<HTMLElement>('[data-testid="chat-scroll-container"]'),
+        doc.querySelector<HTMLElement>('main .overflow-y-auto'),
+        doc.querySelector<HTMLElement>('main')
+      ];
+      return candidates.find((element) => Boolean(element)) ?? null;
+    },
+    getReadingColumnRect(doc) {
+      // The reading column is where turns and the composer live — not <main>, which
+      // also spans the gutter the rail needs. Returning null is better than a wrong
+      // rectangle: the caller then falls back to the viewport midpoint.
+      const column =
+        doc.querySelector<HTMLElement>('.font-claude-message') ??
+        doc.querySelector<HTMLElement>('fieldset div[contenteditable="true"], main form');
+      if (!column) {
+        return null;
+      }
+      const rect = column.getBoundingClientRect();
+      return rect.width > 0 ? rect : null;
+    }
+  },
+
+  // The provider's own name for its temporary conversation mode. Aside names it
+  // in the handoff guidance; it never operates the mode itself.
+  privacy: {
+    label: 'Incognito chat'
+  }
+};
