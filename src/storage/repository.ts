@@ -160,6 +160,18 @@ async function applyInside(
         rev: REV_START
       } satisfies QuestionDraft);
 
+      if (command.note) {
+        await put(tx, STORES.notes, {
+          id: command.note.id,
+          questionId: question.id,
+          sourceId: command.source.id,
+          text: command.note.text,
+          messageId: null,
+          createdAt: now,
+          updatedAt: now
+        } satisfies Note);
+      }
+
       return { status: 'applied', rev: question.rev, id: question.id };
     }
 

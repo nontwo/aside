@@ -7,142 +7,64 @@ import {
   HIGHLIGHT_OVERLAY_ID,
   LEGACY_LAST_BRANCH_KIND_STORAGE_KEY,
   LEGACY_PANEL_STORAGE_PREFIX,
-  PANEL_STORAGE_PREFIX,
   ROOT_STYLE_ID,
   LAST_BRANCH_KIND_STORAGE_KEY
 } from '../shared/constants';
 import { mergePanelStateOnConflict, resolveWriteConflict } from '../shared/panel-store';
 import {
   getPanelStorageKeyForConversationId,
-  getPanelStorageKeyForState,
   isCatchAllPanelStorageKey,
   isPanelStorageKey,
-  mergePanelBuckets
 } from '../shared/panel-storage';
 import type {
   PanelChangedMessage,
   PanelListResponse,
   PanelListedRecord,
   PanelWriteResponse,
-  BranchSurfaceMode,
-  BranchCapturedEvent,
-  PrivacyRecovery,
-  RecheckBranchInTabMessage,
-  RecheckBranchInTabResponse
+  BranchCreationMode,
+  BranchEntryAction,
+  BranchKind,
+  BranchPanelState,
+  BranchPanelStatus,
+  CapturedMessage,
+  SelectionPayload
 } from '../shared/types';
-import {
-  describePreparationStep,
-  observePrivateMode,
-  summarizeObservation
-} from '../runtime/private-mode';
-import type { PrivacyObservation } from '../runtime/private-mode';
 import {
   buildSelectionPayloadFromDraft,
   captureSelectionDraftFromRange,
-  countTranscriptTurns,
-  extractStructuredNodeText,
-  extractTranscript,
-  findQuotedTextRangeInElement,
-  findTurnElementByAnchor,
-  getRecentAssistantTexts,
+  locatePassage,
   rangeTouchesAssistantMessage,
   setActiveScopeResolver,
   setActiveTranscriptAdapter
 } from '../shared/dom';
 import type { SelectionDraft } from '../shared/dom';
-import {
-  buildBranchPrompt,
-  stripHiddenTitle
-} from '../shared/prompts';
-import {
-  DEFAULT_MAX_CONTEXT_CHARS,
-  createContext,
-  describeContextSize,
-  freezeContext,
-  measureContext,
-  renderContextText,
-  sanitizeStoredContext,
-  withBlockIncluded,
-  withUserBackground
-} from '../shared/context';
+import { createContext, sanitizeStoredContext } from '../shared/context';
 import type { BranchContext, ContextBlock } from '../shared/context';
 import { attachElementToHost, ensureExtensionHostElement } from './ui-host';
 import { findFreeCorner, findLeftGutterSlot, findSafePlacement } from '../shared/placement';
-import { surfaceMayBeAttempted } from '../shared/providers/types';
-import type { SurfaceObservation } from '../shared/providers/types';
-import {
-  COMPILER_VERSION,
-  buildContextPlan,
-  describePlan,
-  renderContextText as renderPlanText
-} from '../context/plan';
-import type { ContextPlan, PlanInput, SourceTurn } from '../context/plan';
-import { TEMPLATE_VERSION, buildPrompt } from '../context/template';
-import {
-  blockIdFor,
-  fnv1a,
-  newAnchorId,
-  newLinkId,
-  newQuestionId,
-  newSnapshotId,
-  sourceIdFor
-} from '../domain/ids';
-import { autoTitle } from '../domain/commands';
-import type { CapturedMessage } from '../shared/types';
-import {
-  exportSourceMarkdown,
-  fetchBundle,
-  listQuestionsForScope,
-  runCommand
-} from '../ui/question-client';
+import type { Rect } from '../shared/placement';
+import { exportSourceMarkdown, fetchBundle, listQuestionsForScope, runCommand } from '../ui/question-client';
 import { renderQuestionList } from '../ui/question-list';
 import type { ListFilter } from '../ui/question-list';
 import { BUILD_ID } from '../shared/build-info';
-import { TranscriptCaptureWatcher } from '../providers/capture';
-import type { ObservedTurn } from '../providers/capture';
 import type { QuestionBundle, QuestionListEntry } from '../storage/repository';
 import type { QuestionChangedMessage } from '../storage/protocol';
-import type { Rect } from '../shared/placement';
-import {
-  composerSizePenalty,
-  getActionLabel,
-  getSendCandidateProfile,
-  inferTemporaryChatState,
-  isAcceptableSendControl,
-  isTemporaryChatControl,
-  setActiveComposerAdapter
-} from '../shared/send-controls';
-import type {
-  BranchCreationMode,
-  BranchEntryAction,
-  BranchKind,
-  BranchPanelEvent,
-  BranchPanelState,
-  BranchPanelStatus,
-  CreateBranchWindowResponse,
-  FocusBranchWindowResponse,
-  BranchAttemptRef,
-  ForwardBranchPanelEventMessage,
-  RunBranchPromptInTabMessage,
-  SelectionPayload
-} from '../shared/types';
-import {
-  createAttemptId,
-  isBranchAttemptRef,
-  isPrivacyRecovery,
-  isBranchPanelEvent,
-  isRunBranchPromptRequest,
-  ownsAttempt
-} from '../shared/branch-attempt';
-import {
-  clipText,
-  compactWhitespace,
-  normalizeChatUrl,
-  randomId,
-  sleep
-} from '../shared/utils';
+import { clipText, compactWhitespace, normalizeChatUrl, randomId, sleep } from '../shared/utils';
 import { findChatAdapterForUrl, getAdapter } from '../shared/providers';
-import type { ConversationIdentity, ProviderAdapter, ProviderId } from '../shared/providers';
+import type { ConversationIdentity, ProviderAdapter } from '../shared/providers';
+import { HANDOFF_CARD_CSS, HandoffCard, writeClipboardText } from './handoff-card';
+import type { HandoffCardDeps } from './handoff-card';
+import { WHY_QUESTION, routeFor } from '../handoff/routes';
+import type {
+  AnchorResult,
+  HandoffChangedMessage,
+  HandoffDraft,
+  HandoffEntry,
+  HandoffRequest,
+  HandoffResponse,
+  HandoffScrollToAnchorMessage,
+  ScratchHandoff
+} from '../handoff/types';
 
 interface PanelRuntime {
   state: BranchPanelState;
@@ -151,103 +73,17 @@ interface PanelRuntime {
   statusEl: HTMLElement;
   errorEl: HTMLElement;
   focusTextEl: HTMLElement;
-  formEl: HTMLFormElement;
-  branchKindField: HTMLDivElement;
-  privacyNoteEl: HTMLDetailsElement;
-  privacyStorageWarning: HTMLParagraphElement;
-  privacyContainerWarning: HTMLParagraphElement;
-  persistentKindButton: HTMLButtonElement;
-  temporaryKindButton: HTMLButtonElement;
-  questionInput: HTMLTextAreaElement;
-  submitButton: HTMLButtonElement;
-  iframeShell: HTMLDivElement;
-  iframeEl: HTMLIFrameElement;
-  iframeOverlay: HTMLDivElement;
-  iframeOverlayTitle: HTMLParagraphElement;
-  iframeOverlayText: HTMLParagraphElement;
-  contextShell: HTMLDetailsElement;
-  contextBlockList: HTMLDivElement;
-  contextBackground: HTMLTextAreaElement;
-  contextSizeEl: HTMLParagraphElement;
-  contextPreview: HTMLPreElement;
+  promptShell: HTMLDetailsElement;
+  promptPre: HTMLPreElement;
   archiveEl: HTMLDivElement;
-  /** Fingerprint of the last capture written per ordinal, to bound writes. */
-  writtenCapture: Map<number, string>;
   debugLogShell: HTMLDivElement;
   debugLogTextarea: HTMLTextAreaElement;
   copyLogButton: HTMLButtonElement;
   openTabHeaderButton: HTMLButtonElement;
   moreDetails: HTMLDetailsElement;
-  recoveryEl: HTMLDivElement;
-  recoveryText: HTMLParagraphElement;
-  showTargetButton: HTMLButtonElement;
-  checkAgainButton: HTMLButtonElement;
-  ordinaryButton: HTMLButtonElement;
-  ordinaryConfirmEl: HTMLDivElement;
-  pendingFramePrompt?: string;
-  frameReady: boolean;
-  frameStartSent: boolean;
-  watchdogId?: number;
-  /** The Owner asked to see the branch document behind a failed private preparation. */
-  showTargetWhileFailed: boolean;
-  /** Last preparation step the branch document reported for the current attempt. */
-  lastPreparationStep?: string;
-  /** Build of the content script inside the embedded frame, from its ready handshake. */
-  frameBuildId?: string;
 }
-
-/**
- * Attempts this tab started. Both tabs holding the same panel see the same
- * `attemptId` once the record syncs, so the state alone cannot say which tab is
- * driving the branch; only the tab that minted the attempt knows.
- */
-const startedAttemptIds = new Set<string>();
-
-/** True when this tab is the one actually running the panel's branch. */
-function tabDrivesBranch(runtime: PanelRuntime): boolean {
-  const attemptId = runtime.state.attemptId;
-  return Boolean(attemptId && startedAttemptIds.has(attemptId));
-}
-
-/** The attempt a panel is currently running, if any. */
-function currentAttemptRef(runtime: PanelRuntime): BranchAttemptRef | null {
-  const attemptId = runtime.state.attemptId;
-  if (!attemptId) {
-    return null;
-  }
-  return { providerId: provider.id, panelId: runtime.state.panelId, attemptId };
-}
-
-type AutomationTransport = 'frame' | 'background';
 
 type ThemeMode = 'light' | 'dark';
-
-interface FrameStartBranchMessage extends BranchAttemptRef {
-  source: 'aside';
-  target: 'frame';
-  type: 'SB_FRAME_START_BRANCH';
-  prompt: string;
-  launchUrl: string;
-  branchKind: BranchKind;
-}
-
-interface FrameReadyMessage {
-  source: 'aside';
-  target: 'parent';
-  type: 'SB_FRAME_READY';
-  currentUrl: string;
-  /** Build of the content script in the frame, compared by the parent. */
-  buildId?: string;
-}
-
-interface FrameBranchEventMessage extends BranchAttemptRef {
-  source: 'aside';
-  target: 'parent';
-  type: 'SB_FRAME_EVENT';
-  event: BranchPanelEvent;
-}
-
-type FrameIncomingMessage = FrameReadyMessage | FrameBranchEventMessage;
 
 declare global {
   interface Window {
@@ -259,21 +95,9 @@ const PANEL_CLASS = 'aside-panel';
 const PANEL_TABBAR_ID = 'aside-tabbar';
 const ASIDE_LAUNCHER_ID = 'aside-launcher';
 const RAIL_WIDTH_PX = 96;
-const FRAME_AUTOMATION_STYLE_ID = 'aside-frame-automation-style';
 const EXTENSION_HOST_ID = 'aside-root';
-const TITLE_WATCH_TIMEOUT_MS = 120_000;
-// The envelope has to stay hidden for as long as the message can re-render, which is
-// longer than it takes to read the title out of it.
-const TITLE_MARKER_WATCH_TIMEOUT_MS = TITLE_WATCH_TIMEOUT_MS;
-const TEMPORARY_LEAK_WATCH_MS = 4_000;
 const MIN_SELECTION_LENGTH = 4;
-const ASK_TRIGGER_SYNC_DELAY_MS = 120;
 const PERSIST_DEBOUNCE_MS = 300;
-// ChatGPT can refuse to be framed, the frame can fail to load, or the branch window can
-// stop answering. Without these ceilings a panel sat on "Loading..." forever with no way
-// back to the question form.
-const FRAME_HANDSHAKE_TIMEOUT_MS = 25_000;
-const BRANCH_RESPONSE_TIMEOUT_MS = 180_000;
 let currentSelectionPayload: SelectionPayload | null = null;
 let currentSelectionDraft: SelectionDraft | null = null;
 let currentSelectionRect: DOMRect | null = null;
@@ -309,9 +133,7 @@ let asideLauncher: HTMLButtonElement | null = null;
 let themeObserver: MutationObserver | null = null;
 let activeTheme: ThemeMode | null = null;
 let pendingUrlChangeToken = 0;
-let lastUsedBranchKind: BranchKind = 'persistent';
 let isEvaluatingSelection = false;
-let pendingDraftFocusPanelId: string | null = null;
 // Panels the user closed on purpose. Everything else found in storage belongs to another
 // conversation (or another tab) and has to survive a write from this page.
 const closedPanelIds = new Set<string>();
@@ -331,58 +153,12 @@ let provider: ProviderAdapter = getAdapter('chatgpt');
  */
 const sessionDiscriminator = randomId('doc').slice(4);
 
-/**
- * Where a branch of this kind should start.
- *
- * A private branch cannot stay inside a project: both providers document private
- * mode as unavailable there. Launching one at the project route is exactly what a
- * live ChatGPT run did — the Temporary Chat control was present but unrendered
- * (a 0x0 box), so its state could not be read and the branch was refused. The
- * refusal was correct; the launch URL was not.
- *
- * This drops the project's files and instructions from the branch, which is a
- * real loss of context. It is stated in the panel before the branch is sent, never
- * silently.
- */
-function resolveLaunchUrl(identity: ConversationIdentity, branchKind: BranchKind): string {
-  if (branchKind === 'temporary' && identity.containerId && provider.privacy.leavesContainer) {
-    return identity.rootLaunchUrl;
-  }
-  return identity.launchUrl;
-}
-
-/** True when this branch will be pulled out of its project by going private. */
-function privateBranchLeavesContainer(state: BranchPanelState): boolean {
-  return (
-    state.branchKind === 'temporary' &&
-    Boolean(currentIdentity(state.rootChatUrl).containerId) &&
-    provider.privacy.leavesContainer
-  );
-}
-
 function currentIdentity(url = lastKnownUrl): ConversationIdentity {
   return provider.identify(url, sessionDiscriminator);
 }
 let persistTimer: number | undefined;
 let persistQueue: Promise<void> = Promise.resolve();
 let toolbarSyncFrame: number | undefined;
-
-/**
- * Raised when a requested private mode could not be positively verified. It is a
- * distinct type because the caller must never treat it as a generic automation
- * failure and retry in another mode.
- */
-class PrivacyNotVerifiedError extends Error {
-  readonly privacyBlocked = true;
-  /** Where preparation stopped, so the panel can offer Check again on the same target. */
-  readonly recovery?: PrivacyRecovery;
-
-  constructor(message: string, recovery?: PrivacyRecovery) {
-    super(message);
-    this.name = 'PrivacyNotVerifiedError';
-    this.recovery = recovery;
-  }
-}
 
 /**
  * Two builds talking to each other — a content script left over from a previous
@@ -422,10 +198,6 @@ function isTopFrame(): boolean {
   return window.top === window.self;
 }
 
-function getConversationStorageKey(url = lastKnownUrl): string {
-  return getPanelStorageKeyForConversationId(currentIdentity(url).scopeKey);
-}
-
 function formatDebugLogEntry(message: string, details?: unknown): string {
   let suffix = '';
   if (details !== undefined) {
@@ -439,34 +211,11 @@ function formatDebugLogEntry(message: string, details?: unknown): string {
   return `[${new Date().toISOString()}] ${message}${suffix}`;
 }
 
-function recordAutomationLog(message: string, details?: unknown): string {
-  const entry = formatDebugLogEntry(message, details);
-  console.info('[Aside]', entry);
-
-  if (activeAttempt) {
-    void sendAutomationEvent({
-      kind: 'debug-log',
-      message: entry
-    });
-  }
-
-  return entry;
-}
-
 function appendPanelLog(runtime: PanelRuntime, message: string, details?: unknown): void {
   const entry = formatDebugLogEntry(message, details);
   runtime.state.debugLog = [...(runtime.state.debugLog ?? []), entry].slice(-250);
   runtime.state.updatedAt = Date.now();
   console.info('[Aside]', entry);
-}
-
-function appendPanelLogEntries(runtime: PanelRuntime, entries: string[]): void {
-  if (!entries.length) {
-    return;
-  }
-
-  runtime.state.debugLog = [...(runtime.state.debugLog ?? []), ...entries].slice(-250);
-  runtime.state.updatedAt = Date.now();
 }
 
 /**
@@ -481,7 +230,6 @@ function appendPanelLogEntries(runtime: PanelRuntime, entries: string[]): void {
 const panelRevisions = new Map<string, number>();
 const dirtyPanelIds = new Set<string>();
 const unsavedPanelIds = new Set<string>();
-let sessionStorageUsable = true;
 
 function storageAreaForPanel(state: Pick<BranchPanelState, 'branchKind'>): 'local' | 'session' {
   return state.branchKind === 'temporary' ? 'session' : 'local';
@@ -534,27 +282,16 @@ function adoptAuthoritativeState(panelId: string, state: BranchPanelState, rev: 
     return;
   }
 
-  // Never yank text out from under someone mid-sentence: if the user is typing in
-  // this panel, keep their question and leave the panel marked unsaved.
-  const editing = document.activeElement === runtime.questionInput;
-  const localQuestion = runtime.questionInput.value;
-
+  // Saved-record views are read-only, so there is no local text to protect: the
+  // authoritative record wins, except for this tab's own view state.
   runtime.state = mergePanelStateOnConflict({
     local: runtime.state,
     theirs: state,
-    localQuestion: editing ? localQuestion : state.initialQuestion ?? '',
-    localDrivesBranch: tabDrivesBranch(runtime)
+    localQuestion: state.initialQuestion ?? '',
+    localDrivesBranch: false
   });
   lastWrittenSignatures.set(panelId, panelWriteSignature(runtime.state));
-  if (!editing) {
-    runtime.questionInput.value = runtime.state.initialQuestion ?? '';
-    unsavedPanelIds.delete(panelId);
-  } else {
-    // The user is typing here. Keep their text, but do NOT immediately write it
-    // back: that would silently overwrite the other tab's draft. The panel shows
-    // as unsaved until the user reaches a deliberate save point.
-    unsavedPanelIds.add(panelId);
-  }
+  unsavedPanelIds.delete(panelId);
 
   syncPanelUI(runtime);
   renderTabs();
@@ -609,7 +346,7 @@ async function writePanelRecord(runtime: PanelRuntime, attempt = 0): Promise<voi
     const theirs = response.current;
     panelRevisions.set(panelId, theirs.rev);
 
-    const localQuestion = runtime.questionInput.value;
+    const localQuestion = runtime.state.initialQuestion ?? '';
     const decision = resolveWriteConflict({
       localQuestion,
       theirQuestion: theirs.state.initialQuestion,
@@ -626,7 +363,7 @@ async function writePanelRecord(runtime: PanelRuntime, attempt = 0): Promise<voi
           local: runtime.state,
           theirs: theirs.state,
           localQuestion: decision.question,
-          localDrivesBranch: tabDrivesBranch(runtime)
+          localDrivesBranch: false
         }),
         updatedAt: Date.now()
       };
@@ -642,7 +379,7 @@ async function writePanelRecord(runtime: PanelRuntime, attempt = 0): Promise<voi
         local: runtime.state,
         theirs: theirs.state,
         localQuestion: decision.question,
-        localDrivesBranch: tabDrivesBranch(runtime)
+        localDrivesBranch: false
       });
       unsavedPanelIds.add(panelId);
       syncPanelUI(runtime);
@@ -659,8 +396,6 @@ async function writePanelRecord(runtime: PanelRuntime, attempt = 0): Promise<voi
   if (response.status === 'rejected-deleted') {
     // Closed in another tab. Honour that here rather than resurrecting it.
     appendPanelLog(runtime, 'Panel was closed in another tab; removing it here');
-    clearPanelWatchdog(runtime);
-    runtime.iframeEl.src = 'about:blank';
     runtime.element.remove();
     panelRuntimes.delete(panelId);
     panelRevisions.delete(panelId);
@@ -672,7 +407,6 @@ async function writePanelRecord(runtime: PanelRuntime, attempt = 0): Promise<voi
   if (response.unsaved) {
     unsavedPanelIds.add(panelId);
     if (storageAreaForPanel(runtime.state) === 'session') {
-      sessionStorageUsable = false;
     }
     syncPanelUI(runtime);
   }
@@ -779,7 +513,6 @@ async function listPanelRecords(): Promise<PanelListedRecord[]> {
     return [];
   }
   if (response.sessionUnavailable) {
-    sessionStorageUsable = false;
   }
   if (response.buildId) {
     workerBuildId = response.buildId;
@@ -870,101 +603,6 @@ async function migrateLegacyPanelStorage(): Promise<void> {
  */
 function branchKindStorageKey(): string {
   return `${LAST_BRANCH_KIND_STORAGE_KEY}:${provider.id}`;
-}
-
-async function loadLastUsedBranchKind(): Promise<void> {
-  if (!hasRuntimeAccess()) {
-    lastUsedBranchKind = 'persistent';
-    return;
-  }
-
-  const key = branchKindStorageKey();
-  try {
-    const stored = (await chrome.storage.local.get(key)) as Record<string, unknown>;
-    lastUsedBranchKind = stored[key] === 'temporary' ? 'temporary' : 'persistent';
-  } catch (error) {
-    if (!isInvalidatedError(error)) {
-      throw error;
-    }
-    lastUsedBranchKind = 'persistent';
-  }
-}
-
-function persistLastUsedBranchKind(kind: BranchKind): void {
-  lastUsedBranchKind = kind;
-  if (!hasRuntimeAccess()) {
-    return;
-  }
-
-  void chrome.storage.local
-    .set({ [branchKindStorageKey()]: kind })
-    .catch((error) => {
-      if (!isInvalidatedError(error)) {
-        console.warn('[Aside] Failed to persist branch kind', error);
-      }
-    });
-}
-
-async function createNativeBranchWindow(options: {
-  attempt: BranchAttemptRef;
-  prompt: string;
-  launchUrl: string;
-  branchKind: BranchKind;
-  focusWindow?: boolean;
-  arrangeSideBySide?: boolean;
-}): Promise<CreateBranchWindowResponse> {
-  if (!hasRuntimeAccess()) {
-    return {
-      ok: false,
-      reason: 'Chrome extension runtime is unavailable.'
-    };
-  }
-
-  try {
-    return (await chrome.runtime.sendMessage({
-      type: 'CREATE_BRANCH_WINDOW',
-      ...options.attempt,
-      prompt: options.prompt,
-      launchUrl: options.launchUrl,
-      branchKind: options.branchKind,
-      focusWindow: options.focusWindow,
-      arrangeSideBySide: options.arrangeSideBySide
-    })) as CreateBranchWindowResponse;
-  } catch (error) {
-    return {
-      ok: false,
-      reason: error instanceof Error ? error.message : String(error)
-    };
-  }
-}
-
-async function focusNativeBranchWindow(options: {
-  panelId: string;
-  launchTabId?: number;
-  launchWindowId?: number;
-  branchChatUrl?: string;
-}): Promise<FocusBranchWindowResponse> {
-  if (!hasRuntimeAccess()) {
-    return {
-      ok: false,
-      reason: 'Chrome extension runtime is unavailable.'
-    };
-  }
-
-  try {
-    return (await chrome.runtime.sendMessage({
-      type: 'FOCUS_BRANCH_WINDOW',
-      panelId: options.panelId,
-      launchTabId: options.launchTabId,
-      launchWindowId: options.launchWindowId,
-      branchChatUrl: options.branchChatUrl
-    })) as FocusBranchWindowResponse;
-  } catch (error) {
-    return {
-      ok: false,
-      reason: error instanceof Error ? error.message : String(error)
-    };
-  }
 }
 
 function detectChatGptTheme(): ThemeMode {
@@ -1884,6 +1522,7 @@ function ensureStyles(): void {
       background: rgba(16, 185, 129, 0.18);
       box-shadow: 0 0 0 2px rgba(5, 150, 105, 0.22);
     }
+  ${HANDOFF_CARD_CSS}
   `;
 
   const existing = document.getElementById(ROOT_STYLE_ID);
@@ -1900,43 +1539,6 @@ function ensureStyles(): void {
   const style = document.createElement('style');
   style.id = ROOT_STYLE_ID;
   style.textContent = css;
-  document.head.append(style);
-  cleanupFns.push(() => style.remove());
-}
-
-/**
- * Forces provider controls visible and clickable so automation can drive them.
- *
- * This is a blunt override of provider rendering, so it is installed ONLY in the
- * branch surface Aside is driving — never in the page the user is reading. It is
- * also removed on cleanup rather than left behind.
- */
-function ensureFrameAutomationStyles(): void {
-  if (document.getElementById(FRAME_AUTOMATION_STYLE_ID)) {
-    return;
-  }
-
-  const style = document.createElement('style');
-  style.id = FRAME_AUTOMATION_STYLE_ID;
-  style.textContent = `
-    article[data-message-author-role] [class*="opacity-0"],
-    article[data-message-author-role] [class*="invisible"],
-    article[data-message-author-role] [class*="pointer-events-none"],
-    main [data-testid^="conversation-turn-"] [class*="opacity-0"],
-    main [data-testid^="conversation-turn-"] [class*="invisible"],
-    main [data-testid^="conversation-turn-"] [class*="pointer-events-none"] {
-      opacity: 1 !important;
-      visibility: visible !important;
-      pointer-events: auto !important;
-    }
-
-    article[data-message-author-role] button,
-    article[data-message-author-role] [role="button"],
-    main [data-testid^="conversation-turn-"] button,
-    main [data-testid^="conversation-turn-"] [role="button"] {
-      pointer-events: auto !important;
-    }
-  `;
   document.head.append(style);
   cleanupFns.push(() => style.remove());
 }
@@ -2086,18 +1688,6 @@ function materializeSelectionPayload(
   }
 }
 
-/**
- * A selection taken inside a private chat defaults to a private branch, whatever the
- * user last chose elsewhere. Inheriting a remembered "Persistent" default here is how
- * a passage the user deliberately kept out of history ends up saved to it.
- */
-function getBranchKindForNewDraft(): BranchKind {
-  if (currentIdentity().urlPrivacyHint === 'private') {
-    return 'temporary';
-  }
-  return lastUsedBranchKind;
-}
-
 function openDraftFromCurrentSelection(entryAction: BranchEntryAction): void {
   const draft = currentSelectionDraft ?? getSelectionDraftFromWindow();
   const payload = currentSelectionPayload ?? materializeSelectionPayload(draft);
@@ -2107,22 +1697,10 @@ function openDraftFromCurrentSelection(entryAction: BranchEntryAction): void {
   }
   currentSelectionPayload = payload;
 
-  const branchKind = getBranchKindForNewDraft();
-  if (entryAction === 'new_tab') {
-    void openSelectionInNewTab(payload, branchKind);
-  } else if (entryAction === 'why') {
-    createBranchDraft(payload, {
-      entryAction,
-      branchKind,
-      initialQuestion: 'Why?',
-      autoStart: true
-    });
-  } else {
-    createBranchDraft(payload, {
-      entryAction,
-      branchKind
-    });
-  }
+  // Ask, Why and New-tab share one path: a scratch handoff that is temporary-
+  // intended and session-only whatever mode an earlier branch used. Nothing is
+  // copied, opened or saved until the Owner clicks in the card.
+  void openHandoff(entryAction, payload);
   // Deliberately does NOT clear the selection: the provider's native selection
   // options must remain usable after Aside has been invoked.
   hideAskButton(false);
@@ -2362,54 +1940,6 @@ function findLayoutConflicts(element: HTMLElement): HTMLElement[] {
  */
 let dodgedProviderNodes: HTMLElement[] = [];
 
-/**
- * Whether the embedded surface actually worked on this provider, this session.
- *
- * Session-scoped deliberately: a provider can change its framing headers, or an
- * enterprise policy can, and a refusal remembered across sessions would make that
- * permanent from Aside's side.
- */
-let embeddedSurfaceObservation: SurfaceObservation = 'unknown';
-
-function recordEmbeddedObservation(observed: SurfaceObservation, reason: string): void {
-  if (embeddedSurfaceObservation === observed) {
-    return;
-  }
-  embeddedSurfaceObservation = observed;
-  console.info(`[Aside] embedded surface on ${provider.id}: ${observed} (${reason})`);
-}
-
-/**
- * Did the frame actually load the provider, or an error page?
- *
- * A same-origin document is readable; a frame refused by X-Frame-Options or a CSP
- * frame-ancestors directive lands on the browser's own error page, which is not.
- * That is an observable property of the rendered page rather than an assumption
- * about headers — which is the whole point, since the assumption is what was
- * wrong.
- *
- * Returns null when it cannot be told apart, so an inconclusive read never
- * disables a surface.
- */
-function embeddedFrameWasRefused(iframe: HTMLIFrameElement): boolean | null {
-  if (!iframe.src || iframe.src === 'about:blank') {
-    return null;
-  }
-  try {
-    const doc = iframe.contentDocument;
-    if (!doc) {
-      return true;
-    }
-    // A refused frame can also present as an empty document with no location.
-    if (doc.location?.href === 'about:blank' && !doc.body?.childElementCount) {
-      return null;
-    }
-    return false;
-  } catch {
-    return true;
-  }
-}
-
 const MAX_REMEMBERED_CONFLICTS = 8;
 
 function liveRectsFor(nodes: HTMLElement[]): { rects: Rect[]; live: HTMLElement[] } {
@@ -2581,18 +2111,6 @@ function syncSelectionToolbarToViewport(): void {
   positionSelectionToolbar(rect);
 }
 
-function isElementVisible(element: HTMLElement): boolean {
-  const rect = element.getBoundingClientRect();
-  const style = window.getComputedStyle(element);
-  return (
-    rect.width > 0 &&
-    rect.height > 0 &&
-    style.display !== 'none' &&
-    style.visibility !== 'hidden' &&
-    Number(style.opacity || '1') > 0.01
-  );
-}
-
 function evaluateSelection(): void {
   if (isEvaluatingSelection) {
     return;
@@ -2728,6 +2246,11 @@ function ensureCompactLauncher(): HTMLButtonElement {
         openDraftFromCurrentSelection('ask');
         return;
       }
+      const hiddenCard = [...handoffCards.values()].find((card) => card.hidden && !card.ended);
+      if (hiddenCard) {
+        showHandoffCard(hiddenCard);
+        return;
+      }
       const firstMinimized = sortPanels().find((runtime) => runtime.state.minimized);
       if (firstMinimized) {
         expandPanel(firstMinimized.state.panelId);
@@ -2749,7 +2272,9 @@ function setCompactLauncherVisible(visible: boolean): void {
     return;
   }
 
-  const minimizedCount = sortPanels().filter((runtime) => runtime.state.minimized).length;
+  const minimizedCount =
+    sortPanels().filter((runtime) => runtime.state.minimized).length +
+    [...handoffCards.values()].filter((card) => card.hidden && !card.ended).length;
   launcher.textContent = minimizedCount ? `Aside (${minimizedCount})` : 'Aside';
   launcher.setAttribute(
     'aria-label',
@@ -2908,7 +2433,9 @@ function positionTabBar(isRetry = false): void {
     return;
   }
 
-  const minimizedCount = sortPanels().filter((runtime) => runtime.state.minimized).length;
+  const minimizedCount =
+    sortPanels().filter((runtime) => runtime.state.minimized).length +
+    [...handoffCards.values()].filter((card) => card.hidden && !card.ended).length;
   const { rects: railDodged, live } = liveRectsFor(dodgedRailNodes);
   dodgedRailNodes = live;
 
@@ -2976,20 +2503,9 @@ function getNonRootContainerUrl(url: string): string | undefined {
   return currentIdentity(url).containerUrl ?? undefined;
 }
 
-interface CreateDraftOptions {
-  entryAction: BranchEntryAction;
-  branchKind: BranchKind;
-  initialQuestion?: string;
-  autoStart?: boolean;
-  hostChatUrl?: string;
-  preferredSurface?: BranchSurfaceMode;
-}
-
 /**
- * The single place a branch context is assembled, used by Ask, Why and New-tab on
- * both providers. Assistant answers the selection touched are included by default;
- * the preceding question is offered but off, because widening history is a choice
- * the user makes rather than one Aside makes for them.
+ * The legacy branch context shape, kept so a record opened from the question
+ * database still has the fields older code paths read.
  */
 function createContextForSelection(selection: SelectionPayload): BranchContext {
   const blocks: ContextBlock[] = selection.selectedBlocks
@@ -3028,151 +2544,21 @@ function createContextForSelection(selection: SelectionPayload): BranchContext {
   });
 }
 
-function createDraftState(selection: SelectionPayload, options: CreateDraftOptions): BranchPanelState {
-  const hostChatUrl = normalizeChatUrl(options.hostChatUrl ?? selection.rootChatUrl);
-  return {
-    panelId: randomId('panel'),
-    rootConversationId: currentIdentity(hostChatUrl).scopeKey,
-    rootChatUrl: hostChatUrl,
-    rootProjectUrl: getNonRootContainerUrl(hostChatUrl),
-    selection,
-    context: createContextForSelection(selection),
-    // The preview is the structured selection — equation source, code, lists —
-    // never the whitespace-normalized anchor text, which exists only to find the
-    // passage again and flattens sub/superscripts and operators.
-    focusPreview: clipText(selection.structuredSelectedText || selection.selectedText, 400),
-    branchKind: options.branchKind,
-    entryAction: options.entryAction,
-    surfaceMode: options.preferredSurface ?? 'embedded',
-    preferredSurface: options.preferredSurface,
-    launchUrl: undefined,
-    creationMode: 'pending',
-    title: DEFAULT_BRANCH_TITLE,
-    titleStatus: 'pending',
-    minimized: false,
-    status: 'draft',
-    statusLabel: 'Ask a focused follow-up about this selected passage.',
-    initialQuestion: options.initialQuestion,
-    debugLog: [
-      formatDebugLogEntry('Branch draft created', {
-        rootChatUrl: selection.rootChatUrl,
-        rootConversationId: selection.rootConversationId,
-        selectedTextLength: selection.selectedText.length,
-        branchKind: options.branchKind,
-        entryAction: options.entryAction,
-        selectedBlocks: selection.selectedBlocks.map((block) => ({
-          role: block.role,
-          turnIndex: block.turnIndex,
-          messageId: block.messageId
-        })),
-        branchBaseMessageId: selection.branchBaseMessageId
-      })
-    ],
-    createdAt: Date.now(),
-    updatedAt: Date.now()
-  };
-}
-
-function focusDraftQuestionInput(runtime: PanelRuntime): void {
-  if (!runtime.questionInput.isConnected) {
-    return;
-  }
-  if (runtime.state.status !== 'draft' && runtime.state.status !== 'failed') {
-    return;
-  }
-  runtime.questionInput.click();
-  runtime.questionInput.focus({ preventScroll: true });
-  runtime.questionInput.setSelectionRange(
-    runtime.questionInput.value.length,
-    runtime.questionInput.value.length
-  );
-}
-
-function scheduleDraftQuestionFocus(runtime: PanelRuntime): void {
-  const deadline = Date.now() + 4_000;
-  const focusUntilSettled = () => {
-    if (!panelRuntimes.has(runtime.state.panelId)) {
-      return;
-    }
-
-    if (runtime.state.status !== 'draft' && runtime.state.status !== 'failed') {
-      return;
-    }
-
-    focusDraftQuestionInput(runtime);
-    if (document.activeElement === runtime.questionInput || Date.now() >= deadline) {
-      return;
-    }
-
-    window.requestAnimationFrame(focusUntilSettled);
-  };
-
-  window.requestAnimationFrame(focusUntilSettled);
-  window.requestAnimationFrame(() => {
-    focusDraftQuestionInput(runtime);
-  });
-  [0, 50, 150, 350, 750, 1500, 3000].forEach((delayMs) => {
-    window.setTimeout(() => {
-      focusDraftQuestionInput(runtime);
-    }, delayMs);
-  });
-}
-
-function focusPendingDraftQuestionInput(): void {
-  if (!pendingDraftFocusPanelId) {
-    return;
-  }
-
-  const runtime = panelRuntimes.get(pendingDraftFocusPanelId);
-  if (!runtime || runtime.state.status !== 'draft') {
-    pendingDraftFocusPanelId = null;
-    return;
-  }
-
-  focusDraftQuestionInput(runtime);
-  if (document.activeElement === runtime.questionInput) {
-    pendingDraftFocusPanelId = null;
-  }
-}
-
-function createBranchDraft(selection: SelectionPayload, options: CreateDraftOptions): PanelRuntime {
-  const state = createDraftState(selection, options);
-  minimizeOtherPanels(state.panelId);
-  const runtime = createPanelRuntime(state);
-  if (state.entryAction === 'new_tab' && state.status === 'draft') {
-    pendingDraftFocusPanelId = state.panelId;
-    focusDraftQuestionInput(runtime);
-    scheduleDraftQuestionFocus(runtime);
-  }
-  renderTabs();
-  persistPanels();
-
-  if (options.initialQuestion) {
-    runtime.questionInput.value = options.initialQuestion;
-    runtime.state.initialQuestion = options.initialQuestion;
-    syncPanelUI(runtime);
-  }
-
-  // An ordinary question gets its canonical record the moment it exists. A
-  // private one never does: session-only material is never staged on disk.
-  const registration =
-    state.branchKind === 'temporary' ? Promise.resolve() : registerQuestionForPanel(runtime);
-
-  if (options.autoStart && options.initialQuestion?.trim()) {
-    void registration.then(() => startBranch(state.panelId, options.initialQuestion!.trim()));
-  }
-
-  return runtime;
-}
-
+/**
+ * A saved record from an earlier version of Aside, shown read-only.
+ *
+ * Nothing here sends, loads a provider frame or opens a window on its own. The
+ * two ways forward are explicit: open the saved provider conversation as plain
+ * navigation, or ask about the same passage as a new temporary handoff — which
+ * leaves this record untouched.
+ */
 function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   const element = document.createElement('div');
-  element.className = PANEL_CLASS;
+  element.className = `${PANEL_CLASS} aside-legacy-panel`;
   element.dataset.panelId = state.panelId;
 
   const header = document.createElement('div');
   header.className = 'aside-panel-header';
-
   const headingWrap = document.createElement('div');
   headingWrap.className = 'aside-panel-heading';
   const titleEl = document.createElement('h2');
@@ -3188,30 +2574,27 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   jumpButton.textContent = 'Jump to origin';
   const openTabHeaderButton = document.createElement('button');
   openTabHeaderButton.type = 'button';
-  openTabHeaderButton.textContent = 'Open branch';
-  // Diagnostics sit behind one "More" disclosure: they are for a maintainer, and a
-  // failed panel should read as one error and a way forward, not six buttons.
+  openTabHeaderButton.textContent = 'Open conversation';
+  openTabHeaderButton.dataset.asideRole = 'legacy-open-conversation';
+  openTabHeaderButton.title = `Open the saved ${provider.label} conversation in a new tab. Nothing is sent.`;
   const moreDetails = document.createElement('details');
   moreDetails.className = 'aside-panel-more';
   const moreSummary = document.createElement('summary');
   moreSummary.textContent = 'More';
-  moreSummary.title = 'Diagnostics';
   const moreMenu = document.createElement('div');
   moreMenu.className = 'aside-panel-more-menu';
   const copyLogButton = document.createElement('button');
   copyLogButton.type = 'button';
   copyLogButton.textContent = 'Copy log';
   copyLogButton.title =
-    'Copy a redacted diagnostic report: URLs, status and automation steps, without your selected text or prompt.';
+    'Copy a redacted diagnostic report: URLs, status and steps, without your selected text or prompt.';
   const copyLogWithContentButton = document.createElement('button');
   copyLogWithContentButton.type = 'button';
   copyLogWithContentButton.textContent = 'Copy log + text';
-  copyLogWithContentButton.title =
-    'Copy the diagnostic report including your selected text and the generated prompt.';
+  copyLogWithContentButton.title = 'Copy the diagnostic report including your selected text and the prompt.';
   const selectLogMenuButton = document.createElement('button');
   selectLogMenuButton.type = 'button';
   selectLogMenuButton.textContent = 'Select log';
-  selectLogMenuButton.title = 'Show the redacted diagnostic report in the panel, selected for copying.';
   moreMenu.append(copyLogButton, copyLogWithContentButton, selectLogMenuButton);
   moreDetails.append(moreSummary, moreMenu);
   const minimizeButton = document.createElement('button');
@@ -3223,59 +2606,17 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   actions.append(jumpButton, openTabHeaderButton, minimizeButton, moreDetails, closeButton);
   header.append(headingWrap, actions);
 
-  // Recovery for a private mode that stopped short: what to do in the branch
-  // window, and the three ways forward. Ordinary mode is a deliberate two-step
-  // choice, never a fallback Aside takes on its own.
-  const recoveryEl = document.createElement('div');
-  recoveryEl.className = 'aside-recovery';
-  recoveryEl.hidden = true;
-  const recoveryText = document.createElement('p');
-  const recoveryActions = document.createElement('div');
-  recoveryActions.className = 'aside-recovery-actions';
-  const showTargetButton = document.createElement('button');
-  showTargetButton.type = 'button';
-  showTargetButton.className = 'aside-panel-secondary';
-  showTargetButton.textContent = 'Show branch window';
-  showTargetButton.dataset.asideRole = 'recovery-show-target';
-  const checkAgainButton = document.createElement('button');
-  checkAgainButton.type = 'button';
-  checkAgainButton.className = 'aside-panel-primary';
-  checkAgainButton.textContent = 'Check again';
-  checkAgainButton.dataset.asideRole = 'recovery-check-again';
-  checkAgainButton.title = `Look at the same branch window again and, if ${provider.privacy.label} is on, send the question there.`;
-  const ordinaryButton = document.createElement('button');
-  ordinaryButton.type = 'button';
-  ordinaryButton.className = 'aside-panel-secondary';
-  ordinaryButton.textContent = 'Use ordinary mode…';
-  ordinaryButton.dataset.asideRole = 'recovery-ordinary';
-  recoveryActions.append(showTargetButton, checkAgainButton, ordinaryButton);
-  const ordinaryConfirmEl = document.createElement('div');
-  ordinaryConfirmEl.className = 'aside-recovery-confirm';
-  ordinaryConfirmEl.hidden = true;
-  const ordinaryConfirmText = document.createElement('p');
-  ordinaryConfirmText.textContent = `Send this question as an ordinary ${provider.label} chat instead? It will not use ${provider.privacy.label}: ${provider.label} keeps it in your history and Aside keeps a saved record.`;
-  const ordinaryConfirmActions = document.createElement('div');
-  ordinaryConfirmActions.className = 'aside-recovery-actions';
-  const ordinaryConfirmButton = document.createElement('button');
-  ordinaryConfirmButton.type = 'button';
-  ordinaryConfirmButton.className = 'aside-panel-primary';
-  ordinaryConfirmButton.textContent = 'Send as ordinary chat';
-  ordinaryConfirmButton.dataset.asideRole = 'recovery-ordinary-confirm';
-  const ordinaryCancelButton = document.createElement('button');
-  ordinaryCancelButton.type = 'button';
-  ordinaryCancelButton.className = 'aside-panel-secondary';
-  ordinaryCancelButton.textContent = `Keep ${provider.privacy.label}`;
-  ordinaryConfirmActions.append(ordinaryConfirmButton, ordinaryCancelButton);
-  ordinaryConfirmEl.append(ordinaryConfirmText, ordinaryConfirmActions);
-  recoveryEl.append(recoveryText, recoveryActions, ordinaryConfirmEl);
-
   const body = document.createElement('div');
   body.className = 'aside-panel-body';
+
+  const legacyNote = document.createElement('p');
+  legacyNote.className = 'aside-legacy-note';
+  legacyNote.textContent = 'Saved record from an earlier version of Aside. Read-only: nothing here is sent automatically.';
 
   const focus = document.createElement('div');
   focus.className = 'aside-focus';
   const focusLabel = document.createElement('small');
-  focusLabel.textContent = 'Selected local focus';
+  focusLabel.textContent = 'Selected passage';
   const focusTextEl = document.createElement('p');
   focusTextEl.title = 'Click to expand or collapse the selected passage';
   focusTextEl.addEventListener('click', () => {
@@ -3283,134 +2624,13 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   });
   focus.append(focusLabel, focusTextEl);
 
-  const formEl = document.createElement('form');
-  formEl.className = 'aside-launcher';
-  const branchKindField = document.createElement('div');
-  branchKindField.className = 'aside-kind-toggle';
-  const persistentKindButton = document.createElement('button');
-  persistentKindButton.type = 'button';
-  persistentKindButton.textContent = 'Persistent';
-  // Stable hook: the visible label is the provider's own word for the mode and
-  // therefore differs per provider.
-  persistentKindButton.dataset.asideRole = 'branch-kind-persistent';
-  const temporaryKindButton = document.createElement('button');
-  temporaryKindButton.type = 'button';
-  // The provider's own name for the mode, not a word Aside invented: the user has
-  // to recognise it in the provider's own interface to check it.
-  temporaryKindButton.textContent = provider.privacy.label;
-  temporaryKindButton.dataset.asideRole = 'branch-kind-temporary';
-  temporaryKindButton.title = `Run this branch in ${provider.label}'s ${provider.privacy.label} mode`;
-
-  // What the provider documents about its private mode, shown before a private
-  // branch runs rather than described only in the README. Collapsed by default so
-  // it does not shout, but present at the moment the choice is made.
-  const privacyNoteEl = document.createElement('details');
-  privacyNoteEl.className = 'aside-privacy-note';
-  const privacyNoteSummary = document.createElement('summary');
-  privacyNoteSummary.textContent = `What ${provider.privacy.label} does and does not do`;
-  // Shown only when session storage is unavailable: a private branch still runs,
-  // but Aside will not fall back to writing its content to disk, so the panel
-  // cannot be kept. The user should hear that before choosing the mode, not after
-  // the branch disappears.
-  const privacyContainerWarning = document.createElement('p');
-  privacyContainerWarning.className = 'aside-privacy-warning';
-  privacyContainerWarning.textContent = `${provider.privacy.label} is not available inside a project, so this branch will start outside it. The project's files and instructions will not travel with it.`;
-  privacyContainerWarning.hidden = true;
-
-  const privacyStorageWarning = document.createElement('p');
-  privacyStorageWarning.className = 'aside-privacy-warning';
-  privacyStorageWarning.textContent =
-    'This browser did not make session storage available to Aside. A private branch will still run, but it cannot be kept when you leave the page: Aside will not write private branch content to disk instead.';
-  privacyStorageWarning.hidden = true;
-  const privacyNoteList = document.createElement('ul');
-  provider.privacy.constraints.forEach((constraint) => {
-    const item = document.createElement('li');
-    item.textContent = constraint;
-    // The container warning above says this in one bold line when it applies;
-    // the bullet is then hidden rather than said twice.
-    if (/project/i.test(constraint)) {
-      item.dataset.topic = 'project';
-    }
-    privacyNoteList.append(item);
-  });
-  privacyNoteEl.append(
-    privacyNoteSummary,
-    privacyContainerWarning,
-    privacyStorageWarning,
-    privacyNoteList
-  );
-  const questionInput = document.createElement('textarea');
-  // Stable hook: the panel has more than one textarea, and selectors that rely on
-  // document order break the moment a section is added above this one.
-  questionInput.dataset.asideRole = 'question';
-  questionInput.placeholder = 'Ask a focused question about this passage';
-  questionInput.autocomplete = 'off';
-  questionInput.autocapitalize = 'sentences';
-  questionInput.autofocus = state.entryAction === 'new_tab' && state.status === 'draft';
-  const launcherActions = document.createElement('div');
-  launcherActions.className = 'aside-launcher-actions';
-  const submitButton = document.createElement('button');
-  submitButton.type = 'submit';
-  submitButton.className = 'aside-panel-primary';
-  submitButton.textContent = 'Start branch';
-  branchKindField.append(persistentKindButton, temporaryKindButton);
-  launcherActions.append(submitButton);
-  formEl.append(branchKindField, privacyNoteEl, questionInput, launcherActions);
-
-  const iframeShell = document.createElement('div');
-  iframeShell.className = 'aside-frame-shell';
-  iframeShell.hidden = true;
-  const iframeEl = document.createElement('iframe');
-  iframeEl.className = 'aside-frame';
-  iframeEl.title = `${provider.label} embedded branch`;
-  iframeEl.setAttribute('loading', 'eager');
-  iframeEl.referrerPolicy = 'strict-origin-when-cross-origin';
-  iframeEl.src = 'about:blank';
-  const iframeOverlay = document.createElement('div');
-  iframeOverlay.className = 'aside-frame-overlay';
-  const iframeOverlayCard = document.createElement('div');
-  iframeOverlayCard.className = 'aside-frame-overlay-card';
-  const iframeOverlayTitle = document.createElement('p');
-  iframeOverlayTitle.className = 'aside-frame-overlay-title';
-  const iframeOverlayText = document.createElement('p');
-  iframeOverlayText.className = 'aside-frame-overlay-text';
-  iframeOverlayCard.append(iframeOverlayTitle, iframeOverlayText);
-  iframeOverlay.append(iframeOverlayCard);
-  iframeShell.append(iframeEl, iframeOverlay);
-
-  // Context: what will actually be submitted, inspectable and editable before it is.
-  const contextShell = document.createElement('details');
-  contextShell.className = 'aside-context';
-  const contextSummary = document.createElement('summary');
-  contextSummary.textContent = 'Context';
-  const contextSource = document.createElement('p');
-  contextSource.className = 'aside-context-source';
-  const contextBlockList = document.createElement('div');
-  contextBlockList.className = 'aside-context-blocks';
-  const contextBackgroundLabel = document.createElement('label');
-  contextBackgroundLabel.className = 'aside-context-background';
-  contextBackgroundLabel.textContent = 'Background to add (optional)';
-  const contextBackground = document.createElement('textarea');
-  contextBackground.dataset.asideRole = 'context-background';
-  contextBackground.rows = 2;
-  contextBackground.placeholder = 'Anything the passage assumes but does not say';
-  contextBackgroundLabel.append(contextBackground);
-  const contextSizeEl = document.createElement('p');
-  contextSizeEl.className = 'aside-context-size';
-  const contextPreviewLabel = document.createElement('p');
-  contextPreviewLabel.className = 'aside-context-preview-label';
-  contextPreviewLabel.textContent = 'Exactly what will be sent:';
-  const contextPreview = document.createElement('pre');
-  contextPreview.className = 'aside-context-preview';
-  contextShell.append(
-    contextSummary,
-    contextSource,
-    contextBlockList,
-    contextBackgroundLabel,
-    contextSizeEl,
-    contextPreviewLabel,
-    contextPreview
-  );
+  const promptShell = document.createElement('details');
+  promptShell.className = 'aside-context';
+  const promptSummary = document.createElement('summary');
+  promptSummary.textContent = 'Prompt that was prepared for this branch';
+  const promptPre = document.createElement('pre');
+  promptPre.className = 'aside-context-preview';
+  promptShell.append(promptSummary, promptPre);
 
   // Saved thread: what was read back from the branch conversation. Read-only
   // evidence; opening it never opens a provider tab or sends anything.
@@ -3418,14 +2638,22 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   archiveEl.className = 'aside-archive';
   archiveEl.hidden = true;
 
+  const legacyActions = document.createElement('div');
+  legacyActions.className = 'aside-launcher-actions aside-legacy-actions';
+  const askAgainButton = document.createElement('button');
+  askAgainButton.type = 'button';
+  askAgainButton.className = 'aside-panel-primary';
+  askAgainButton.textContent = 'Ask about this passage (temporary handoff)';
+  askAgainButton.dataset.asideRole = 'legacy-ask-handoff';
+  legacyActions.append(askAgainButton);
+
   const debugLogShell = document.createElement('div');
   debugLogShell.className = 'aside-debug-log';
   debugLogShell.hidden = true;
   const debugLogTitle = document.createElement('strong');
   debugLogTitle.textContent = 'Copyable debug log';
   const debugLogHelp = document.createElement('p');
-  debugLogHelp.textContent =
-    'Clipboard access was blocked, so select this log and paste it where you need it.';
+  debugLogHelp.textContent = 'Select this log and paste it where you need it.';
   const debugLogTextarea = document.createElement('textarea');
   debugLogTextarea.dataset.asideRole = 'debug-log';
   debugLogTextarea.readOnly = true;
@@ -3443,7 +2671,7 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   debugLogActions.append(selectDebugLogButton, closeDebugLogButton);
   debugLogShell.append(debugLogTitle, debugLogHelp, debugLogTextarea, debugLogActions);
 
-  body.append(focus, contextShell, archiveEl, recoveryEl, formEl, iframeShell, debugLogShell);
+  body.append(legacyNote, focus, promptShell, archiveEl, legacyActions, debugLogShell);
   element.append(header, body);
   mountInExtensionHost(element);
 
@@ -3454,65 +2682,21 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
     statusEl,
     errorEl,
     focusTextEl,
-    formEl,
-    branchKindField,
-    privacyNoteEl,
-    privacyStorageWarning,
-    privacyContainerWarning,
-    persistentKindButton,
-    temporaryKindButton,
-    questionInput,
-    submitButton,
-    iframeShell,
-    iframeEl,
-    iframeOverlay,
-    iframeOverlayTitle,
-    iframeOverlayText,
-    contextShell,
-    contextBlockList,
-    contextBackground,
-    contextSizeEl,
-    contextPreview,
+    promptShell,
+    promptPre,
     archiveEl,
-    writtenCapture: new Map<number, string>(),
     debugLogShell,
     debugLogTextarea,
     copyLogButton,
     openTabHeaderButton,
-    moreDetails,
-    recoveryEl,
-    recoveryText,
-    showTargetButton,
-    checkAgainButton,
-    ordinaryButton,
-    ordinaryConfirmEl,
-    frameReady: false,
-    frameStartSent: false,
-    showTargetWhileFailed: false
+    moreDetails
   };
-
-  questionInput.value = state.initialQuestion ?? '';
-  contextSource.textContent = state.context?.sourceLabel ?? '';
-  contextBackground.value = state.context?.userBackground ?? '';
-
-  contextBackground.addEventListener('input', () => {
-    if (!runtime.state.context) {
-      return;
-    }
-    runtime.state.context = withUserBackground(runtime.state.context, contextBackground.value);
-    runtime.state.updatedAt = Date.now();
-    renderContextSection(runtime);
-    persistPanelsSoon();
-  });
-  contextBackground.addEventListener('blur', () => {
-    void syncDraftToStore(runtime);
-  });
 
   jumpButton.addEventListener('click', () => {
     scrollToOrigin(runtime.state.selection);
   });
   openTabHeaderButton.addEventListener('click', () => {
-    void openBranchInNewTab(runtime.state.panelId);
+    void openSavedConversation(runtime.state.panelId);
   });
   copyLogButton.addEventListener('click', () => {
     moreDetails.open = false;
@@ -3525,23 +2709,6 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   selectLogMenuButton.addEventListener('click', () => {
     moreDetails.open = false;
     showCopyableDebugLog(runtime, buildBranchDebugLogText(runtime, false));
-  });
-  showTargetButton.addEventListener('click', () => {
-    void showBranchTarget(runtime.state.panelId);
-  });
-  checkAgainButton.addEventListener('click', () => {
-    void checkPrivateModeAgain(runtime.state.panelId);
-  });
-  ordinaryButton.addEventListener('click', () => {
-    ordinaryConfirmEl.hidden = false;
-    ordinaryConfirmButton.focus();
-  });
-  ordinaryCancelButton.addEventListener('click', () => {
-    ordinaryConfirmEl.hidden = true;
-  });
-  ordinaryConfirmButton.addEventListener('click', () => {
-    ordinaryConfirmEl.hidden = true;
-    void useOrdinaryModeInstead(runtime.state.panelId);
   });
   selectDebugLogButton.addEventListener('click', () => {
     debugLogTextarea.focus();
@@ -3556,104 +2723,14 @@ function createPanelRuntime(state: BranchPanelState): PanelRuntime {
   closeButton.addEventListener('click', () => {
     closePanel(runtime.state.panelId);
   });
-  iframeEl.addEventListener('load', () => {
-    const refused = embeddedFrameWasRefused(iframeEl);
-    appendPanelLog(runtime, 'Embedded branch frame load event', {
-      iframeSrc: iframeEl.src,
-      panelStatus: runtime.state.status,
-      frameRefused: refused
-    });
-
-    if (refused === true && runtime.state.surfaceMode === 'embedded') {
-      // Observed, not assumed. Fall back rather than sitting on an error page
-      // until the handshake watchdog fires.
-      recordEmbeddedObservation('refused', 'frame document was not readable after load');
-      clearPanelWatchdog(runtime);
-      void promotePersistentBranchToNativeWindow(runtime);
-      return;
-    }
-
-    if (refused === false) {
-      recordEmbeddedObservation('worked', 'frame document was readable after load');
-    }
-
-    syncPanelUI(runtime);
-  });
-  formEl.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const question = questionInput.value.trim();
-    if (!question) {
-      return;
-    }
-    await startBranch(runtime.state.panelId, question);
-  });
-  persistentKindButton.addEventListener('click', () => {
-    runtime.state.branchKind = 'persistent';
-    runtime.state.updatedAt = Date.now();
-    persistLastUsedBranchKind('persistent');
-    syncPanelUI(runtime);
-    persistPanels();
-    // Back to ordinary retention: the question gets its durable record now.
-    if (!runtime.state.questionId) {
-      void registerQuestionForPanel(runtime);
-    }
-  });
-  temporaryKindButton.addEventListener('click', () => {
-    runtime.state.branchKind = 'temporary';
-    runtime.state.updatedAt = Date.now();
-    persistLastUsedBranchKind('temporary');
-    syncPanelUI(runtime);
-    persistPanels();
-    // A draft that turns private must leave nothing on disk. Only an unsent
-    // draft can do this silently; a sent question keeps its history and the
-    // Owner is told to continue as a new private question instead.
-    if (runtime.state.questionId && !runtime.state.snapshotId) {
-      const questionId = runtime.state.questionId;
-      runtime.state.questionId = undefined;
-      questionRevs.delete(questionId);
-      draftRevs.delete(questionId);
-      void runCommand({ type: 'DeleteQuestion', questionId, descendants: 'reparent' }).then(() =>
-        refreshQuestionList()
-      );
-    }
-  });
-  questionInput.addEventListener('input', () => {
-    runtime.state.initialQuestion = questionInput.value;
-    runtime.state.updatedAt = Date.now();
-    syncPanelUI(runtime);
-    persistPanelsSoon(runtime.state.panelId);
-  });
-  // Leaving the box is a deliberate save point, which is also how a panel that went
-  // unsaved because another tab wrote first gets reconciled.
-  questionInput.addEventListener('blur', () => {
-    void syncDraftToStore(runtime);
-    runtime.state.initialQuestion = questionInput.value;
-    runtime.state.updatedAt = Date.now();
-    persistPanels(runtime.state.panelId);
-  });
-  // Enter sends, Shift+Enter adds a line, matching the composer the user just came from.
-  // isComposing keeps IME candidate selection from submitting a half-typed question.
-  questionInput.addEventListener('keydown', (event) => {
-    if (event.key !== 'Enter' || event.shiftKey || event.isComposing) {
-      return;
-    }
-
-    event.preventDefault();
-    if (submitButton.disabled) {
-      return;
-    }
-
-    if (typeof formEl.requestSubmit === 'function') {
-      formEl.requestSubmit();
-      return;
-    }
-
-    formEl.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true }));
+  askAgainButton.addEventListener('click', () => {
+    // A new scratch session from the saved passage; the record is not changed.
+    minimizePanel(runtime.state.panelId);
+    void openHandoff('ask', runtime.state.selection, runtime.state.initialQuestion ?? '');
   });
 
   panelRuntimes.set(state.panelId, runtime);
   syncPanelUI(runtime);
-
   return runtime;
 }
 
@@ -3676,150 +2753,6 @@ function getDisplayTitle(state: BranchPanelState): string {
   }
 
   return 'Naming branch...';
-}
-
-// A failed branch is the one state where the user most needs the form back, including a
-// branch that was promoted to a native window or that failed after a URL appeared.
-// Without this, "Close" was the only way out of a failure.
-function canShowForm(state: BranchPanelState): boolean {
-  return state.status === 'draft' || state.status === 'failed';
-}
-
-function canShowBranchKindToggle(state: BranchPanelState): boolean {
-  return canShowForm(state) && (state.entryAction === 'ask' || state.entryAction === 'new_tab');
-}
-
-function canShowFrame(state: BranchPanelState): boolean {
-  if (state.surfaceMode === 'native_window' || state.archiveOnly) {
-    return false;
-  }
-  return state.status !== 'draft' || Boolean(state.branchChatUrl) || Boolean(state.launchUrl);
-}
-
-/**
- * Render the Context section from the panel's own context value. The preview shows
- * the exact string the prompt will carry, produced by the same function that builds
- * it, so the two cannot drift.
- */
-function sourceTurnsForState(state: BranchPanelState): SourceTurn[] {
-  const turns: SourceTurn[] = state.selection.selectedBlocks.map((block) => ({
-    id: block.messageId,
-    role: block.role,
-    turnIndex: block.turnIndex,
-    text: block.structuredText || block.text
-  }));
-  const preceding = state.selection.precedingQuestion;
-  if (preceding && !turns.some((turn) => turn.id === preceding.messageId)) {
-    turns.push({
-      id: preceding.messageId,
-      role: preceding.role,
-      turnIndex: preceding.turnIndex,
-      text: preceding.structuredText || preceding.text
-    });
-  }
-  return turns.sort((left, right) => left.turnIndex - right.turnIndex);
-}
-
-/** The plan for a panel, from its selection, exclusions, background and history. */
-function buildPlanForPanel(runtime: PanelRuntime, question?: string): ContextPlan {
-  const { state } = runtime;
-  const turns = sourceTurnsForState(state);
-  const anchorTurn =
-    turns.find((turn) => turn.id === state.selection.branchBaseMessageId) ??
-    [...turns].reverse().find((turn) => turn.role === 'assistant') ??
-    turns[0] ?? {
-      id: state.selection.branchBaseMessageId,
-      role: 'assistant' as const,
-      turnIndex: 0,
-      text: state.selection.structuredSelectedText || state.selection.selectedText
-    };
-  const input: PlanInput = {
-    focusText: state.selection.structuredSelectedText || state.selection.selectedText,
-    anchorTurn,
-    turns,
-    question: question ?? runtime.questionInput.value.trim() ?? '',
-    background: state.context?.userBackground ?? '',
-    excludedIds: state.excludedPlanIds ?? [],
-    history: (state.archive?.messages ?? [])
-      .filter((message) => !message.partial)
-      .map((message) => ({ role: message.role, text: message.text })),
-    unavailableReferences: [],
-    enclosingEquations: state.selection.enclosingEquations ?? [],
-    fidelityLimitations: state.selection.fidelity?.limitations ?? [],
-    maxChars: DEFAULT_MAX_CONTEXT_CHARS
-  };
-  return buildContextPlan(input);
-}
-
-/**
- * Render the Context section from the plan. The preview is the complete prompt
- * — instructions, material and question — produced by the same functions that
- * build the submission, so the two cannot drift.
- */
-function renderContextSection(runtime: PanelRuntime): void {
-  const { state } = runtime;
-  if (!state.selection) {
-    runtime.contextShell.hidden = true;
-    return;
-  }
-
-  runtime.contextShell.hidden = false;
-  runtime.contextBlockList.replaceChildren();
-
-  const plan = buildPlanForPanel(runtime);
-  const summary = runtime.contextShell.querySelector<HTMLElement>('.aside-context-source');
-  if (summary) {
-    summary.textContent = describePlan(plan);
-  }
-
-  plan.blocks.forEach((block) => {
-    const row = document.createElement('label');
-    row.className = 'aside-context-block';
-    row.dataset.planRole = block.role;
-
-    const toggle = document.createElement('input');
-    toggle.type = 'checkbox';
-    toggle.checked = block.included;
-    // The focus is what the question is about; background is what the Owner
-    // typed. Neither is something to untick — remove the text instead.
-    toggle.disabled = block.role === 'focus' || block.role === 'background';
-    toggle.addEventListener('change', () => {
-      const excluded = new Set(runtime.state.excludedPlanIds ?? []);
-      if (toggle.checked) {
-        excluded.delete(block.id);
-      } else {
-        excluded.add(block.id);
-      }
-      runtime.state.excludedPlanIds = [...excluded];
-      runtime.state.updatedAt = Date.now();
-      renderContextSection(runtime);
-      syncPanelUI(runtime);
-      persistPanels(runtime.state.panelId);
-      void syncDraftToStore(runtime);
-    });
-
-    const label = document.createElement('span');
-    const omitted = !block.included && block.omitReason === 'budget' ? ' (left out to fit the size limit)' : '';
-    label.textContent = `${block.reason}: ${clipText(compactWhitespace(block.text), 90)}${omitted}`;
-    row.append(toggle, label);
-    runtime.contextBlockList.append(row);
-  });
-
-  if (plan.missing.length) {
-    const missing = document.createElement('small');
-    missing.className = 'aside-context-limitation';
-    missing.textContent = `Known gaps: ${plan.missing.join('; ')}`;
-    runtime.contextBlockList.append(missing);
-  }
-
-  runtime.contextSizeEl.textContent = plan.overBudget
-    ? `The passage and question alone are about ${plan.charCount.toLocaleString()} characters, over Aside's ${plan.maxChars.toLocaleString()}-character limit. Select a smaller passage.`
-    : `About ${plan.charCount.toLocaleString()} characters of material (limit ${plan.maxChars.toLocaleString()}; characters, not tokens).`;
-  runtime.contextSizeEl.dataset.overBudget = String(plan.overBudget);
-  runtime.contextPreview.textContent = buildPrompt({
-    contextText: renderPlanText(plan),
-    question: runtime.questionInput.value.trim() || '(your question)'
-  });
 }
 
 function captureLabelForState(state: BranchPanelState): string {
@@ -3869,98 +2802,35 @@ function renderArchiveSection(runtime: PanelRuntime): void {
   }
 }
 
+/** One status line for a saved record, by what it is — never a live state. */
+function legacyStatusLine(state: BranchPanelState): string {
+  if (state.status === 'live' || state.branchChatUrl) {
+    return state.branchChatUrl
+      ? `Saved branch. Open its ${provider.label} conversation, or read what was saved below.`
+      : 'Saved branch.';
+  }
+  if (state.status === 'draft') {
+    return 'Unsent draft. Ask about it as a temporary handoff, or close it.';
+  }
+  return 'This branch was not completed.';
+}
+
 function syncPanelUI(runtime: PanelRuntime): void {
   const { state } = runtime;
-  const showForm = canShowForm(state);
-  const showFrame = canShowFrame(state);
-  const showOpenBranch = Boolean(
-    state.branchChatUrl || state.launchTabId || state.launchWindowId
-  );
-  // A private preparation that stopped short is recoverable on the same target,
-  // so its frame is kept alive but not shown as a blank "live" surface.
-  const recovery = state.status === 'failed' ? state.recovery : undefined;
-  const overlayVisible = state.status !== 'live' && !recovery;
-
   runtime.element.hidden = state.minimized;
   runtime.titleEl.textContent = getDisplayTitle(state);
   const unsaved = unsavedPanelIds.has(state.panelId);
   runtime.statusEl.textContent = unsaved
-    ? `${state.statusLabel} (not saved — this branch is only in this tab)`
-    : state.statusLabel;
+    ? `${legacyStatusLine(state)} (not saved — this view is only in this tab)`
+    : legacyStatusLine(state);
   runtime.element.dataset.unsaved = String(unsaved);
   runtime.errorEl.textContent = state.status === 'failed' ? state.errorMessage ?? '' : '';
   runtime.errorEl.style.display = runtime.errorEl.textContent ? 'block' : 'none';
   runtime.focusTextEl.textContent = state.focusPreview;
-  renderContextSection(runtime);
+  runtime.promptPre.textContent = state.initialPrompt ?? '';
+  runtime.promptShell.hidden = !state.initialPrompt;
   renderArchiveSection(runtime);
-
-  // Over budget is a decision for the user, not a silent truncation, so the send
-  // is blocked until they remove something.
-  const contextOverBudget = runtime.contextSizeEl.dataset.overBudget === 'true';
-
-  runtime.formEl.style.display = showForm ? 'flex' : 'none';
-  runtime.branchKindField.style.display = canShowBranchKindToggle(state) ? 'inline-flex' : 'none';
-  const privacyNoteVisible = showForm && state.branchKind === 'temporary';
-  runtime.privacyNoteEl.hidden = !privacyNoteVisible;
-
-  // Losing the project's files and instructions is a real change to what the
-  // branch can see. It is said once, as the summary line's own warning, and the
-  // note stays collapsed: the Owner opens it, Aside does not open it for them.
-  const leavesContainer = privateBranchLeavesContainer(state);
-  runtime.privacyContainerWarning.hidden = !(privacyNoteVisible && leavesContainer);
-  runtime.privacyNoteEl
-    .querySelectorAll<HTMLLIElement>('li[data-topic="project"]')
-    .forEach((item) => {
-      item.hidden = privacyNoteVisible && leavesContainer;
-    });
-  runtime.privacyStorageWarning.hidden = sessionStorageUsable;
-  runtime.persistentKindButton.dataset.selected = String(state.branchKind === 'persistent');
-  runtime.temporaryKindButton.dataset.selected = String(state.branchKind === 'temporary');
-  runtime.questionInput.disabled = !showForm;
-  runtime.persistentKindButton.disabled = !showForm;
-  runtime.temporaryKindButton.disabled = !showForm;
-  runtime.submitButton.disabled =
-    !runtime.questionInput.value.trim() ||
-    contextOverBudget ||
-    state.status === 'creating_branch' ||
-    state.status === 'opening_branch';
-  runtime.submitButton.title = contextOverBudget
-    ? 'The passage and question alone exceed the size limit. Select a smaller passage.'
-    : '';
-  runtime.submitButton.textContent = state.status === 'failed' ? 'Try again' : 'Start branch';
-  runtime.iframeShell.hidden = !showFrame || (Boolean(recovery) && !runtime.showTargetWhileFailed);
-  runtime.iframeOverlay.hidden = !overlayVisible;
-
-  runtime.recoveryEl.hidden = !recovery;
-  if (recovery) {
-    runtime.recoveryText.textContent = describeRecoveryHint(recovery);
-    runtime.showTargetButton.hidden = !recovery.offerShowTarget;
-    runtime.checkAgainButton.hidden = !recovery.offerCheckAgain;
-    runtime.ordinaryButton.hidden = !recovery.offerOrdinaryMode || state.branchKind !== 'temporary';
-    if (runtime.ordinaryButton.hidden) {
-      runtime.ordinaryConfirmEl.hidden = true;
-    }
-  } else {
-    runtime.ordinaryConfirmEl.hidden = true;
-  }
-  runtime.iframeOverlayTitle.textContent =
-    state.surfaceMode === 'native_window'
-      ? state.status === 'failed'
-        ? `${provider.label} branch could not finish loading`
-        : state.status === 'live'
-          ? ''
-          : `This branch runs in a ${provider.label} window`
-      : state.status === 'failed'
-      ? 'Branch could not finish loading'
-      : state.status === 'live'
-        ? ''
-        : 'Opening branch in this window';
-  // The error is said once, by the heading; the overlay carries only the status.
-  runtime.iframeOverlayText.textContent = state.statusLabel;
-  runtime.openTabHeaderButton.style.display = showOpenBranch ? 'inline-flex' : 'none';
-  if (state.status === 'live') {
-    ensureLiveFrameLocation(runtime);
-  }
+  runtime.openTabHeaderButton.style.display = state.branchChatUrl ? 'inline-flex' : 'none';
 }
 
 function renderTabs(): void {
@@ -3969,7 +2839,8 @@ function renderTabs(): void {
 
   const minimized = sortPanels().filter((runtime) => runtime.state.minimized && !runtime.state.closedView);
   const questionCount = questionListCount();
-  container.hidden = minimized.length === 0 && questionCount === 0;
+  const hiddenHandoffs = [...handoffCards.values()].filter((card) => card.hidden && !card.ended);
+  container.hidden = minimized.length === 0 && questionCount === 0 && hiddenHandoffs.length === 0;
 
   if (questionCount > 0 || questionListEntries.length > 0) {
     const listTab = document.createElement('div');
@@ -3983,6 +2854,22 @@ function renderTabs(): void {
     listTab.append(listButton);
     container.append(listTab);
   }
+
+  // Scratch handoffs: session-only entries, never written to the panel store.
+  hiddenHandoffs.forEach((card) => {
+    const tab = document.createElement('div');
+    tab.className = 'aside-tab aside-tab-handoff';
+    tab.dataset.sessionId = card.sessionId;
+    const openButton = document.createElement('button');
+    openButton.type = 'button';
+    openButton.textContent = card.railLabel();
+    openButton.title = 'Temporary handoff (not saved in Aside)';
+    const badge = document.createElement('small');
+    badge.textContent = 'temporary';
+    openButton.addEventListener('click', () => showHandoffCard(card));
+    tab.append(openButton, badge);
+    container.append(tab);
+  });
 
   minimized.forEach((runtime) => {
     const tab = document.createElement('div');
@@ -4022,6 +2909,47 @@ function renderTabs(): void {
   positionTabBar();
 }
 
+/**
+ * The panel slot sits at the right of the viewport. Where the provider's
+ * composer (or a tool pane) is below it on the same side, the slot stops short
+ * of it instead of painting over a native control; the card's body scrolls.
+ */
+function fitSlotToFreeSpace(element: HTMLElement): void {
+  if (element.hidden) {
+    return;
+  }
+  element.style.maxHeight = '';
+  const card = element.getBoundingClientRect();
+  if (card.width <= 0 || card.height <= 0) {
+    return;
+  }
+  const blocking = provider.layout.reservedRegionSelectors
+    .filter((entry) => entry.kind === 'composer' || entry.kind === 'tool-panel')
+    .flatMap((entry) => {
+      try {
+        return Array.from(document.querySelectorAll<HTMLElement>(entry.selector));
+      } catch {
+        return [];
+      }
+    })
+    .filter((node) => !isAsideOwned(node))
+    .map((node) => node.getBoundingClientRect())
+    .filter(
+      (rect) =>
+        rect.width > 0 &&
+        rect.height > 0 &&
+        rect.left < card.right &&
+        rect.right > card.left &&
+        rect.top > card.top + 120 &&
+        rect.top < card.bottom
+    );
+  if (!blocking.length) {
+    return;
+  }
+  const limit = Math.min(...blocking.map((rect) => rect.top)) - card.top - 12;
+  element.style.maxHeight = `${Math.max(240, Math.floor(limit))}px`;
+}
+
 function syncMountedUi(): void {
   ensureExtensionHost();
 
@@ -4035,6 +2963,13 @@ function syncMountedUi(): void {
   sortPanels().forEach((runtime) => {
     mountInExtensionHost(runtime.element);
     syncPanelUI(runtime);
+    fitSlotToFreeSpace(runtime.element);
+  });
+  handoffCards.forEach((card) => {
+    if (!card.ended) {
+      mountInExtensionHost(card.element);
+      fitSlotToFreeSpace(card.element);
+    }
   });
 
   renderTabs();
@@ -4042,8 +2977,6 @@ function syncMountedUi(): void {
   if (highlightOverlay?.childElementCount) {
     mountInExtensionHost(highlightOverlay);
   }
-
-  focusPendingDraftQuestionInput();
 }
 
 function scheduleMountedUiSync(delayMs: number): void {
@@ -4141,8 +3074,6 @@ function createStateFromRestore(raw: BranchPanelState): BranchPanelState | null 
     minimized: Boolean(raw.minimized),
     initialQuestion: raw.initialQuestion,
     initialPrompt: raw.initialPrompt,
-    // Validated as data: a stored record is no more trusted than a message.
-    recovery: status === 'failed' && isPrivacyRecovery(raw.recovery) ? raw.recovery : undefined,
     status,
     statusLabel:
       raw.statusLabel ||
@@ -4223,6 +3154,7 @@ function expandPanel(panelId: string): void {
   minimizeOtherPanels(panelId);
   runtime.state.minimized = false;
   runtime.state.updatedAt = Date.now();
+  yieldHandoffCards();
   syncPanelUI(runtime);
   renderTabs();
   persistPanels(panelId);
@@ -4243,7 +3175,6 @@ function closePanel(panelId: string): void {
   runtime.state.closedView = true;
   runtime.state.minimized = true;
   runtime.state.updatedAt = Date.now();
-  runtime.iframeEl.src = 'about:blank';
   runtime.element.remove();
   panelRuntimes.delete(panelId);
   renderTabs();
@@ -4258,129 +3189,27 @@ function closePanel(panelId: string): void {
 // can come back to the conversation and find them again.
 function clearPanelsForCurrentConversation(): void {
   panelRuntimes.forEach((runtime) => {
-    clearPanelWatchdog(runtime);
-    runtime.iframeEl.src = 'about:blank';
     runtime.element.remove();
   });
   panelRuntimes.clear();
   renderTabs();
 }
 
-async function openBranchInNewTab(panelId: string): Promise<void> {
-  const runtime = panelRuntimes.get(panelId);
-  if (!runtime) {
-    return;
-  }
-
-  appendPanelLog(runtime, 'Open branch requested', {
-    branchChatUrl: runtime.state.branchChatUrl,
-    launchTabId: runtime.state.launchTabId,
-    launchWindowId: runtime.state.launchWindowId,
-    surfaceMode: runtime.state.surfaceMode
-  });
-
-  if (runtime.state.launchTabId || runtime.state.launchWindowId || runtime.state.branchChatUrl) {
-    const response = await focusNativeBranchWindow({
-      panelId,
-      launchTabId: runtime.state.launchTabId,
-      launchWindowId: runtime.state.launchWindowId,
-      branchChatUrl: runtime.state.branchChatUrl
-    });
-
-    if (response.ok) {
-      return;
-    }
-  }
-
-  if (runtime.state.branchChatUrl) {
-    window.open(runtime.state.branchChatUrl, '_blank', 'noopener,noreferrer');
-  }
-}
-
-async function promotePersistentBranchToNativeWindow(runtime: PanelRuntime): Promise<void> {
-  if (
-    runtime.state.surfaceMode === 'native_window' ||
-    runtime.state.branchKind !== 'persistent' ||
-    !runtime.state.initialPrompt ||
-    !runtime.state.launchUrl
-  ) {
-    return;
-  }
-
-  runtime.pendingFramePrompt = undefined;
-  runtime.state.surfaceMode = 'native_window';
-  runtime.state.status = 'opening_branch';
-  runtime.state.statusLabel = `Continuing this branch in a native ${provider.label} window...`;
-  runtime.state.errorMessage = undefined;
-  runtime.state.updatedAt = Date.now();
-  appendPanelLog(runtime, 'Promoting persistent branch to a native provider window', {
-    launchUrl: runtime.state.launchUrl
-  });
-  syncPanelUI(runtime);
-  persistPanels();
-
-  // Promotion continues the same attempt, so it keeps the same attempt id: the
-  // embedded frame that just failed is already identified by it and cannot come back.
-  const attempt = currentAttemptRef(runtime);
-  if (!attempt) {
-    appendPanelLog(runtime, 'Refusing to promote a branch without an attempt id');
-    return;
-  }
-
-  const response = await createNativeBranchWindow({
-    attempt,
-    prompt: runtime.state.initialPrompt,
-    launchUrl: runtime.state.launchUrl,
-    branchKind: runtime.state.branchKind,
-    focusWindow: true,
-    arrangeSideBySide: true
-  });
-
-  if (!response.ok) {
-    appendPanelLog(runtime, 'Native branch window promotion failed', {
-      reason: response.reason
-    });
-    runtime.state.status = 'failed';
-    runtime.state.creationMode = 'failed';
-    runtime.state.statusLabel = 'Native branch recovery failed.';
-    runtime.state.errorMessage =
-      response.reason ?? `The native ${provider.label} recovery window could not be opened.`;
-    runtime.state.updatedAt = Date.now();
-    syncPanelUI(runtime);
-    persistPanels();
-    return;
-  }
-
-  runtime.state.launchTabId = response.tabId;
-  runtime.state.launchWindowId = response.windowId;
-  runtime.state.updatedAt = Date.now();
-  startPanelWatchdog(
-    runtime,
-    BRANCH_RESPONSE_TIMEOUT_MS,
-    `The native ${provider.label} branch window stopped reporting back. Use Open branch to check it directly, or try again.`
-  );
-  appendPanelLog(runtime, 'Native branch recovery window created', {
-    launchTabId: response.tabId,
-    launchWindowId: response.windowId
-  });
-  syncPanelUI(runtime);
-  persistPanels();
-}
-
 /**
- * New-tab is a presentation choice, not a different pipeline: the same draft,
- * the same context plan, the same question — started in a window of its own.
- * Nothing is sent to initialise the branch; the actual question is sent once.
+ * Open a saved record's provider conversation as plain navigation in a new tab.
+ * It carries no prompt and starts nothing; the worker only accepts provider URLs.
  */
-async function openSelectionInNewTab(
-  selection: SelectionPayload,
-  branchKind: BranchKind
-): Promise<void> {
-  createBranchDraft(selection, {
-    entryAction: 'new_tab',
-    branchKind,
-    preferredSurface: 'native_window'
-  });
+async function openSavedConversation(panelId: string): Promise<void> {
+  const runtime = panelRuntimes.get(panelId);
+  const url = runtime?.state.branchChatUrl;
+  if (!runtime || !url) {
+    return;
+  }
+  appendPanelLog(runtime, 'Open saved conversation requested');
+  const response = await sendStoreMessage<{ ok: boolean; reason?: string }>({ type: 'OPEN_PROVIDER_URL', url });
+  if (!response?.ok) {
+    notifyAside(`The saved ${provider.label} conversation could not be opened.`);
+  }
 }
 
 const REDACTED = '(redacted — use "Copy log + text" to include it)';
@@ -4402,22 +3231,8 @@ function buildBranchDebugLogText(runtime: PanelRuntime, includeContent = false):
       : 'Content is redacted. Use "Copy log + text" if a maintainer needs the selected text and prompt.',
     `build: ${BUILD_ID}`,
     `workerBuild: ${workerBuildId ?? '(not reported)'}`,
-    `frameBuild: ${runtime.frameBuildId ?? '(none)'}`,
     `provider: ${provider.id}`,
     `branchPrivacy: ${state.branchKind === 'temporary' ? provider.privacy.label : 'persistent'}`,
-    `privateModeRecovery: ${
-      state.recovery
-        ? JSON.stringify({
-            step: state.recovery.step,
-            availability: state.recovery.availability,
-            mode: state.recovery.mode,
-            evidence: state.recovery.evidence,
-            nextAction: state.recovery.nextAction,
-            control: state.recovery.control,
-            reportedBy: state.recovery.buildId ?? null
-          })
-        : '(none)'
-    }`,
     `generatedAt: ${new Date().toISOString()}`,
     `panelId: ${state.panelId}`,
     `rootChatUrl: ${state.rootChatUrl}`,
@@ -4505,308 +3320,6 @@ async function copyBranchDebugLog(panelId: string, includeContent = false): Prom
   }
 }
 
-function buildEmbeddedFrameUrl(launchUrl: string): string {
-  try {
-    const url = new URL(launchUrl);
-    url.hash = `aside-${Date.now()}`;
-    return url.toString();
-  } catch {
-    return launchUrl;
-  }
-}
-
-function clearPanelWatchdog(runtime: PanelRuntime): void {
-  if (runtime.watchdogId !== undefined) {
-    window.clearTimeout(runtime.watchdogId);
-    runtime.watchdogId = undefined;
-  }
-}
-
-function startPanelWatchdog(runtime: PanelRuntime, timeoutMs: number, reason: string): void {
-  clearPanelWatchdog(runtime);
-  runtime.watchdogId = window.setTimeout(() => {
-    runtime.watchdogId = undefined;
-
-    if (panelRuntimes.get(runtime.state.panelId) !== runtime) {
-      return;
-    }
-
-    if (
-      runtime.state.status === 'live' ||
-      runtime.state.status === 'failed' ||
-      runtime.state.status === 'draft'
-    ) {
-      return;
-    }
-
-    appendPanelLog(runtime, 'Branch watchdog fired', {
-      timeoutMs,
-      panelStatus: runtime.state.status,
-      frameReady: runtime.frameReady,
-      frameStartSent: runtime.frameStartSent
-    });
-    applyBranchPanelEvent(runtime, { kind: 'failed', reason });
-  }, timeoutMs);
-}
-
-function loadEmbeddedBranchFrame(runtime: PanelRuntime, launchUrl: string): void {
-  runtime.frameReady = false;
-  runtime.frameStartSent = false;
-  startPanelWatchdog(
-    runtime,
-    FRAME_HANDSHAKE_TIMEOUT_MS,
-    `The embedded ${provider.label} branch window did not finish loading. ${provider.label} may be refusing to be embedded here — try again, or use New-tab to run this branch in its own window.`
-  );
-  const iframeUrl = buildEmbeddedFrameUrl(launchUrl);
-  const previousSrc = runtime.iframeEl.src;
-
-  // Retrying reuses the same iframe, and the cache-busting differs only in the fragment.
-  // A fragment-only src change is a same-document navigation: no load event, so the frame
-  // never posts SB_FRAME_READY again and the retry would sit there until the watchdog.
-  // Going through about:blank forces a real document load — but only once about:blank
-  // has actually committed. Setting the new src on a zero timeout raced that commit:
-  // the provider document was still current, the change was fragment-only, and the
-  // switch from a private draft to an ordinary send sat on the handshake watchdog.
-  const setTarget = () => {
-    if (panelRuntimes.get(runtime.state.panelId) !== runtime) {
-      return;
-    }
-    runtime.iframeEl.src = iframeUrl;
-  };
-
-  if (previousSrc && previousSrc !== 'about:blank') {
-    let pending = true;
-    const proceed = () => {
-      if (!pending) {
-        return;
-      }
-      pending = false;
-      runtime.iframeEl.removeEventListener('load', proceed);
-      setTarget();
-    };
-    runtime.iframeEl.addEventListener('load', proceed);
-    runtime.iframeEl.src = 'about:blank';
-    // about:blank normally commits within a frame; if the load event never comes,
-    // proceed anyway rather than hang.
-    window.setTimeout(proceed, 600);
-  } else {
-    window.setTimeout(setTarget, 0);
-  }
-
-  appendPanelLog(runtime, 'Loading embedded branch frame', {
-    targetUrl: launchUrl,
-    iframeSrc: iframeUrl,
-    previousSrc: previousSrc || null,
-    panelStatus: runtime.state.status
-  });
-}
-
-function ensureLiveFrameLocation(runtime: PanelRuntime): void {
-  const desiredUrl = runtime.state.branchChatUrl;
-  if (!desiredUrl || runtime.pendingFramePrompt) {
-    return;
-  }
-
-  // Restoring a page used to give every minimized branch from every conversation its own
-  // eagerly loading chatgpt.com iframe. Load the frame when the panel is actually shown.
-  if (runtime.state.minimized) {
-    return;
-  }
-
-  if (runtime.frameStartSent || runtime.frameReady) {
-    return;
-  }
-
-  const currentSrc = runtime.iframeEl.src;
-  if (!currentSrc || currentSrc === 'about:blank') {
-    runtime.iframeEl.src = desiredUrl;
-    return;
-  }
-
-  if (normalizeChatUrl(currentSrc) !== normalizeChatUrl(desiredUrl)) {
-    runtime.iframeEl.src = desiredUrl;
-  }
-}
-
-function postToEmbeddedFrame(runtime: PanelRuntime, message: FrameStartBranchMessage): void {
-  const targetWindow = runtime.iframeEl.contentWindow;
-  if (!targetWindow) {
-    return;
-  }
-
-  let targetOrigin = '*';
-  try {
-    targetOrigin = new URL(runtime.state.launchUrl ?? runtime.state.rootChatUrl).origin;
-  } catch {
-    targetOrigin = '*';
-  }
-
-  targetWindow.postMessage(message, targetOrigin);
-}
-
-function tryDispatchPendingFrameStart(runtime: PanelRuntime): void {
-  if (!runtime.pendingFramePrompt || runtime.frameStartSent || !runtime.frameReady || !runtime.state.launchUrl) {
-    return;
-  }
-
-  const prompt = runtime.pendingFramePrompt;
-  runtime.frameStartSent = true;
-  runtime.state.status = 'opening_branch';
-  runtime.state.statusLabel = 'Sending the local branch question inside the branch window...';
-  runtime.state.updatedAt = Date.now();
-  appendPanelLog(runtime, 'Dispatching embedded branch start command', {
-    launchUrl: runtime.state.launchUrl,
-    promptLength: prompt.length
-  });
-  startPanelWatchdog(
-    runtime,
-    BRANCH_RESPONSE_TIMEOUT_MS,
-    `The branch window stopped responding before the answer was ready. Try again, or use Open branch to continue it directly in ${provider.label}.`
-  );
-  syncPanelUI(runtime);
-  persistPanels();
-
-  const attempt = currentAttemptRef(runtime);
-  if (!attempt) {
-    appendPanelLog(runtime, 'Refusing to dispatch a branch start without an attempt id');
-    return;
-  }
-
-  postToEmbeddedFrame(runtime, {
-    source: 'aside',
-    target: 'frame',
-    type: 'SB_FRAME_START_BRANCH',
-    ...attempt,
-    prompt,
-    launchUrl: runtime.state.launchUrl,
-    branchKind: runtime.state.branchKind
-  });
-}
-
-function findRuntimeByFrameWindow(source: MessageEventSource | null): PanelRuntime | null {
-  if (!source) {
-    return null;
-  }
-
-  for (const runtime of panelRuntimes.values()) {
-    if (runtime.iframeEl.contentWindow === source) {
-      return runtime;
-    }
-  }
-
-  return null;
-}
-
-function isTrustedBranchOrigin(origin: string, runtime?: PanelRuntime): boolean {
-  if (!origin || origin === 'null') {
-    return false;
-  }
-
-  if (origin === window.location.origin) {
-    return true;
-  }
-
-  const launchUrl = runtime?.state.launchUrl ?? runtime?.state.branchChatUrl;
-  if (!launchUrl) {
-    return false;
-  }
-
-  try {
-    return new URL(launchUrl).origin === origin;
-  } catch {
-    return false;
-  }
-}
-
-function handleEmbeddedFrameMessage(event: MessageEvent<FrameIncomingMessage>): void {
-  const data = event.data;
-  if (
-    !data ||
-    typeof data !== 'object' ||
-    data.source !== 'aside' ||
-    data.target !== 'parent'
-  ) {
-    return;
-  }
-
-  const runtime = findRuntimeByFrameWindow(event.source);
-  if (!runtime) {
-    return;
-  }
-
-  // The window identity check above already rules out unrelated frames; the origin check
-  // keeps a navigated-away branch frame from driving the panel.
-  if (!isTrustedBranchOrigin(event.origin, runtime)) {
-    appendPanelLog(runtime, 'Ignored branch frame message from an unexpected origin', {
-      origin: event.origin
-    });
-    return;
-  }
-
-  if (data.type === 'SB_FRAME_READY') {
-    runtime.frameReady = true;
-    runtime.frameBuildId = typeof data.buildId === 'string' ? data.buildId : undefined;
-    if (runtime.frameBuildId && runtime.frameBuildId !== BUILD_ID) {
-      reportStaleClient(runtime, 'branch frame', runtime.frameBuildId);
-    }
-    appendPanelLog(runtime, 'Embedded branch frame ready', {
-      currentUrl: data.currentUrl,
-      frameBuild: runtime.frameBuildId ?? null,
-      panelStatus: runtime.state.status,
-      hasPendingPrompt: Boolean(runtime.pendingFramePrompt),
-      lastPreparationStep: runtime.lastPreparationStep ?? null,
-      iframeSrc: runtime.iframeEl.src
-    });
-
-    // A new document under a start that was already delivered: the provider
-    // navigated while a private mode was being prepared (Claude opens incognito
-    // as a new page). Only while the last reported step was before anything was
-    // typed is the pending prompt delivered again — a resume can never resend.
-    if (
-      runtime.frameStartSent &&
-      runtime.pendingFramePrompt &&
-      runtime.state.status === 'opening_branch' &&
-      runtime.lastPreparationStep &&
-      runtime.lastPreparationStep !== 'ready' &&
-      runtime.lastPreparationStep !== 'failed'
-    ) {
-      appendPanelLog(runtime, 'Branch frame navigated during private-mode preparation; resuming on the new document', {
-        lastPreparationStep: runtime.lastPreparationStep
-      });
-      runtime.frameStartSent = false;
-    }
-    tryDispatchPendingFrameStart(runtime);
-    return;
-  }
-
-  if (data.type === 'SB_FRAME_EVENT') {
-    if (!isBranchAttemptRef(data) || !isBranchPanelEvent(data.event)) {
-      return;
-    }
-
-    if (!ownsAttempt(data, currentAttemptRef(runtime))) {
-      appendPanelLog(runtime, 'Ignored a branch frame event from a superseded attempt', {
-        eventKind: data.event.kind,
-        messageAttemptId: data.attemptId,
-        currentAttemptId: runtime.state.attemptId ?? null
-      });
-      return;
-    }
-
-    // A panel that has moved on to a native window is no longer driven by its old frame;
-    // a late event from that frame would otherwise overwrite the current branch state.
-    if (runtime.state.surfaceMode !== 'embedded') {
-      appendPanelLog(runtime, 'Ignored a branch frame event for a panel that is no longer embedded', {
-        eventKind: data.event.kind,
-        surfaceMode: runtime.state.surfaceMode
-      });
-      return;
-    }
-
-    applyBranchPanelEvent(runtime, data.event);
-  }
-}
-
 /**
  * A write accepted by the authority, made anywhere. Keeps every open tab in step
  * instead of each one discovering the change on its next navigation.
@@ -4827,8 +3340,6 @@ function handlePanelChanged(message: PanelChangedMessage): void {
   if (message.deleted) {
     const runtime = panelRuntimes.get(message.panelId);
     if (runtime) {
-      clearPanelWatchdog(runtime);
-      runtime.iframeEl.src = 'about:blank';
       runtime.element.remove();
       panelRuntimes.delete(message.panelId);
       renderTabs();
@@ -4900,622 +3411,55 @@ function drainPendingPanelChanges(): void {
   syncMountedUi();
 }
 
-function handleForwardedBranchPanelEvent(message: ForwardBranchPanelEventMessage): void {
-  if (!isBranchAttemptRef(message) || !isBranchPanelEvent(message.event)) {
-    return;
-  }
-
-  const runtime = panelRuntimes.get(message.panelId);
-  if (!runtime) {
-    return;
-  }
-
-  if (!ownsAttempt(message, currentAttemptRef(runtime))) {
-    appendPanelLog(runtime, 'Ignored a background branch event from a superseded attempt', {
-      eventKind: message.event.kind,
-      messageAttemptId: message.attemptId,
-      currentAttemptId: runtime.state.attemptId ?? null
-    });
-    return;
-  }
-
-  // Only a native-window branch reports through the background. Retrying a failed native
-  // branch switches the panel back to an embedded frame and leaves the old window open;
-  // without this guard a late event from that orphan could mark the new branch live with
-  // the previous conversation's URL.
-  if (runtime.state.surfaceMode !== 'native_window') {
-    appendPanelLog(runtime, 'Ignored a background branch event for an embedded panel', {
-      eventKind: message.event.kind,
-      surfaceMode: runtime.state.surfaceMode
-    });
-    return;
-  }
-
-  applyBranchPanelEvent(runtime, message.event);
-}
-
 function installRuntimeMessageListener(): void {
   if (!hasRuntimeAccess()) {
     return;
   }
 
   const runtimeMessageListener = (
-    message: RunBranchPromptInTabMessage | ForwardBranchPanelEventMessage | PanelChangedMessage | QuestionChangedMessage,
-    _sender: chrome.runtime.MessageSender,
+    message: PanelChangedMessage | QuestionChangedMessage | HandoffChangedMessage | HandoffScrollToAnchorMessage | { type?: unknown },
+    sender: chrome.runtime.MessageSender,
     sendResponse: (response?: unknown) => void
   ) => {
-    if (!isTopFrame() || !message || typeof message !== 'object' || !('type' in message)) {
+    // Only this extension's worker talks to the page; never another tab.
+    if (!isTopFrame() || sender.id !== chrome.runtime.id || sender.tab) {
+      return false;
+    }
+    if (!message || typeof message !== 'object' || !('type' in message)) {
       return false;
     }
 
-    if (message.type === 'PANEL_CHANGED') {
-      handlePanelChanged(message);
-      sendResponse({ ok: true });
-      return false;
-    }
-
-    if (message.type === 'QUESTION_CHANGED') {
-      void refreshQuestionList();
-      sendResponse({ ok: true });
-      return false;
-    }
-
-    if (message.type === 'BRANCH_PANEL_EVENT') {
-      handleForwardedBranchPanelEvent(message);
-      sendResponse({ ok: true });
-      return false;
-    }
-
-    if (message.type === 'RUN_BRANCH_PROMPT_IN_TAB') {
-      if (!isRunBranchPromptRequest(message)) {
-        sendResponse({
-          ok: false,
-          reason: 'The branch run request was malformed and was not started.',
-          buildId: BUILD_ID
-        });
+    switch (message.type) {
+      case 'PANEL_CHANGED':
+        handlePanelChanged(message as PanelChangedMessage);
+        sendResponse({ ok: true });
+        return false;
+      case 'QUESTION_CHANGED':
+        void refreshQuestionList();
+        sendResponse({ ok: true });
+        return false;
+      case 'HANDOFF_CHANGED':
+        handleHandoffChanged(message as HandoffChangedMessage);
+        sendResponse({ ok: true });
+        return false;
+      case 'HANDOFF_SCROLL_TO_ANCHOR': {
+        const card = handoffCards.get((message as HandoffScrollToAnchorMessage).sessionId);
+        sendResponse({ anchor: card ? jumpToHandoffPassage(card.session) : 'not-found' });
         return false;
       }
-
-      if (automationTaskRunning) {
-        sendResponse({
-          ok: false,
-          reason: `Another branch automation is already running in this ${provider.label} window.`,
-          buildId: BUILD_ID
-        });
+      case 'RUN_BRANCH_PROMPT_IN_TAB':
+        // A worker from an older build asking for the retired automatic run.
+        sendResponse({ ok: false, code: 'retired', buildId: BUILD_ID });
         return false;
-      }
-
-      void runBranchPromptAutomation(message, 'background');
-      sendResponse({ ok: true, buildId: BUILD_ID });
-      return false;
+      default:
+        return false;
     }
-
-    return false;
   };
 
   chrome.runtime.onMessage.addListener(runtimeMessageListener);
   cleanupFns.push(() => {
     chrome.runtime.onMessage.removeListener(runtimeMessageListener);
   });
-}
-
-async function startBranch(panelId: string, question: string): Promise<void> {
-  const runtime = panelRuntimes.get(panelId);
-  if (!runtime) {
-    return;
-  }
-
-  // Build the plan and freeze it now: a later edit, or the source answer still
-  // streaming, must not change a prompt that is already in flight.
-  const plan = buildPlanForPanel(runtime, question);
-  if (plan.overBudget) {
-    runtime.state.status = 'failed';
-    runtime.state.creationMode = 'failed';
-    runtime.state.statusLabel = 'This branch was not sent.';
-    runtime.state.errorMessage = `The passage and question alone are about ${plan.charCount.toLocaleString()} characters, over the ${plan.maxChars.toLocaleString()}-character limit. Select a smaller passage and try again.`;
-    runtime.state.updatedAt = Date.now();
-    syncPanelUI(runtime);
-    persistPanels();
-    return;
-  }
-
-  const contextText = renderPlanText(plan);
-  const prompt = buildPrompt({ contextText, question });
-  // Titles are local: from the question, never from the model.
-  runtime.state.title = autoTitle(question, runtime.state.selection.selectedText);
-  runtime.state.titleStatus = 'ready';
-  const launchUrl = provider.normalizeUrl(
-    resolveLaunchUrl(currentIdentity(runtime.state.rootChatUrl), runtime.state.branchKind)
-  );
-
-  if (!launchUrl) {
-    runtime.state.initialQuestion = question;
-    runtime.state.status = 'failed';
-    runtime.state.creationMode = 'failed';
-    runtime.state.statusLabel = 'Local branch creation failed.';
-    runtime.state.errorMessage = `Could not determine a launch URL for this ${provider.label} branch.`;
-    runtime.state.updatedAt = Date.now();
-    syncPanelUI(runtime);
-    persistPanels();
-    return;
-  }
-
-  appendPanelLog(runtime, 'Start branch requested', {
-    questionLength: question.length,
-    rootChatUrl: runtime.state.rootChatUrl,
-    launchUrl,
-    branchKind: runtime.state.branchKind,
-    entryAction: runtime.state.entryAction,
-    selectedTextLength: runtime.state.selection.selectedText.length,
-    selectedAssistantBlockIds: runtime.state.selection.selectedBlocks
-      .filter((block) => block.role === 'assistant')
-      .map((block) => block.messageId),
-    promptLength: prompt.length
-  });
-  if (runtime.state.branchChatUrl) {
-    // The previous attempt already created a conversation. Keep the link in the log so a
-    // retry does not erase the only way back to something the user may need to delete.
-    appendPanelLog(runtime, 'Replacing a branch that already has a conversation URL', {
-      previousBranchChatUrl: runtime.state.branchChatUrl
-    });
-  }
-
-  // A fresh attempt id per try. Anything still running from the previous attempt —
-  // an orphaned native window, a frame that has not been torn down yet — is
-  // identified by the old id and can no longer touch this panel.
-  runtime.state.attemptId = createAttemptId();
-  startedAttemptIds.add(runtime.state.attemptId);
-  // Some providers refuse to be framed. Where that is the case the branch opens in
-  // a window Aside drives instead — a real fallback with the same context and the
-  // same state safety, not an embedded pass reported under another name.
-  // "May we try?" is a different question from "can we claim it works?". Tying
-  // them together is how Claude ended up opening every branch in its own window
-  // on an unchecked assumption about framing headers.
-  const canEmbed =
-    runtime.state.preferredSurface !== 'native_window' &&
-    surfaceMayBeAttempted(provider.surfaces.embedded, embeddedSurfaceObservation);
-  // Try again after a private preparation stopped short: the frame the Owner may
-  // just have fixed is the one to use. Same target, no navigation, new attempt.
-  const reuseFrame =
-    canEmbed &&
-    runtime.state.status === 'failed' &&
-    Boolean(runtime.state.recovery) &&
-    runtime.state.surfaceMode === 'embedded' &&
-    runtime.frameReady &&
-    runtime.state.launchUrl === launchUrl;
-  if (!canEmbed && !surfaceMayBeAttempted(provider.surfaces.nativeWindow)) {
-    // Neither surface is available: say so rather than opening a window that
-    // cannot be driven and timing out on the watchdog.
-    runtime.state.initialQuestion = question;
-    runtime.state.status = 'failed';
-    runtime.state.creationMode = 'failed';
-    runtime.state.statusLabel = 'This branch was not started.';
-    runtime.state.errorMessage = provider.surfaces.detail;
-    runtime.state.updatedAt = Date.now();
-    syncPanelUI(runtime);
-    persistPanels(runtime.state.panelId);
-    return;
-  }
-  runtime.state.initialQuestion = question;
-  runtime.state.initialPrompt = prompt;
-  runtime.state.surfaceMode = canEmbed ? 'embedded' : 'native_window';
-  runtime.state.launchUrl = launchUrl;
-  runtime.state.branchChatUrl = undefined;
-  runtime.state.launchTabId = undefined;
-  runtime.state.launchWindowId = undefined;
-  runtime.state.creationMode =
-    runtime.state.branchKind === 'temporary' ? 'local_temporary' : 'local_persistent';
-  runtime.state.archiveOnly = false;
-  runtime.state.archive = undefined;
-  runtime.writtenCapture.clear();
-  runtime.state.status = 'creating_branch';
-  runtime.state.statusLabel = canEmbed
-    ? `Loading the embedded ${provider.label} branch window...`
-    : `Opening a ${provider.label} window for this branch...`;
-  runtime.state.errorMessage = undefined;
-  runtime.state.recovery = undefined;
-  runtime.lastPreparationStep = undefined;
-  runtime.showTargetWhileFailed = false;
-  runtime.state.updatedAt = Date.now();
-  persistLastUsedBranchKind(runtime.state.branchKind);
-  runtime.pendingFramePrompt = canEmbed ? prompt : undefined;
-  runtime.frameReady = reuseFrame ? runtime.frameReady : false;
-  runtime.frameStartSent = false;
-
-  // Persist the intent before the external action: the exact prompt is frozen
-  // as a snapshot and the run recorded as submitting. Private questions have no
-  // durable record and skip this.
-  await freezeSnapshotForPanel(runtime, plan, prompt, question);
-
-  minimizeOtherPanels(panelId);
-  if (canEmbed && !reuseFrame) {
-    loadEmbeddedBranchFrame(runtime, launchUrl);
-  }
-  if (reuseFrame) {
-    appendPanelLog(runtime, 'Retrying in the existing branch frame', {
-      launchUrl,
-      frameBuild: runtime.frameBuildId ?? null
-    });
-  }
-  syncPanelUI(runtime);
-  renderTabs();
-  persistPanels();
-
-  if (reuseFrame) {
-    tryDispatchPendingFrameStart(runtime);
-    return;
-  }
-
-  if (!canEmbed) {
-    await openBranchInDrivenWindow(runtime, prompt, launchUrl);
-  }
-}
-
-/** One line under the error: what to do in the branch window before Check again. */
-function describeRecoveryHint(recovery: PrivacyRecovery): string {
-  const label = provider.privacy.label;
-  switch (recovery.nextAction) {
-    case 'choose-personalization':
-      return 'Make the choice in the branch window, then Check again.';
-    case 'sign-in':
-      return 'Sign in inside the branch window, then Check again.';
-    case 'wait-for-page':
-      return 'Wait for the branch window to load, then Check again.';
-    default:
-      return recovery.step === 'blocked'
-        ? `Check again after moving to a chat where ${label} is allowed, or send as an ordinary chat.`
-        : `Turn on ${label} in the branch window, then Check again.`;
-  }
-}
-
-/**
- * Re-observe the SAME branch document and, if the mode verifies, send the pending
- * prompt there. The frame is not reloaded and no window is opened: the target the
- * Owner may just have fixed is the target checked.
- */
-async function checkPrivateModeAgain(panelId: string): Promise<void> {
-  const runtime = panelRuntimes.get(panelId);
-  if (!runtime || runtime.state.status !== 'failed' || !runtime.state.recovery) {
-    return;
-  }
-
-  const attempt = currentAttemptRef(runtime);
-  const prompt = runtime.pendingFramePrompt ?? runtime.state.initialPrompt;
-  const question = runtime.questionInput.value.trim() || runtime.state.initialQuestion?.trim() || '';
-  if (!attempt || !prompt || !runtime.state.launchUrl) {
-    // Nothing to resume on this target: run it as a fresh attempt instead.
-    appendPanelLog(runtime, 'Check again had no resumable attempt; starting the branch again');
-    if (question) {
-      await startBranch(panelId, question);
-    }
-    return;
-  }
-
-  appendPanelLog(runtime, 'Check again requested', {
-    previousStep: runtime.state.recovery.step,
-    surfaceMode: runtime.state.surfaceMode,
-    frameReady: runtime.frameReady
-  });
-  runtime.state.status = 'opening_branch';
-  runtime.state.creationMode =
-    runtime.state.branchKind === 'temporary' ? 'local_temporary' : 'local_persistent';
-  runtime.state.statusLabel = `Checking ${provider.privacy.label} again in the branch window…`;
-  runtime.state.errorMessage = undefined;
-  runtime.state.recovery = undefined;
-  runtime.lastPreparationStep = undefined;
-  runtime.showTargetWhileFailed = false;
-  runtime.state.updatedAt = Date.now();
-  syncPanelUI(runtime);
-  persistPanels();
-
-  if (runtime.state.surfaceMode === 'embedded') {
-    runtime.pendingFramePrompt = prompt;
-    runtime.frameStartSent = false;
-    if (runtime.frameReady) {
-      tryDispatchPendingFrameStart(runtime);
-    } else {
-      // The frame document is gone (page reload, or a navigation not finished
-      // yet): load the same target again and continue when it reports ready.
-      loadEmbeddedBranchFrame(runtime, runtime.state.launchUrl);
-    }
-    return;
-  }
-
-  startPanelWatchdog(
-    runtime,
-    BRANCH_RESPONSE_TIMEOUT_MS,
-    `The ${provider.label} branch window stopped reporting back. Use Open branch to check it directly, or try again.`
-  );
-  const response = await recheckBranchInTab(attempt);
-  if (response.buildId && response.buildId !== BUILD_ID) {
-    reportStaleClient(runtime, 'branch tab', response.buildId);
-  }
-  if (!response.ok) {
-    clearPanelWatchdog(runtime);
-    appendPanelLog(runtime, 'Check again could not reach the branch window', { reason: response.reason });
-    applyBranchPanelEvent(runtime, {
-      kind: 'failed',
-      reason: response.reason ?? `The ${provider.label} branch window could not be checked again. Use Try again.`
-    });
-  }
-}
-
-async function recheckBranchInTab(attempt: BranchAttemptRef): Promise<RecheckBranchInTabResponse> {
-  if (!hasRuntimeAccess()) {
-    return { ok: false, reason: 'Chrome extension runtime is unavailable.' };
-  }
-  try {
-    return (await chrome.runtime.sendMessage({
-      type: 'RECHECK_BRANCH_IN_TAB',
-      ...attempt
-    } satisfies RecheckBranchInTabMessage)) as RecheckBranchInTabResponse;
-  } catch (error) {
-    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
-  }
-}
-
-/** Bring the branch document into view so the Owner can act in it. */
-async function showBranchTarget(panelId: string): Promise<void> {
-  const runtime = panelRuntimes.get(panelId);
-  if (!runtime) {
-    return;
-  }
-  appendPanelLog(runtime, 'Show branch window requested', { surfaceMode: runtime.state.surfaceMode });
-  if (runtime.state.surfaceMode === 'embedded') {
-    runtime.showTargetWhileFailed = true;
-    syncPanelUI(runtime);
-    runtime.iframeShell.scrollIntoView({ block: 'nearest' });
-    runtime.iframeEl.focus();
-    return;
-  }
-  const response = await focusNativeBranchWindow({
-    panelId,
-    launchTabId: runtime.state.launchTabId,
-    launchWindowId: runtime.state.launchWindowId
-  });
-  if (!response.ok) {
-    runtime.state.statusLabel = response.reason ?? `The ${provider.label} branch window could not be shown.`;
-    runtime.state.updatedAt = Date.now();
-    syncPanelUI(runtime);
-  }
-}
-
-/**
- * The Owner's explicit choice to send as an ordinary chat after a private mode
- * could not be verified. Only reached through the confirmation step; the draft
- * becomes durable here and only here.
- */
-async function useOrdinaryModeInstead(panelId: string): Promise<void> {
-  const runtime = panelRuntimes.get(panelId);
-  if (!runtime || runtime.state.branchKind !== 'temporary') {
-    return;
-  }
-  const question = runtime.questionInput.value.trim() || runtime.state.initialQuestion?.trim() || '';
-  if (!question) {
-    return;
-  }
-  appendPanelLog(runtime, 'Owner chose ordinary mode after private-mode preparation stopped', {
-    previousStep: runtime.state.recovery?.step ?? null
-  });
-  runtime.state.branchKind = 'persistent';
-  runtime.state.recovery = undefined;
-  runtime.state.updatedAt = Date.now();
-  persistLastUsedBranchKind('persistent');
-  syncPanelUI(runtime);
-  if (!runtime.state.questionId) {
-    await registerQuestionForPanel(runtime);
-  }
-  await startBranch(panelId, question);
-}
-
-/**
- * Run a branch in a window Aside opens, for providers that cannot be embedded.
- * Same attempt id, same watchdog, same failure reporting as the embedded path.
- */
-async function openBranchInDrivenWindow(
-  runtime: PanelRuntime,
-  prompt: string,
-  launchUrl: string
-): Promise<void> {
-  const attempt = currentAttemptRef(runtime);
-  if (!attempt) {
-    appendPanelLog(runtime, 'Refusing to open a branch window without an attempt id');
-    return;
-  }
-
-  startPanelWatchdog(
-    runtime,
-    BRANCH_RESPONSE_TIMEOUT_MS,
-    `The ${provider.label} branch window stopped reporting back. Use Open branch to check it directly, or try again.`
-  );
-
-  const response = await createNativeBranchWindow({
-    attempt,
-    prompt,
-    launchUrl,
-    branchKind: runtime.state.branchKind,
-    focusWindow: true,
-    arrangeSideBySide: true
-  });
-
-  if (!response.ok) {
-    clearPanelWatchdog(runtime);
-    appendPanelLog(runtime, 'Branch window could not be opened', { reason: response.reason });
-    runtime.state.status = 'failed';
-    runtime.state.creationMode = 'failed';
-    runtime.state.statusLabel = `${provider.label} branch creation failed.`;
-    runtime.state.errorMessage =
-      response.reason ?? `The ${provider.label} branch window could not be opened.`;
-    runtime.state.updatedAt = Date.now();
-    syncPanelUI(runtime);
-    persistPanels();
-    return;
-  }
-
-  runtime.state.launchTabId = response.tabId;
-  runtime.state.launchWindowId = response.windowId;
-  runtime.state.updatedAt = Date.now();
-  syncPanelUI(runtime);
-  persistPanels();
-}
-
-function applyBranchPanelEvent(runtime: PanelRuntime, event: BranchPanelEvent): void {
-  switch (event.kind) {
-    case 'status':
-      appendPanelLog(runtime, 'Embedded branch status', {
-        status: event.status,
-        statusLabel: event.statusLabel
-      });
-      runtime.state.status = event.status;
-      runtime.state.statusLabel = event.statusLabel;
-      runtime.state.updatedAt = Date.now();
-      syncPanelUI(runtime);
-      persistPanels();
-      return;
-
-    case 'debug-log':
-      appendPanelLogEntries(runtime, [event.message]);
-      syncPanelUI(runtime);
-      persistPanelsSoon(runtime.state.panelId);
-      return;
-
-    case 'preparation': {
-      const recovery = event.recovery;
-      runtime.lastPreparationStep = recovery.step;
-      if (recovery.buildId && recovery.buildId !== BUILD_ID) {
-        reportStaleClient(runtime, 'branch document', recovery.buildId);
-      }
-      appendPanelLog(runtime, 'Private-mode preparation', {
-        step: recovery.step,
-        availability: recovery.availability,
-        mode: recovery.mode,
-        evidence: recovery.evidence,
-        nextAction: recovery.nextAction,
-        control: recovery.control
-      });
-      if (runtime.state.status === 'opening_branch' || runtime.state.status === 'creating_branch') {
-        runtime.state.status = 'opening_branch';
-        runtime.state.statusLabel = describePreparationStep(recovery, provider.privacy.label);
-        runtime.state.updatedAt = Date.now();
-        syncPanelUI(runtime);
-        persistPanelsSoon(runtime.state.panelId);
-      }
-      return;
-    }
-
-    case 'title':
-      // Titles are local now. A legacy answer that still carries the old marker
-      // is logged and otherwise ignored, so the Owner's title is never replaced.
-      appendPanelLog(runtime, 'Ignored a model-emitted title; titles are local', event.title);
-      return;
-
-    case 'live':
-      clearPanelWatchdog(runtime);
-      runtime.pendingFramePrompt = undefined;
-      runtime.state.recovery = undefined;
-      runtime.showTargetWhileFailed = false;
-      runtime.lastPreparationStep = undefined;
-      runtime.state.launchTabId = event.launchTabId ?? runtime.state.launchTabId;
-      runtime.state.launchWindowId = event.launchWindowId ?? runtime.state.launchWindowId;
-      runtime.state.branchChatUrl = event.branchChatUrl
-        ? normalizeChatUrl(event.branchChatUrl)
-        : runtime.state.branchChatUrl;
-      appendPanelLog(runtime, 'Branch is live', {
-        branchChatUrl: runtime.state.branchChatUrl,
-        launchTabId: runtime.state.launchTabId,
-        launchWindowId: runtime.state.launchWindowId,
-        surfaceMode: runtime.state.surfaceMode
-      });
-      runtime.state.status = 'live';
-      runtime.state.creationMode =
-        runtime.state.branchKind === 'temporary' ? 'local_temporary' : 'local_persistent';
-      runtime.state.statusLabel =
-        runtime.state.surfaceMode === 'native_window'
-          ? `Branch answer is ready in its ${provider.label} window.`
-          : 'Branch answer is ready in this window.';
-      runtime.state.errorMessage = undefined;
-      runtime.state.updatedAt = Date.now();
-      syncPanelUI(runtime);
-      renderTabs();
-      persistPanels();
-      void recordRunForPanel(runtime, {
-        run: 'submitted',
-        conversationUrl: runtime.state.branchChatUrl ?? null,
-        acknowledgement: 'branch reported live'
-      });
-      return;
-
-    case 'captured': {
-      runtime.state.archive = { messages: event.messages, capture: event.capture };
-      runtime.state.updatedAt = Date.now();
-      renderArchiveSection(runtime);
-      persistPanelsSoon(runtime.state.panelId);
-      void recordCaptureForPanel(runtime, event);
-      return;
-    }
-
-    case 'failed':
-      clearPanelWatchdog(runtime);
-      appendPanelLog(runtime, 'Branch reported failure', {
-        reason: event.reason,
-        branchChatUrl: event.branchChatUrl,
-        launchTabId: event.launchTabId,
-        launchWindowId: event.launchWindowId,
-        surfaceMode: runtime.state.surfaceMode
-      });
-      runtime.state.launchTabId = event.launchTabId ?? runtime.state.launchTabId;
-      runtime.state.launchWindowId = event.launchWindowId ?? runtime.state.launchWindowId;
-      runtime.state.branchChatUrl = event.branchChatUrl
-        ? normalizeChatUrl(event.branchChatUrl)
-        : runtime.state.branchChatUrl;
-      if (
-        runtime.state.branchKind === 'persistent' &&
-        runtime.state.surfaceMode === 'embedded' &&
-        /never became a persistent chat url/i.test(event.reason)
-      ) {
-        // If the URL turned up late, the branch really did succeed. Re-sending here
-        // would post the same question a second time and leave two conversations.
-        if (runtime.state.branchChatUrl) {
-          appendPanelLog(runtime, 'Persistent branch URL arrived late; keeping the existing branch', {
-            branchChatUrl: runtime.state.branchChatUrl
-          });
-          applyBranchPanelEvent(runtime, {
-            kind: 'live',
-            branchChatUrl: runtime.state.branchChatUrl
-          });
-          return;
-        }
-
-        void promotePersistentBranchToNativeWindow(runtime);
-        return;
-      }
-
-      if (event.buildId && event.buildId !== BUILD_ID) {
-        reportStaleClient(runtime, 'branch document', event.buildId);
-      }
-      if (event.recovery) {
-        // Preparation stopped before anything was typed. The pending prompt and
-        // the target stay, so Check again can continue exactly there.
-        runtime.state.recovery = event.recovery;
-        runtime.lastPreparationStep = 'failed';
-      } else {
-        runtime.pendingFramePrompt = undefined;
-        runtime.state.recovery = undefined;
-      }
-      runtime.showTargetWhileFailed = false;
-      runtime.state.status = 'failed';
-      runtime.state.creationMode = 'failed';
-      runtime.state.statusLabel = event.recovery
-        ? 'This branch was not sent.'
-        : runtime.state.surfaceMode === 'native_window'
-          ? `${provider.label} branch creation failed.`
-          : 'Local branch creation failed.';
-      runtime.state.errorMessage = event.reason;
-      runtime.state.updatedAt = Date.now();
-      syncPanelUI(runtime);
-      persistPanels();
-      void recordRunForPanel(runtime, { run: 'failed' });
-  }
 }
 
 function clearHighlightOverlay(): void {
@@ -5635,36 +3579,37 @@ function afterScrollSettles(callback: () => void): void {
   }
 }
 
-function scrollToOrigin(selection: SelectionPayload): void {
-  const target = findTurnElementByAnchor(selection);
-  if (!target) {
-    window.scrollTo({ top: selection.fallbackScrollY, behavior: 'smooth' });
-    return;
-  }
-
-  const exactRange = findQuotedTextRangeInElement(target, {
-    selectedText: selection.selectedText,
-    rangeQuotes: selection.rangeQuotes
-  });
-
-  if (exactRange) {
-    const firstRect = getFirstRangeRect(exactRange);
+/**
+ * Bring a saved passage back into view, validated rather than guessed: an exact
+ * match of the passage with its recorded context, or its message when only the
+ * message is identifiable. A duplicate phrase elsewhere is never used to claim
+ * success.
+ */
+function scrollToOrigin(selection: SelectionPayload): AnchorResult {
+  const found = locatePassage(selection);
+  if (found.status === 'exact') {
+    const firstRect = getFirstRangeRect(found.range);
     if (firstRect) {
-      scrollRectIntoView(firstRect, target);
+      scrollRectIntoView(firstRect, found.element);
       afterScrollSettles(() => {
         renderHighlightRects(
-          Array.from(exactRange.getClientRects()).map((rect) => rect as DOMRect),
-          target.getBoundingClientRect()
+          Array.from(found.range.getClientRects()).map((rect) => rect as DOMRect),
+          found.element.getBoundingClientRect()
         );
       });
-      return;
+      return 'exact';
     }
+    found.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    return 'exact';
   }
-
-  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  afterScrollSettles(() => {
-    renderHighlightRects([target.getBoundingClientRect()]);
-  });
+  if (found.status === 'message-only') {
+    found.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    afterScrollSettles(() => {
+      renderHighlightRects([found.element.getBoundingClientRect()]);
+    });
+    return 'message-only';
+  }
+  return found.status;
 }
 
 async function handleUrlChange(): Promise<void> {
@@ -5719,6 +3664,7 @@ async function handleUrlChange(): Promise<void> {
   }
 
   clearPanelsForCurrentConversation();
+  syncHandoffCardsToScope();
   hideAskButton();
   lastKnownUrl = nextUrl;
   await restorePanels();
@@ -5783,14 +3729,12 @@ function installUrlObservers(): void {
 function initTopFrame(): void {
   installThemeObserver();
   ensureStyles();
-  // Deliberately NOT ensureFrameAutomationStyles(): the page the user is reading
-  // keeps the provider's own rendering exactly as the provider authored it.
   installRuntimeMessageListener();
   syncMountedUi();
   void (async () => {
     await migrateLegacyPanelStorage();
-    await loadLastUsedBranchKind();
     await restorePanels();
+    await restoreHandoffs();
     syncMountedUi();
     scheduleMountedUiSync(350);
     scheduleMountedUiSync(1500);
@@ -5817,15 +3761,16 @@ function initTopFrame(): void {
     syncMountedUi();
     scheduleMountedUiSync(350);
   };
+  // Leaving the page (for the native chat, the toolbar popup, another tab) is
+  // when a debounced draft must reach the worker, so every view agrees.
   const focusListener = () => {
-    focusPendingDraftQuestionInput();
+    flushHandoffDrafts();
   };
   const visibilityListener = () => {
     if (document.visibilityState === 'visible') {
-      focusPendingDraftQuestionInput();
       return;
     }
-
+    flushHandoffDrafts();
     // Debounced writes would otherwise be lost if the tab is discarded while hidden.
     void flushPersistedPanels();
   };
@@ -5861,19 +3806,11 @@ function initTopFrame(): void {
   window.addEventListener('scroll', scrollListener, scrollListenerOptions);
   window.addEventListener('resize', resizeListener);
   window.addEventListener('pageshow', pageshowListener);
-  window.addEventListener('focus', focusListener);
+  window.addEventListener('blur', focusListener);
   document.addEventListener('visibilitychange', visibilityListener);
   window.addEventListener('pagehide', pagehideListener);
   document.addEventListener('keydown', keydownListener);
   installUrlObservers();
-
-  const frameMessageListener = (event: MessageEvent<FrameIncomingMessage>) => {
-    handleEmbeddedFrameMessage(event);
-  };
-  window.addEventListener('message', frameMessageListener);
-  cleanupFns.push(() => {
-    window.removeEventListener('message', frameMessageListener);
-  });
 
   cleanupFns.push(() => document.removeEventListener('selectionchange', selectionListener));
   cleanupFns.push(() => document.removeEventListener('mouseup', mouseupListener));
@@ -5886,1773 +3823,19 @@ function initTopFrame(): void {
   });
   cleanupFns.push(() => window.removeEventListener('resize', resizeListener));
   cleanupFns.push(() => window.removeEventListener('pageshow', pageshowListener));
-  cleanupFns.push(() => window.removeEventListener('focus', focusListener));
+  cleanupFns.push(() => window.removeEventListener('blur', focusListener));
   cleanupFns.push(() => document.removeEventListener('visibilitychange', visibilityListener));
   cleanupFns.push(() => window.removeEventListener('pagehide', pagehideListener));
   cleanupFns.push(() => document.removeEventListener('keydown', keydownListener));
-}
 
-function getDeepQueryRoots(root: ParentNode = document): ParentNode[] {
-  const roots: ParentNode[] = [];
-  const seen = new Set<Node>();
-
-  const visit = (candidate: ParentNode | null | undefined): void => {
-    if (!candidate) {
-      return;
-    }
-
-    const node = candidate as unknown as Node;
-    if (seen.has(node)) {
-      return;
-    }
-    seen.add(node);
-    roots.push(candidate);
-
-    const traversalRoot =
-      candidate instanceof Document
-        ? candidate.documentElement
-        : candidate instanceof ShadowRoot || candidate instanceof Element
-          ? candidate
-          : null;
-    if (!traversalRoot) {
-      return;
-    }
-
-    const walker = document.createTreeWalker(traversalRoot, NodeFilter.SHOW_ELEMENT);
-    let current: Node | null = traversalRoot;
-    while (current) {
-      if (current instanceof HTMLElement && current.shadowRoot?.mode === 'open') {
-        visit(current.shadowRoot);
-      }
-      current = walker.nextNode();
-    }
-  };
-
-  visit(root);
-  return roots;
-}
-
-function queryOne<T extends Element = HTMLElement>(selectors: string[], root: ParentNode = document): T | null {
-  const searchRoots = getDeepQueryRoots(root);
-  for (const selector of selectors) {
-    for (const searchRoot of searchRoots) {
-      const match = searchRoot.querySelector<T>(selector);
-      if (match) {
-        return match;
-      }
-    }
-  }
-  return null;
-}
-
-function queryMany<T extends Element = HTMLElement>(selectors: string[], root: ParentNode = document): T[] {
-  const results: T[] = [];
-  const seen = new Set<Element>();
-  const searchRoots = getDeepQueryRoots(root);
-  selectors.forEach((selector) => {
-    searchRoots.forEach((searchRoot) => {
-      Array.from(searchRoot.querySelectorAll<T>(selector)).forEach((match) => {
-        if (seen.has(match)) {
-          return;
-        }
-        seen.add(match);
-        results.push(match);
-      });
-    });
-  });
-  return results;
-}
-
-/**
- * Composer candidates, adapter selectors first and structure as a hedge.
- *
- * The adapter's selectors stay tier 1 — they are the provider knowledge this
- * codebase is organised around, and they found the live ChatGPT composer. But all
- * five of Claude's require tag DIV and the literal attribute value "true", so
- * `contenteditable=""`, `contenteditable="plaintext-only"` and inherited
- * editability are invisible to them. Tier 2 enumerates by a property of the
- * rendered page instead — `isContentEditable`, or a real textarea — across shadow
- * roots too, and is scored below any tier-1 match so selector drift degrades the
- * ranking rather than being fatal.
- */
-function getComposerCandidates(): Array<HTMLElement | HTMLTextAreaElement> {
-  const selectors = provider.composer.composerSelectors;
-  const seen = new Set<Element>();
-  const candidates: Array<HTMLElement | HTMLTextAreaElement> = [];
-
-  queryMany<HTMLElement | HTMLTextAreaElement>(selectors).forEach((candidate) => {
-    if (seen.has(candidate)) {
-      return;
-    }
-    seen.add(candidate);
-    candidates.push(candidate);
-  });
-
-  const tierOneCount = candidates.length;
-
-  getDeepQueryRoots().forEach((root) => {
-    root.querySelectorAll<HTMLElement>('textarea, [contenteditable]').forEach((element) => {
-      if (seen.has(element)) {
-        return;
-      }
-      const editable =
-        element instanceof HTMLTextAreaElement || element.isContentEditable === true;
-      if (!editable) {
-        return;
-      }
-      // The outermost editable host: an editable child of an editable is part of
-      // the same field, not a second composer.
-      if (
-        !(element instanceof HTMLTextAreaElement) &&
-        element.parentElement?.closest('[contenteditable]')
-      ) {
-        return;
-      }
-      seen.add(element);
-      structuralComposerCandidates.add(element);
-      candidates.push(element);
-    });
-  });
-
-  composerCensusCounts = { tierOne: tierOneCount, total: candidates.length };
-  return candidates;
-}
-
-/** Candidates found only by structure, so they can be ranked below adapter matches. */
-const structuralComposerCandidates = new WeakSet<Element>();
-
-let composerCensusCounts = { tierOne: 0, total: 0 };
-
-function isDisabledElement(element: Element): boolean {
-  if (element instanceof HTMLButtonElement || element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-    return element.disabled;
-  }
-
-  return element.getAttribute('aria-disabled') === 'true';
-}
-
-/** Why a candidate was rejected, so a failure can say which gate closed. */
-type ComposerRejection = 'not-visible' | 'disabled' | 'readonly' | 'accepted';
-
-let lastComposerRejection: ComposerRejection = 'accepted';
-
-function scoreComposerCandidate(candidate: HTMLElement | HTMLTextAreaElement): number {
-  lastComposerRejection = 'accepted';
-
-  // Hard gates, all of them properties of the rendered page rather than markup.
-  // An element with no layout box must never win: it also becomes the anchor the
-  // privacy control is searched around.
-  if (!isElementVisible(candidate)) {
-    lastComposerRejection = 'not-visible';
-    return Number.NEGATIVE_INFINITY;
-  }
-  if (isDisabledElement(candidate)) {
-    lastComposerRejection = 'disabled';
-    return Number.NEGATIVE_INFINITY;
-  }
-
-  if (candidate.getAttribute('readonly') === 'true' || candidate.hasAttribute('readonly')) {
-    lastComposerRejection = 'readonly';
-    return Number.NEGATIVE_INFINITY;
-  }
-
-  const rect = candidate.getBoundingClientRect();
-
-  // Size is a penalty, not a veto. This repo has already been bitten by the veto
-  // once — commit 9621ee1 found that an empty contenteditable has no intrinsic
-  // height, and the fixture was padded to work around it rather than the gate
-  // being fixed. A small but genuinely rendered composer must still be able to
-  // win when nothing better exists.
-  const sizePenalty = composerSizePenalty(
-    rect.width,
-    rect.height,
-    structuralComposerCandidates.has(candidate)
-  );
-
-  const label = compactWhitespace(
-    [
-      candidate.id,
-      candidate.getAttribute('name'),
-      candidate.getAttribute('placeholder'),
-      candidate.getAttribute('aria-label'),
-      candidate.getAttribute('data-testid'),
-      candidate.getAttribute('role')
-    ]
-      .filter(Boolean)
-      .join(' ')
-  ).toLowerCase();
-
-  let score = 0;
-  if (candidate.id === 'prompt-textarea') {
-    score += 500;
-  }
-  if (candidate.closest('form')) {
-    score += 120;
-  }
-  if (candidate instanceof HTMLTextAreaElement) {
-    score += 80;
-  }
-  if (candidate.matches('div[contenteditable="true"]')) {
-    score += 40;
-  }
-  if (candidate.getAttribute('role') === 'textbox') {
-    score += 40;
-  }
-  if (/prompt|message|ask|chatgpt|question|send|发送|提问|问题|消息/.test(label)) {
-    score += 140;
-  }
-  if (candidate.getAttribute('placeholder')) {
-    score += 30;
-  }
-
-  score += Math.min(200, Math.round(rect.width / 4));
-  score += Math.min(120, Math.round(rect.height * 2));
-  score += Math.max(0, Math.round(rect.top / 3));
-  score += Math.max(0, Math.round((window.innerHeight - Math.max(0, window.innerHeight - rect.bottom)) / 6));
-
-  return score + sizePenalty;
-}
-
-/**
- * What the composer picker actually saw, for a failure that can be diagnosed.
- *
- * The live Claude run produced twenty seconds of silence and then one sentence —
- * "The Claude composer did not appear in time." — which cannot distinguish "the
- * page rendered no composer" from "a composer was there and every gate rejected
- * it". Those need opposite fixes, and guessing between them is how this project
- * has already lost two rounds.
- *
- * Structure only: tags, roles, geometry, computed visibility, rejection reasons.
- * No field values, no page text.
- */
-function describeComposerCensus(): Record<string, unknown> {
-  const selectorHits: Record<string, number> = {};
-  provider.composer.composerSelectors.forEach((selector) => {
-    try {
-      selectorHits[selector] = queryMany<HTMLElement>([selector]).length;
-    } catch {
-      selectorHits[selector] = -1;
-    }
-  });
-
-  const candidates = getComposerCandidates().slice(0, 8).map((candidate) => {
-    const rect = candidate.getBoundingClientRect();
-    const style = window.getComputedStyle(candidate);
-    const score = scoreComposerCandidate(candidate);
-    return {
-      tag: candidate.tagName,
-      role: candidate.getAttribute('role'),
-      testId: candidate.getAttribute('data-testid'),
-      contentEditableAttr: candidate.getAttribute('contenteditable'),
-      isContentEditable: candidate.isContentEditable === true,
-      hasPlaceholder: Boolean(
-        candidate.getAttribute('placeholder') ?? candidate.getAttribute('data-placeholder')
-      ),
-      rect: {
-        width: Math.round(rect.width),
-        height: Math.round(rect.height),
-        top: Math.round(rect.top)
-      },
-      clientRects: candidate.getClientRects().length,
-      display: style.display,
-      visibility: style.visibility,
-      opacity: style.opacity,
-      structuralOnly: structuralComposerCandidates.has(candidate),
-      score: Number.isFinite(score) ? score : null,
-      rejectedBy: Number.isFinite(score) ? null : lastComposerRejection
-    };
-  });
-
-  return {
-    providerId: provider.id,
-    readyState: document.readyState,
-    visibilityState: document.visibilityState,
-    viewport: { width: window.innerWidth, height: window.innerHeight },
-    deepRoots: getDeepQueryRoots().length,
-    editableHosts: getDeepQueryRoots().reduce(
-      (total, root) => total + root.querySelectorAll('[contenteditable],textarea').length,
-      0
-    ),
-    selectorHits,
-    tierOneMatches: composerCensusCounts.tierOne,
-    candidateCount: composerCensusCounts.total,
-    candidates
-  };
-}
-
-function describeComposerCandidate(candidate: HTMLElement | HTMLTextAreaElement): Record<string, unknown> {
-  const rect = candidate.getBoundingClientRect();
-  return {
-    tag: candidate.tagName,
-    id: candidate.id || null,
-    name: candidate.getAttribute('name'),
-    placeholder: candidate.getAttribute('placeholder'),
-    ariaLabel: candidate.getAttribute('aria-label'),
-    dataTestId: candidate.getAttribute('data-testid'),
-    role: candidate.getAttribute('role'),
-    hasForm: Boolean(candidate.closest('form')),
-    rect: {
-      top: Math.round(rect.top),
-      left: Math.round(rect.left),
-      width: Math.round(rect.width),
-      height: Math.round(rect.height)
-    },
-    score: scoreComposerCandidate(candidate)
-  };
-}
-
-function findComposer(): HTMLElement | HTMLTextAreaElement | null {
-  const candidates = getComposerCandidates()
-    .map((candidate) => ({
-      candidate,
-      score: scoreComposerCandidate(candidate)
-    }))
-    .filter((entry) => Number.isFinite(entry.score))
-    .sort((left, right) => right.score - left.score);
-
-  return candidates[0]?.candidate ?? null;
-}
-
-async function waitForComposer(timeoutMs = 20_000): Promise<HTMLElement | HTMLTextAreaElement> {
-  // A frame that is not being rendered has no laid-out anything, so every
-  // candidate fails the visibility gate and the wait burns its whole budget
-  // blaming the composer for it. Say what is actually wrong instead.
-  if (window.innerWidth === 0 || window.innerHeight === 0) {
-    recordAutomationLog('Branch frame is not being rendered', {
-      viewport: { width: window.innerWidth, height: window.innerHeight },
-      visibilityState: document.visibilityState
-    });
-    throw new Error(
-      `The branch window is not being rendered, so nothing could be typed into ${provider.label}.`
-    );
-  }
-
-  const deadline = Date.now() + timeoutMs;
-  let censusLogged = false;
-  const censusAt = Date.now() + 2_000;
-
-  while (Date.now() < deadline) {
-    const composer = findComposer();
-    if (composer) {
-      return composer;
-    }
-    if (!censusLogged && Date.now() >= censusAt) {
-      censusLogged = true;
-      recordAutomationLog('Composer not found yet', describeComposerCensus());
-    }
-    await sleep(250);
-  }
-
-  recordAutomationLog('Composer search timed out', describeComposerCensus());
-  throw new Error(`The ${provider.label} composer did not appear in time.`);
-}
-
-function getComposerValueLength(composer: HTMLElement | HTMLTextAreaElement): number {
-  return composer instanceof HTMLTextAreaElement
-    ? composer.value.length
-    : compactWhitespace(composer.textContent || '').length;
-}
-
-function refreshComposerReference(
-  composer: HTMLElement | HTMLTextAreaElement
-): HTMLElement | HTMLTextAreaElement {
-  return findComposer() ?? composer;
-}
-
-async function focusComposerForFollowUp(timeoutMs = 5_000): Promise<void> {
-  const composer = await waitForComposer(timeoutMs);
-  composer.click();
-  composer.focus();
-
-  if (composer instanceof HTMLTextAreaElement) {
-    const nextPosition = composer.value.length;
-    composer.setSelectionRange(nextPosition, nextPosition);
-  }
-
-  recordAutomationLog('Composer focused for manual follow-up', {
-    composerCandidate: describeComposerCandidate(composer)
-  });
-}
-
-function describeComposerCandidateForLog(
-  composer: HTMLElement | HTMLTextAreaElement,
-  fallback?: Record<string, unknown>
-): Record<string, unknown> {
-  if (composer.isConnected) {
-    const description = describeComposerCandidate(composer);
-    const rect = description.rect as Record<string, number> | undefined;
-    if (rect && ((rect.width ?? 0) > 0 || (rect.height ?? 0) > 0)) {
-      return description;
-    }
-  }
-
-  return fallback ?? describeComposerCandidate(composer);
-}
-
-function fillComposer(
-  composer: HTMLElement | HTMLTextAreaElement,
-  prompt: string,
-  inputType: 'insertText' | 'insertFromPaste' = 'insertText'
-): void {
-  composer.click();
-  composer.focus();
-
-  if (composer instanceof HTMLTextAreaElement) {
-    composer.setSelectionRange(0, composer.value.length);
-    composer.dispatchEvent(
-      new InputEvent('beforeinput', {
-        bubbles: true,
-        cancelable: true,
-        data: prompt,
-        inputType
-      })
-    );
-    try {
-      composer.setRangeText(prompt, 0, composer.value.length, 'end');
-    } catch {
-      // Fall back to the native setter below if setRangeText is unavailable.
-    }
-    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-    setter?.call(composer, prompt);
-    composer.dispatchEvent(
-      new InputEvent('input', {
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-        data: prompt,
-        inputType
-      })
-    );
-    composer.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'a', code: 'KeyA' }));
-    composer.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'a', code: 'KeyA' }));
-    composer.dispatchEvent(new Event('change', { bubbles: true }));
-    return;
-  }
-
-  const selection = window.getSelection();
-  const range = document.createRange();
-  range.selectNodeContents(composer);
-  selection?.removeAllRanges();
-  selection?.addRange(range);
-
-  try {
-    if (prompt) {
-      document.execCommand('insertText', false, prompt);
-    } else {
-      // insertText with an empty string is a no-op, so deleting the selection is the
-      // only way to actually empty a contenteditable composer.
-      document.execCommand('delete');
-    }
-  } catch {
-    composer.textContent = prompt;
-  }
-
-  composer.dispatchEvent(
-    new InputEvent('input', {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      data: prompt,
-      inputType
-    })
-  );
-}
-
-function countSignificantChars(value: string): number {
-  return value.replace(/\s+/g, '').length;
-}
-
-// A ProseMirror composer renders the prompt's blank lines as separate paragraphs, so its
-// textContent has no separator at all where the prompt had a newline. Comparing raw or
-// whitespace-collapsed lengths therefore always came up short and the composer was filled
-// twice on every branch. Compare the characters that actually matter instead.
-function getComposerSignificantLength(composer: HTMLElement | HTMLTextAreaElement): number {
-  return countSignificantChars(
-    composer instanceof HTMLTextAreaElement ? composer.value : composer.textContent ?? ''
-  );
-}
-
-async function fillComposerWithStrategies(
-  composer: HTMLElement | HTMLTextAreaElement,
-  prompt: string
-): Promise<{
-  composer: HTMLElement | HTMLTextAreaElement;
-  strategy: 'insertText' | 'insertFromPaste';
-  valueLength: number;
-}> {
-  const strategies: Array<'insertText' | 'insertFromPaste'> = ['insertText', 'insertFromPaste'];
-  let activeComposer = composer;
-  let bestResult = {
-    composer: activeComposer,
-    strategy: strategies[0],
-    valueLength: getComposerValueLength(activeComposer)
-  };
-
-  for (const strategy of strategies) {
-    fillComposer(activeComposer, prompt, strategy);
-    await sleep(120);
-    activeComposer = refreshComposerReference(activeComposer);
-    const valueLength = getComposerValueLength(activeComposer);
-    recordAutomationLog('Composer fill strategy attempted', {
-      strategy,
-      valueLength,
-      significantLength: getComposerSignificantLength(activeComposer),
-      expectedSignificantLength: countSignificantChars(prompt),
-      composerCandidate: describeComposerCandidateForLog(activeComposer)
-    });
-
-    if (valueLength >= bestResult.valueLength) {
-      bestResult = {
-        composer: activeComposer,
-        strategy,
-        valueLength
-      };
-    }
-
-    if (getComposerSignificantLength(activeComposer) >= countSignificantChars(prompt)) {
-      return {
-        composer: activeComposer,
-        strategy,
-        valueLength
-      };
-    }
-  }
-
-  return bestResult;
-}
-
-function getSendButtonCandidates(scope: ParentNode): HTMLElement[] {
-  return queryMany<HTMLElement>(provider.composer.sendButtonSelectors, scope);
-}
-
-function describeSendButtonCandidate(
-  candidate: HTMLElement,
-  composer?: HTMLElement | HTMLTextAreaElement | null,
-  score = scoreSendButtonCandidate(candidate, composer)
-): Record<string, unknown> {
-  const rect = candidate.getBoundingClientRect();
-  const profile = getSendCandidateProfile(candidate, composer);
-  return {
-    tag: candidate.tagName,
-    role: candidate.getAttribute('role'),
-    type: candidate instanceof HTMLButtonElement ? candidate.type : null,
-    ariaLabel: candidate.getAttribute('aria-label'),
-    title: candidate.getAttribute('title'),
-    dataTestId: candidate.getAttribute('data-testid'),
-    label: getActionLabel(candidate),
-    disabled: isDisabledElement(candidate),
-    explicitSend: profile.explicitSend,
-    negative: profile.negative,
-    temporaryChat: profile.temporaryChat,
-    submitLike: profile.submitLike,
-    sameForm: profile.sameForm,
-    rect: {
-      top: Math.round(rect.top),
-      left: Math.round(rect.left),
-      width: Math.round(rect.width),
-      height: Math.round(rect.height)
-    },
-    score
-  };
-}
-
-function getTemporaryChatControlCandidates(scope: ParentNode): HTMLElement[] {
-  const selectors = provider.composer.privacyControlSelectors;
-  const seen = new Set<HTMLElement>();
-  const matches = queryMany<HTMLElement>(selectors, scope);
-  const buttons = getSendButtonCandidates(scope).filter((candidate) => isTemporaryChatControl(candidate));
-
-  return [...matches, ...buttons].filter((candidate) => {
-    if (seen.has(candidate)) {
-      return false;
-    }
-    seen.add(candidate);
-    return true;
-  });
-}
-
-function getComposerSearchScopes(
-  composer?: HTMLElement | HTMLTextAreaElement | null
-): ParentNode[] {
-  const scopes: ParentNode[] = [];
-  const localScope = composer?.closest('form') ?? composer?.parentElement ?? null;
-  if (localScope) {
-    scopes.push(localScope);
-  }
-  scopes.push(document);
-  return scopes;
-}
-
-function findDirectTemporaryChatControl(
-  composer?: HTMLElement | HTMLTextAreaElement | null,
-  targetState: 'active' | 'any' = 'any'
-): HTMLElement | null {
-  const anySelectors = provider.composer.privacyControlSelectors;
-  // An explicitly pressed/checked control is the strongest signal available, so look
-  // for that form of each selector first.
-  const activeSelectors = anySelectors.flatMap((selector) => [
-    `${selector}[aria-pressed="true"]`,
-    `${selector}[aria-checked="true"]`
-  ]);
-
-  for (const scope of getComposerSearchScopes(composer)) {
-    const direct =
-      targetState === 'active'
-        ? queryOne<HTMLElement>(activeSelectors, scope)
-        : queryOne<HTMLElement>(anySelectors, scope);
-    if (direct) {
-      return direct;
-    }
-  }
-
-  return null;
-}
-
-function scoreTemporaryChatCandidate(
-  candidate: HTMLElement,
-  composer?: HTMLElement | HTMLTextAreaElement | null
-): number {
-  if (isDisabledElement(candidate) || !isTemporaryChatControl(candidate)) {
-    return Number.NEGATIVE_INFINITY;
-  }
-
-  const rect = candidate.getBoundingClientRect();
-  const composerRect = composer?.getBoundingClientRect();
-  const inferredState = inferTemporaryChatState(candidate);
-  let score = 0;
-
-  if (isElementVisible(candidate)) {
-    score += 120;
-  }
-  if (composer?.closest('form') && candidate.closest('form') === composer.closest('form')) {
-    score += 250;
-  }
-  if (candidate instanceof HTMLButtonElement && candidate.type === 'submit') {
-    score += 120;
-  }
-  if (inferredState === 'active') {
-    score += 180;
-  }
-  if (inferredState === 'inactive') {
-    score += 60;
-  }
-  if (composerRect) {
-    const horizontalGap = Math.abs(rect.left - composerRect.right);
-    const verticalGap = Math.abs(rect.top - composerRect.top);
-    score += Math.max(0, 200 - Math.round(horizontalGap));
-    score += Math.max(0, 140 - Math.round(verticalGap));
-  }
-
-  return score;
-}
-
-function describeTemporaryChatCandidate(
-  candidate: HTMLElement,
-  composer?: HTMLElement | HTMLTextAreaElement | null,
-  score = scoreTemporaryChatCandidate(candidate, composer)
-): Record<string, unknown> {
-  return {
-    ...describeSendButtonCandidate(candidate, composer, score),
-    inferredState: inferTemporaryChatState(candidate)
-  };
-}
-
-function activateControl(candidate: HTMLElement): void {
-  candidate.focus();
-  const rect = candidate.getBoundingClientRect();
-  const eventInit: MouseEventInit = {
-    bubbles: true,
-    cancelable: true,
-    composed: true,
-    clientX: rect.left + Math.max(1, rect.width / 2),
-    clientY: rect.top + Math.max(1, rect.height / 2)
-  };
-
-  if (window.PointerEvent) {
-    ['pointerdown', 'pointerup'].forEach((type) => {
-      candidate.dispatchEvent(
-        new window.PointerEvent(type, {
-          ...eventInit,
-          pointerId: 1,
-          pointerType: 'mouse',
-          isPrimary: true
-        })
-      );
-    });
-  }
-
-  ['mousedown', 'mouseup', 'click'].forEach((type) => {
-    candidate.dispatchEvent(new MouseEvent(type, eventInit));
-  });
-}
-
-function getRankedTemporaryChatControls(
-  composer?: HTMLElement | HTMLTextAreaElement | null
-): Array<{ candidate: HTMLElement; score: number }> {
-  const seen = new Set<HTMLElement>();
-  return getComposerSearchScopes(composer)
-    .flatMap((scope) => getTemporaryChatControlCandidates(scope))
-    .filter((candidate) => {
-      if (seen.has(candidate)) {
-        return false;
-      }
-      seen.add(candidate);
-      return true;
-    })
-    .map((candidate) => ({
-      candidate,
-      score: scoreTemporaryChatCandidate(candidate, composer)
-    }))
-    .filter((entry) => Number.isFinite(entry.score))
-    .sort((left, right) => right.score - left.score);
-}
-
-async function ensurePersistentChatMode(
-  composer: HTMLElement | HTMLTextAreaElement
-): Promise<void> {
-  const directActiveControl = findDirectTemporaryChatControl(composer, 'active');
-  const directAnyControl = directActiveControl ?? findDirectTemporaryChatControl(composer, 'any');
-  const candidates = getRankedTemporaryChatControls(composer);
-  recordAutomationLog('Detected temporary chat controls', {
-    directActiveControl: directActiveControl
-      ? describeTemporaryChatCandidate(directActiveControl, composer)
-      : null,
-    directAnyControl: directAnyControl ? describeTemporaryChatCandidate(directAnyControl, composer) : null,
-    candidates: candidates
-      .slice(0, 8)
-      .map((entry) => describeTemporaryChatCandidate(entry.candidate, composer, entry.score))
-  });
-
-  const primaryCandidate = directActiveControl ?? directAnyControl ?? candidates[0]?.candidate ?? null;
-  const primaryScore = primaryCandidate ? scoreTemporaryChatCandidate(primaryCandidate, composer) : undefined;
-
-  if (!primaryCandidate) {
-    return;
-  }
-
-  const primaryState = inferTemporaryChatState(primaryCandidate);
-
-  if (primaryState === 'inactive') {
-    recordAutomationLog('Temporary chat control is present but inactive', {
-      control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore),
-      toggledOff: false
-    });
-    return;
-  }
-
-  if (primaryState === 'unknown') {
-    // Clicking a toggle whose state we cannot read could switch temporary chat ON, which
-    // is the outcome this function exists to avoid. Leave it alone and let the missing
-    // /c/ URL downstream be the signal if the chat really was temporary.
-    recordAutomationLog('Temporary chat control state is unreadable; leaving it untouched', {
-      control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore)
-    });
-    return;
-  }
-
-  recordAutomationLog('Temporary chat mode appears active; disabling it before send', {
-    control: describeTemporaryChatCandidate(primaryCandidate, composer, primaryScore),
-    toggledOff: false
-  });
-  // A bare .click() is ignored by toggles that listen for pointer events, which is why
-  // the temporary-chat path already uses the full synthetic activation sequence.
-  activateControl(primaryCandidate);
-
-  const deadline = Date.now() + 4_000;
-  while (Date.now() < deadline) {
-    const refreshedActive = findDirectTemporaryChatControl(composer, 'active');
-    const refreshedAny = refreshedActive ?? findDirectTemporaryChatControl(composer, 'any');
-    if (!refreshedAny) {
-      recordAutomationLog('Temporary chat control disappeared after toggle', {
-        toggledOff: true
-      });
-      return;
-    }
-
-    const nextState = inferTemporaryChatState(refreshedAny);
-    if (nextState === 'inactive') {
-      recordAutomationLog('Temporary chat mode disabled successfully', {
-        control: describeTemporaryChatCandidate(refreshedAny, composer),
-        toggledOff: true
-      });
-      return;
-    }
-
-    await sleep(200);
-  }
-
-  throw new Error(
-    `${provider.label} is in ${provider.privacy.label} mode; persistent branch creation cannot continue.`
-  );
-}
-
-const PRIVATE_PREPARATION_BUDGET_MS = 12_000;
-const PRIVATE_VERIFY_BUDGET_MS = 4_000;
-
-function observePrivateModeHere(
-  composer?: HTMLElement | HTMLTextAreaElement | null
-): PrivacyObservation {
-  return observePrivateMode({
-    document,
-    composer: provider.composer,
-    transcript: provider.transcript,
-    composerElement: composer ?? null,
-    label: provider.privacy.label
-  });
-}
-
-function recoveryFromObservation(observation: PrivacyObservation): PrivacyRecovery {
-  return summarizeObservation(observation, provider.privacy.label, BUILD_ID);
-}
-
-/** Log the observation (attributes only) and tell the panel which step this is. */
-async function reportPreparation(observation: PrivacyObservation, note: string): Promise<PrivacyRecovery> {
-  const recovery = recoveryFromObservation(observation);
-  recordAutomationLog(note, {
-    step: recovery.step,
-    availability: recovery.availability,
-    mode: recovery.mode,
-    evidence: recovery.evidence,
-    nextAction: recovery.nextAction,
-    control: recovery.control
-  });
-  await sendAutomationEvent({ kind: 'preparation', recovery });
-  return recovery;
-}
-
-async function waitForPrivateObservation(
-  composer: HTMLElement | HTMLTextAreaElement | null | undefined,
-  budgetMs: number,
-  settled: (observation: PrivacyObservation) => boolean
-): Promise<PrivacyObservation> {
-  const deadline = Date.now() + budgetMs;
-  let latest = observePrivateModeHere(composer);
-  while (!settled(latest) && Date.now() < deadline) {
-    await sleep(200);
-    latest = observePrivateModeHere(composer);
-  }
-  return latest;
-}
-
-/**
- * Prepare the provider's private mode as a bounded workflow over typed
- * observations: open a menu when the control is behind one, activate the
- * control when it reports inactive, stop at a chooser dialog, and count only
- * provider-owned evidence as verification. Every stop is reported with where it
- * stopped, and nothing is typed on any path that does not end in `ready`.
- */
-async function ensureTemporaryChatMode(
-  composer: HTMLElement | HTMLTextAreaElement
-): Promise<void> {
-  const label = provider.privacy.label;
-  const deadline = Date.now() + PRIVATE_PREPARATION_BUDGET_MS;
-  let menuOpenings = 0;
-  let activations = 0;
-  let lastReported = '';
-
-  for (;;) {
-    const observation = observePrivateModeHere(composer);
-    const key = `${observation.step}:${observation.nextAction}`;
-    if (key !== lastReported) {
-      lastReported = key;
-      await reportPreparation(observation, 'Private-mode observation');
-    }
-
-    if (observation.step === 'ready' && observation.mode === 'private') {
-      return;
-    }
-
-    const stop = (message: string): PrivacyNotVerifiedError =>
-      new PrivacyNotVerifiedError(message, recoveryFromObservation(observation));
-
-    switch (observation.nextAction) {
-      case 'wait-for-page':
-        if (Date.now() < deadline) {
-          await sleep(250);
-          continue;
-        }
-        throw stop('The branch window did not finish loading, so nothing was typed or sent.');
-
-      case 'open-menu':
-        if (observation.actionTarget && menuOpenings < 2 && Date.now() < deadline) {
-          menuOpenings += 1;
-          recordAutomationLog('Opening the provider menu that holds the private-mode control', {
-            control: observation.control
-          });
-          activateControl(observation.actionTarget);
-          await waitForPrivateObservation(composer, 1_500, (next) => next.nextAction !== 'open-menu');
-          continue;
-        }
-        throw stop(
-          `Aside opened ${provider.label}'s menu but could not reach its ${label} control, so nothing was typed or sent. Turn ${label} on in the branch window, then Check again.`
-        );
-
-      case 'activate-control': {
-        if (!observation.actionTarget || activations >= 1) {
-          throw stop(
-            `${label} did not turn on, so nothing was typed or sent. Turn it on in the branch window, then Check again.`
-          );
-        }
-        activations += 1;
-        recordAutomationLog('Private mode inactive; enabling it before anything is typed', {
-          control: observation.control
-        });
-        activateControl(observation.actionTarget);
-        // Only a provider-owned active state counts as verification. A control that
-        // vanished, never flipped, or timed out is not evidence of anything, and
-        // this is the decision that determines whether private text is saved.
-        const verified = await waitForPrivateObservation(
-          composer,
-          PRIVATE_VERIFY_BUDGET_MS,
-          (next) =>
-            (next.step === 'ready' && next.mode === 'private') ||
-            next.step === 'awaiting-choice' ||
-            next.step === 'awaiting-login'
-        );
-        if (verified.step === 'ready' && verified.mode === 'private') {
-          await reportPreparation(verified, 'Private mode verified after activation');
-          return;
-        }
-        if (verified.step === 'awaiting-choice' || verified.step === 'awaiting-login') {
-          await reportPreparation(verified, 'Private mode activation is waiting on the Owner');
-          throw new PrivacyNotVerifiedError(
-            `${verified.reason} Nothing was typed or sent.`,
-            recoveryFromObservation(verified)
-          );
-        }
-        await reportPreparation(verified, 'Private mode was not confirmed after activation');
-        throw new PrivacyNotVerifiedError(
-          `Aside turned on ${provider.label}'s ${label} but ${provider.label} never confirmed it, so nothing was typed or sent. Check ${label} in the branch window, then Check again.`,
-          recoveryFromObservation(verified)
-        );
-      }
-
-      case 'choose-personalization':
-      case 'sign-in':
-      case 'check-again':
-        throw stop(`${observation.reason} Nothing was typed or sent.`);
-
-      case 'none':
-      default:
-        throw stop(
-          observation.step === 'blocked'
-            ? `${provider.label}'s ${label} is disabled in this branch window, so nothing was typed or sent. This usually means a project or workspace rule.`
-            : `${provider.label} did not report whether ${label} is on, so nothing was typed or sent.`
-        );
-    }
+  // The page role is confirmed asynchronously, so a selection can already exist
+  // by the time the listeners are in place: evaluate it once instead of waiting
+  // for the next selection change.
+  if (!(window.getSelection()?.isCollapsed ?? true)) {
+    selectionListener();
   }
 }
 
-/**
- * Re-check that the mode still holds after the prompt has been typed. The composer
- * can remount and a provider can drop out of private mode between the two steps.
- */
-async function assertPrivateModeStillActive(
-  composer: HTMLElement | HTMLTextAreaElement,
-  prompt: string,
-  options: { clearComposer?: boolean } = {}
-): Promise<void> {
-  const observation = observePrivateModeHere(composer);
-  if (observation.mode === 'private') {
-    return;
-  }
-
-  recordAutomationLog('Private mode stopped being verifiable after the prompt was typed', {
-    step: observation.step,
-    mode: observation.mode,
-    evidence: observation.evidence,
-    control: observation.control
-  });
-  const recovery = recoveryFromObservation(observation);
-  if (options.clearComposer === false) {
-    // Nothing has been typed yet, so there is nothing to take back.
-    throw new PrivacyNotVerifiedError(
-      `${provider.label} stopped reporting ${provider.privacy.label} while the branch was being prepared, so nothing was typed or sent.`,
-      recovery
-    );
-  }
-
-  clearComposerAfterFailure(prompt);
-  throw new PrivacyNotVerifiedError(
-    `${provider.label} stopped reporting ${provider.privacy.label} while the branch was being prepared, so it was not sent. The text was removed from the composer.`,
-    recovery
-  );
-}
-
-async function ensureBranchKindMode(
-  branchKind: BranchKind,
-  composer: HTMLElement | HTMLTextAreaElement
-): Promise<void> {
-  if (branchKind === 'temporary') {
-    await ensureTemporaryChatMode(composer);
-    return;
-  }
-
-  await ensurePersistentChatMode(composer);
-}
-
-function scoreSendButtonCandidate(
-  candidate: HTMLElement,
-  composer?: HTMLElement | HTMLTextAreaElement | null
-): number {
-  if (!isElementVisible(candidate) || isDisabledElement(candidate)) {
-    return Number.NEGATIVE_INFINITY;
-  }
-
-  const profile = getSendCandidateProfile(candidate, composer);
-  const rect = candidate.getBoundingClientRect();
-  const composerRect = composer?.getBoundingClientRect();
-  let score = 0;
-
-  if (!isAcceptableSendControl(profile)) {
-    return Number.NEGATIVE_INFINITY;
-  }
-
-  if (candidate.getAttribute('data-testid') === 'send-button') {
-    score += 900;
-  }
-  if (profile.submitLike) {
-    score += 500;
-  }
-  if (profile.explicitSend) {
-    score += 400;
-  }
-  if (profile.sameForm) {
-    score += 200;
-  }
-  if (!profile.label && candidate.querySelector('svg')) {
-    score += 60;
-  }
-  if (composerRect) {
-    const horizontalGap = Math.abs(rect.left - composerRect.right);
-    const verticalGap = Math.abs(rect.top - composerRect.top);
-    score += Math.max(0, 220 - Math.round(horizontalGap));
-    score += Math.max(0, 140 - Math.round(verticalGap));
-    if (profile.sameForm) {
-      score += Math.max(0, 180 - Math.round(horizontalGap * 1.4));
-    }
-  }
-
-  return score;
-}
-
-function getRankedSendButtons(
-  composer?: HTMLElement | HTMLTextAreaElement | null
-): Array<{ candidate: HTMLElement; score: number }> {
-  const scopes: ParentNode[] = [];
-  const localScope = composer?.closest('form') ?? composer?.parentElement ?? null;
-  if (localScope) {
-    scopes.push(localScope);
-  }
-  scopes.push(document);
-
-  const seen = new Set<HTMLElement>();
-  const ranked = scopes
-    .flatMap((scope) => getSendButtonCandidates(scope))
-    .filter((candidate) => {
-      if (seen.has(candidate)) {
-        return false;
-      }
-      seen.add(candidate);
-      return true;
-    })
-    .map((candidate) => ({
-      candidate,
-      score: scoreSendButtonCandidate(candidate, composer)
-    }))
-    .filter((entry) => Number.isFinite(entry.score))
-    .sort((left, right) => right.score - left.score);
-
-  const sameForm = ranked.filter((entry) => getSendCandidateProfile(entry.candidate, composer).sameForm);
-  if (sameForm.length) {
-    const nonSameForm = ranked.filter((entry) => !getSendCandidateProfile(entry.candidate, composer).sameForm);
-    return [...sameForm, ...nonSameForm];
-  }
-
-  return ranked;
-}
-
-async function waitForAcceptedGenerationSignalOrNull(
-  baselineTurnCount: number,
-  initialUrl: string,
-  timeoutMs = 2_500
-): Promise<'persistent_url' | 'stop_button' | 'transcript_growth' | null> {
-  try {
-    return await waitForAcceptedGenerationSignal(baselineTurnCount, initialUrl, timeoutMs);
-  } catch {
-    return null;
-  }
-}
-
-function findStopButton(): HTMLButtonElement | null {
-  return queryOne<HTMLButtonElement>(provider.composer.stopButtonSelectors);
-}
-
-function isPersistentConversationUrl(url: string): boolean {
-  return provider.isConversationUrl(url);
-}
-
-async function waitForAcceptedGenerationSignal(
-  baselineTurnCount: number,
-  initialUrl: string,
-  timeoutMs = 12_000
-): Promise<'persistent_url' | 'stop_button' | 'transcript_growth'> {
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    const currentUrl = normalizeChatUrl(window.location.href);
-    if (currentUrl !== initialUrl && isPersistentConversationUrl(currentUrl)) {
-      return 'persistent_url';
-    }
-
-    if (findStopButton()) {
-      return 'stop_button';
-    }
-
-    if (countTranscriptTurns(document) > baselineTurnCount) {
-      return 'transcript_growth';
-    }
-
-    await sleep(250);
-  }
-
-  throw new Error(
-    `${provider.label} did not start generating the branch question. No persistent chat URL, stop button, or new transcript turn appeared.`
-  );
-}
-
-async function submitComposer(
-  prompt: string,
-  branchKind: BranchKind
-): Promise<{
-  acceptedSignal: 'persistent_url' | 'stop_button' | 'transcript_growth';
-}> {
-  recordAutomationLog('Preparing first branch prompt', {
-    promptLength: prompt.length,
-    branchKind,
-    currentUrl: normalizeChatUrl(window.location.href)
-  });
-  const initialUrl = normalizeChatUrl(window.location.href);
-  const baselineTurnCount = countTranscriptTurns(document);
-
-  // Order matters and is the whole point of this sequence:
-  //   surface -> activate the requested mode -> verify it -> acquire composer ->
-  //   fill -> recheck the mode -> submit once.
-  // Filling first, as this used to, means the selected passage is already sitting
-  // in the composer when a mode control that might itself submit gets clicked.
-  let composer = await waitForComposer();
-  await ensureBranchKindMode(branchKind, composer);
-
-  // The mode toggle can navigate and remount the composer, so acquire it again
-  // rather than typing into a detached node.
-  composer = await waitForComposer();
-
-  // That re-acquire can take up to 20 s, during which the verification above goes
-  // stale. Re-check against the composer that is actually about to be typed into,
-  // so private text is never typed on the strength of a check made before a
-  // navigation.
-  if (branchKind === 'temporary') {
-    await assertPrivateModeStillActive(composer, prompt, { clearComposer: false });
-    // The panel learns the prompt is about to be typed: from here on a navigation
-    // must never be answered by delivering the prompt again.
-    await reportPreparation(observePrivateModeHere(composer), 'Private mode verified; inserting the prompt');
-  }
-
-  let composerSnapshot = describeComposerCandidate(composer);
-  let form = composer.closest('form');
-  recordAutomationLog('Composer acquired after the chat mode was verified', {
-    composerTag: composer.tagName,
-    composerCandidate: composerSnapshot,
-    baselineTurnCount,
-    branchKind,
-    hasForm: form instanceof HTMLFormElement
-  });
-
-  const fillResult = await fillComposerWithStrategies(composer, prompt);
-  composer = fillResult.composer;
-  composerSnapshot = describeComposerCandidateForLog(composer, composerSnapshot);
-  form = composer.closest('form');
-  recordAutomationLog('Composer filled for first branch prompt', {
-    strategy: fillResult.strategy,
-    valueLength: fillResult.valueLength,
-    composerCandidate: composerSnapshot
-  });
-
-  // The mode can change between typing and sending; check again before submitting.
-  if (branchKind === 'temporary') {
-    await assertPrivateModeStillActive(composer, prompt);
-  }
-
-  /**
-   * Every submit attempt is guarded, not just the first.
-   *
-   * The fallback chain below spans roughly thirteen seconds of further attempts.
-   * A single check before the first click would let a mode change part-way
-   * through that window produce a persistent send, which is detectable only
-   * afterwards.
-   */
-  const assertStillPrivateBeforeSend = async (): Promise<void> => {
-    if (branchKind !== 'temporary') {
-      return;
-    }
-    await assertPrivateModeStillActive(refreshComposerReference(composer), prompt);
-  };
-
-  const logVisibleButtonContext = (label: string) => {
-    const currentComposer = refreshComposerReference(composer);
-    const currentSnapshot = describeComposerCandidateForLog(currentComposer, composerSnapshot);
-    recordAutomationLog(label, {
-      composerCandidate: currentSnapshot,
-      buttonCandidates: getSendButtonCandidates(document)
-        .filter((candidate) => isElementVisible(candidate))
-        .slice(0, 16)
-        .map((candidate) => describeSendButtonCandidate(candidate, currentComposer)),
-      temporaryChatCandidates: getRankedTemporaryChatControls(currentComposer)
-        .slice(0, 8)
-        .map((entry) => describeTemporaryChatCandidate(entry.candidate, currentComposer, entry.score))
-    });
-  };
-
-  let significantLengthBeforeSend = 0;
-
-  const attemptClickSendButton = async (
-    stage: 'primary' | 'final_rescan',
-    timeoutMs = 3_500
-  ): Promise<'persistent_url' | 'stop_button' | 'transcript_growth' | null> => {
-    composer = refreshComposerReference(composer);
-    composerSnapshot = describeComposerCandidateForLog(composer, composerSnapshot);
-    form = composer.closest('form');
-    const rankedSendButtons = getRankedSendButtons(composer);
-    const sendButton = rankedSendButtons[0]?.candidate ?? null;
-    recordAutomationLog(
-      stage === 'primary'
-        ? 'Resolved send button for first branch prompt'
-        : 'Resolved send button after fallback re-scan',
-      {
-        found: Boolean(sendButton),
-        sendButtonLabel: sendButton ? getActionLabel(sendButton) : '(none)',
-        sendButton: sendButton
-          ? describeSendButtonCandidate(sendButton, composer, rankedSendButtons[0]?.score)
-          : null,
-        composerCandidate: composerSnapshot,
-        sendButtonCandidates: rankedSendButtons
-          .slice(0, 8)
-          .map((entry) => describeSendButtonCandidate(entry.candidate, composer, entry.score))
-      }
-    );
-
-    if (!sendButton) {
-      return null;
-    }
-
-    recordAutomationLog(
-      stage === 'primary'
-        ? 'Clicking the provider send button for the first branch prompt'
-        : 'Clicking send button after fallback re-scan',
-      {
-        sendButtonLabel: getActionLabel(sendButton),
-        sendButton: describeSendButtonCandidate(sendButton, composer, rankedSendButtons[0]?.score)
-      }
-    );
-    significantLengthBeforeSend = getComposerSignificantLength(composer);
-    activateControl(sendButton);
-
-    const signal = await waitForAcceptedGenerationSignalOrNull(
-      baselineTurnCount,
-      initialUrl,
-      timeoutMs
-    );
-    if (signal) {
-      recordAutomationLog('Provider accepted the prompt after send button click', {
-        stage,
-        acceptedSignal: signal,
-        currentUrl: normalizeChatUrl(window.location.href)
-      });
-      return signal;
-    }
-
-    recordAutomationLog('No generation signal appeared after send button click', {
-      stage,
-      timeoutMs,
-      currentUrl: normalizeChatUrl(window.location.href)
-    });
-    return null;
-  };
-
-  // ChatGPT clears the composer as soon as it accepts a prompt. If that already happened,
-  // every remaining fallback would post the same question a second time. Requiring that
-  // the composer held the prompt immediately before the click keeps a composer that was
-  // merely remounted from looking like a successful send.
-  const promptLooksAccepted = (): boolean =>
-    significantLengthBeforeSend > 0 &&
-    getComposerSignificantLength(refreshComposerReference(composer)) === 0;
-
-  const waitOutAcceptedPrompt = async (
-    stage: string
-  ): Promise<{
-    acceptedSignal: 'persistent_url' | 'stop_button' | 'transcript_growth';
-  }> => {
-    recordAutomationLog('Composer was cleared after submit; waiting instead of resending', {
-      stage,
-      currentUrl: normalizeChatUrl(window.location.href)
-    });
-    const acceptedSignal = await waitForAcceptedGenerationSignal(baselineTurnCount, initialUrl);
-    return { acceptedSignal };
-  };
-
-  const primarySendSignal = await attemptClickSendButton('primary');
-  if (primarySendSignal) {
-    return { acceptedSignal: primarySendSignal };
-  }
-
-  if (promptLooksAccepted()) {
-    return waitOutAcceptedPrompt('after_send_button');
-  }
-
-  logVisibleButtonContext('No enabled send button produced a generation signal near the composer');
-  await assertStillPrivateBeforeSend();
-  recordAutomationLog('Dispatching Enter key fallback for first branch prompt', {
-    hasForm: form instanceof HTMLFormElement
-  });
-  // Record what the composer held before each attempt, not just before the button click:
-  // on a page where Enter is the only way to send, this is the signal that tells the next
-  // fallback the prompt is already gone.
-  significantLengthBeforeSend = getComposerSignificantLength(composer);
-  ['keydown', 'keypress', 'keyup'].forEach((eventType) => {
-    composer.dispatchEvent(
-      new KeyboardEvent(eventType, {
-        bubbles: true,
-        cancelable: true,
-        key: 'Enter',
-        code: 'Enter'
-      })
-    );
-  });
-
-  const enterSignal = await waitForAcceptedGenerationSignalOrNull(
-    baselineTurnCount,
-    initialUrl,
-    2_500
-  );
-  if (enterSignal) {
-    recordAutomationLog('Provider accepted the prompt after Enter fallback', {
-      acceptedSignal: enterSignal,
-      currentUrl: normalizeChatUrl(window.location.href)
-    });
-    return { acceptedSignal: enterSignal };
-  }
-
-  recordAutomationLog('No generation signal appeared after Enter fallback', {
-    currentUrl: normalizeChatUrl(window.location.href)
-  });
-
-  if (promptLooksAccepted()) {
-    return waitOutAcceptedPrompt('after_enter_fallback');
-  }
-
-  if (form instanceof HTMLFormElement) {
-    await assertStillPrivateBeforeSend();
-    recordAutomationLog('Attempting guarded synthetic submit fallback for first branch prompt', {
-      action: 'dispatch-submit-event'
-    });
-    significantLengthBeforeSend = getComposerSignificantLength(refreshComposerReference(composer));
-    form.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true }));
-    const syntheticSignal = await waitForAcceptedGenerationSignalOrNull(
-      baselineTurnCount,
-      initialUrl,
-      2_500
-    );
-    if (syntheticSignal) {
-      recordAutomationLog('Provider accepted the prompt after guarded synthetic submit', {
-        acceptedSignal: syntheticSignal,
-        currentUrl: normalizeChatUrl(window.location.href)
-      });
-      return { acceptedSignal: syntheticSignal };
-    }
-
-    recordAutomationLog('No generation signal appeared after guarded synthetic submit', {
-      currentUrl: normalizeChatUrl(window.location.href)
-    });
-  }
-
-  if (promptLooksAccepted()) {
-    return waitOutAcceptedPrompt('after_synthetic_submit');
-  }
-
-  await assertStillPrivateBeforeSend();
-  const rescannedSignal = await attemptClickSendButton('final_rescan', 4_500);
-  if (rescannedSignal) {
-    return { acceptedSignal: rescannedSignal };
-  }
-
-  logVisibleButtonContext('All embedded submit strategies were attempted without a generation signal');
-
-  const acceptedSignal = await waitForAcceptedGenerationSignal(baselineTurnCount, initialUrl);
-  recordAutomationLog('Provider accepted first branch prompt', {
-    baselineTurnCount,
-    currentTurnCount: countTranscriptTurns(document),
-    acceptedSignal,
-    currentUrl: normalizeChatUrl(window.location.href),
-    stopButtonVisible: Boolean(findStopButton())
-  });
-  return { acceptedSignal };
-}
-
-// A temporary chat never gets a /c/<id> URL. ChatGPT rewrites the URL a beat after it
-// starts generating, so sampling it the instant submitComposer returns cannot see a leak.
-async function watchForPersistentConversationUrl(timeoutMs: number): Promise<string | undefined> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const currentUrl = normalizeChatUrl(window.location.href);
-    if (isPersistentConversationUrl(currentUrl)) {
-      return currentUrl;
-    }
-    await sleep(250);
-  }
-
-  return undefined;
-}
-
-async function waitForConversationUrlAfterSubmit(launchUrl: string, timeoutMs = 20_000): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const currentUrl = normalizeChatUrl(window.location.href);
-    if (isPersistentConversationUrl(currentUrl)) {
-      recordAutomationLog('Persistent branch conversation URL detected', { branchChatUrl: currentUrl });
-      return currentUrl;
-    }
-    await sleep(300);
-  }
-
-  const currentUrl = normalizeChatUrl(window.location.href) || launchUrl;
-  recordAutomationLog('Persistent branch conversation URL was not detected before timeout', {
-    launchUrl,
-    currentUrl
-  });
-  throw new Error(
-    `${provider.label} started responding, but the branch never became a persistent chat URL. It stayed at ${currentUrl}.`
-  );
-}
-
-let activeAttempt: BranchAttemptRef | undefined;
-let activeAutomationTransport: AutomationTransport | undefined;
-let automationTaskRunning = false;
-let titleWatcherId: number | undefined;
-let observedBranchTitle = '';
-
-// Only ever removes our own prompt. By the time a branch fails the user may already be
-// typing in that window, and wiping their text would be far worse than the stray prompt.
-// A temporary branch that produced a /c/ URL is in the user's permanent history. Report
-// the URL rather than a bare failure, so the panel can offer to open and delete it.
-async function reportTemporaryBranchLeak(branchChatUrl: string): Promise<void> {
-  recordAutomationLog('Private branch landed in a persistent conversation', {
-    privacyLabel: provider.privacy.label,
-    branchChatUrl
-  });
-
-  await sendAutomationEvent({
-    kind: 'failed',
-    reason: `${provider.label} saved this branch as a normal conversation even though ${provider.privacy.label} was verified before sending. Open the branch to review or delete it.`,
-    branchChatUrl
-  });
-}
-
-function clearComposerAfterFailure(prompt: string): void {
-  try {
-    const marker = compactWhitespace(prompt).slice(0, 60);
-    if (!marker) {
-      return;
-    }
-
-    const composer = findComposer();
-    if (!composer) {
-      return;
-    }
-
-    const current = compactWhitespace(
-      composer instanceof HTMLTextAreaElement ? composer.value : composer.textContent ?? ''
-    );
-    if (!current.startsWith(marker)) {
-      return;
-    }
-
-    fillComposer(composer, '');
-    recordAutomationLog('Cleared the unsent branch prompt out of the composer after a failure');
-  } catch {
-    // Never let cleanup mask the original failure.
-  }
-}
-
-async function sendAutomationEvent(event: BranchPanelEvent): Promise<void> {
-  if (!activeAttempt || !activeAutomationTransport) {
-    return;
-  }
-
-  if (activeAutomationTransport === 'frame') {
-    if (isTopFrame()) {
-      return;
-    }
-
-    window.parent.postMessage(
-      {
-        source: 'aside',
-        target: 'parent',
-        type: 'SB_FRAME_EVENT',
-        ...activeAttempt,
-        event
-      } satisfies FrameBranchEventMessage,
-      window.location.origin
-    );
-    return;
-  }
-
-  if (!hasRuntimeAccess()) {
-    return;
-  }
-
-  try {
-    await chrome.runtime.sendMessage({
-      type: 'BRANCH_AUTOMATION_EVENT',
-      ...activeAttempt,
-      event
-    });
-  } catch (error) {
-    if (!isInvalidatedError(error)) {
-      console.warn('[Aside] Failed to forward automation event', error);
-    }
-  }
-}
-
-function findBranchTitleFromTranscript(): string | null {
-  // The envelope is always on the branch's own answer, so there is no reason to rebuild
-  // the text of every turn on a 1.2s interval.
-  for (const text of getRecentAssistantTexts(3)) {
-    const parsed = stripHiddenTitle(text);
-    if (parsed.title) {
-      return parsed.title;
-    }
-  }
-
-  return null;
-}
-
-const TITLE_MARKER_PATTERN = /\[\[BRANCH_TITLE:.*?\]\]\s*/i;
-const TITLE_MARKER_OPENING = '[[BRANCH_TITLE:';
-
-// The envelope can arrive split across text nodes while the answer streams, and React
-// re-renders the message afterwards and puts it straight back. So this handles the split
-// case and is safe to call repeatedly.
-function stripTitleEnvelopeFromVisibleMessage(): void {
-  const candidates = queryMany<HTMLElement>([
-    '[data-message-author-role="assistant"] [data-message-content]',
-    'article[data-message-author-role="assistant"] [data-message-content]',
-    '[data-message-author-role="assistant"] .markdown',
-    '[data-message-author-role="assistant"] .prose'
-  ]);
-
-  candidates.forEach((candidate) => {
-    if (!candidate.textContent?.includes(TITLE_MARKER_OPENING)) {
-      return;
-    }
-
-    const walker = document.createTreeWalker(candidate, NodeFilter.SHOW_TEXT);
-    const nodes: Text[] = [];
-    while (walker.nextNode()) {
-      nodes.push(walker.currentNode as Text);
-    }
-
-    const combined = nodes.map((node) => node.nodeValue ?? '').join('');
-    const match = combined.match(TITLE_MARKER_PATTERN);
-    if (!match || match.index === undefined) {
-      return;
-    }
-
-    const markerStart = match.index;
-    const markerEnd = markerStart + match[0].length;
-
-    let cursor = 0;
-    nodes.forEach((node) => {
-      const value = node.nodeValue ?? '';
-      const nodeStart = cursor;
-      const nodeEnd = cursor + value.length;
-      cursor = nodeEnd;
-
-      if (nodeEnd <= markerStart || nodeStart >= markerEnd) {
-        return;
-      }
-
-      const from = Math.max(0, markerStart - nodeStart);
-      const to = Math.min(value.length, markerEnd - nodeStart);
-      node.nodeValue = value.slice(0, from) + value.slice(to);
-    });
-  });
-}
-
-function stopTitleWatcher(): void {
-  if (titleWatcherId) {
-    window.clearInterval(titleWatcherId);
-    titleWatcherId = undefined;
-  }
-}
-
-function startTitleWatcher(): void {
-  if (titleWatcherId) {
-    return;
-  }
-
-  const startedAt = Date.now();
-  titleWatcherId = window.setInterval(() => {
-    const title = findBranchTitleFromTranscript();
-    if (title && title !== observedBranchTitle) {
-      observedBranchTitle = title;
-      void sendAutomationEvent({ kind: 'title', title });
-    }
-
-    // Keep stripping: the marker is detected in the first streamed chunk, and every
-    // later re-render of that message re-inserts it.
-    stripTitleEnvelopeFromVisibleMessage();
-
-    if (Date.now() - startedAt > TITLE_MARKER_WATCH_TIMEOUT_MS) {
-      stopTitleWatcher();
-    }
-  }, 1200);
-}
-
-async function runBranchPromptAutomation(
-  message: FrameStartBranchMessage | RunBranchPromptInTabMessage,
-  transport: AutomationTransport
-): Promise<void> {
-  if (automationTaskRunning) {
-    return;
-  }
-  activeAttempt = {
-    providerId: message.providerId,
-    panelId: message.panelId,
-    attemptId: message.attemptId
-  };
-  activeAutomationTransport = transport;
-  observedBranchTitle = '';
-  automationTaskRunning = true;
-  recordAutomationLog('Resuming frame task', {
-    taskStatus: 'submitting-prompt',
-    branchKind: message.branchKind,
-    launchUrl: message.launchUrl,
-    currentUrl: normalizeChatUrl(window.location.href)
-  });
-
-  try {
-    await sendAutomationEvent({
-      kind: 'status',
-      status: 'opening_branch',
-      statusLabel:
-        transport === 'background'
-          ? `Sending the local branch question in a native ${provider.label} window...`
-          : 'Sending the local branch question in this branch window...'
-    });
-
-    if (transport === 'background') {
-      recordAutomationLog('Allowing the native provider window to settle before submit', {
-        delayMs: 1200,
-        currentUrl: normalizeChatUrl(window.location.href)
-      });
-      await sleep(1200);
-    }
-
-    const { acceptedSignal } = await submitComposer(
-      message.prompt,
-      message.branchKind
-    );
-    const immediateBranchUrl = isPersistentConversationUrl(normalizeChatUrl(window.location.href))
-      ? normalizeChatUrl(window.location.href)
-      : undefined;
-
-    if (message.branchKind === 'temporary') {
-      if (immediateBranchUrl) {
-        await reportTemporaryBranchLeak(immediateBranchUrl);
-        return;
-      }
-
-      recordAutomationLog('Private branch accepted generation signal', {
-        acceptedSignal,
-        currentUrl: normalizeChatUrl(window.location.href)
-      });
-      // Go live now and keep watching: ChatGPT rewrites the URL a beat after it starts
-      // generating, and holding the panel behind the loading overlay for that whole
-      // window would tax every temporary branch that works fine.
-      await sendAutomationEvent({ kind: 'live' });
-      startTitleWatcher();
-      startCaptureWatcher();
-      void (async () => {
-        const leakedUrl = await watchForPersistentConversationUrl(TEMPORARY_LEAK_WATCH_MS);
-        if (leakedUrl) {
-          await reportTemporaryBranchLeak(leakedUrl);
-        }
-      })();
-
-      if (transport === 'background') {
-        try {
-          await focusComposerForFollowUp();
-        } catch (error) {
-          recordAutomationLog('Follow-up composer focus did not complete', {
-            reason: error instanceof Error ? error.message : String(error)
-          });
-        }
-      }
-      return;
-    }
-
-    await sendAutomationEvent({
-      kind: 'status',
-      status: 'opening_branch',
-      statusLabel: `Waiting for ${provider.label} to create a persistent branch URL...`
-    });
-    recordAutomationLog('Waiting for persistent branch URL after accepted generation signal', {
-      acceptedSignal,
-      launchUrl: message.launchUrl,
-      currentUrl: normalizeChatUrl(window.location.href)
-    });
-    const branchChatUrl = await waitForConversationUrlAfterSubmit(
-      message.launchUrl ?? normalizeChatUrl(window.location.href)
-    );
-    await sendAutomationEvent({ kind: 'live', branchChatUrl });
-    startTitleWatcher();
-    startCaptureWatcher();
-    if (transport === 'background') {
-      try {
-        await focusComposerForFollowUp();
-      } catch (error) {
-        recordAutomationLog('Follow-up composer focus did not complete', {
-          reason: error instanceof Error ? error.message : String(error)
-        });
-      }
-    }
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : 'Unknown frame error';
-    const currentUrl = normalizeChatUrl(window.location.href);
-    const branchChatUrl = isPersistentConversationUrl(currentUrl) ? currentUrl : undefined;
-    recordAutomationLog('Frame task failed', {
-      reason,
-      branchChatUrl: branchChatUrl ?? null
-    });
-
-    // Leaving the prompt sitting in the user's real composer is worse than useless: the
-    // next thing they type appends to a 3KB machine prompt they never wrote.
-    clearComposerAfterFailure(message.prompt);
-
-    // A private preparation that stopped short carries where it stopped, so the
-    // panel can offer Check again on this same document.
-    const recovery = error instanceof PrivacyNotVerifiedError ? error.recovery : undefined;
-    await sendAutomationEvent({
-      kind: 'failed',
-      reason,
-      branchChatUrl,
-      recovery,
-      buildId: BUILD_ID
-    });
-  } finally {
-    automationTaskRunning = false;
-  }
-}
 
 
 
@@ -7715,332 +3898,7 @@ function sanitizeArchive(raw: unknown): BranchPanelState['archive'] {
   return { messages, capture };
 }
 
-function scopeKeyForState(state: BranchPanelState): string {
-  return state.rootConversationId || currentIdentity(state.rootChatUrl).scopeKey;
-}
-
-/** Create the canonical question for an ordinary draft. */
-async function registerQuestionForPanel(runtime: PanelRuntime): Promise<void> {
-  const { state } = runtime;
-  if (state.questionId || state.branchKind === 'temporary') {
-    return;
-  }
-  const identity = currentIdentity(state.rootChatUrl);
-  const scopeKey = scopeKeyForState(state);
-  const sourceId = sourceIdFor(provider.id, scopeKey);
-  const selection = state.selection;
-  const anchorBlock =
-    selection.selectedBlocks.find((block) => block.messageId === selection.branchBaseMessageId) ??
-    selection.selectedBlocks[0];
-  const turns = sourceTurnsForState(state);
-  const blocks = turns.map((turn) => {
-    const contentHash = fnv1a(turn.text);
-    return {
-      id: blockIdFor(sourceId, contentHash),
-      sourceId,
-      role: turn.role,
-      kind: 'unknown' as const,
-      text: turn.text,
-      anchorText: compactWhitespace(turn.text),
-      messageId: turn.id,
-      turnIndex: turn.turnIndex,
-      contentHash
-    };
-  });
-  const questionId = newQuestionId();
-  const anchorId = newAnchorId();
-  const focus = selection.structuredSelectedText || selection.selectedText;
-
-  const outcome = await runCommand({
-    type: 'CreateQuestion',
-    source: {
-      id: sourceId,
-      providerId: provider.id,
-      scopeKey,
-      conversationId: identity.conversationId,
-      containerId: identity.containerId,
-      url: state.rootChatUrl,
-      title:
-        compactWhitespace(selection.precedingQuestion?.excerpt || anchorBlock?.excerpt || document.title || '').slice(0, 120) ||
-        `${provider.label} conversation`,
-      kind: 'assistant-answer',
-      acquisition: 'selected-fragment',
-      messageId: anchorBlock?.messageId ?? null
-    },
-    blocks,
-    anchor: {
-      id: anchorId,
-      sourceId,
-      selectedText: focus,
-      exact: selection.rangeQuotes.exact || selection.selectedText,
-      prefix: selection.rangeQuotes.prefix,
-      suffix: selection.rangeQuotes.suffix,
-      messageId: anchorBlock?.messageId ?? selection.branchBaseMessageId,
-      turnIndex: anchorBlock?.turnIndex ?? 0,
-      role: anchorBlock?.role ?? 'assistant',
-      contentHash: fnv1a(anchorBlock?.structuredText || anchorBlock?.text || focus),
-      scrollHint: selection.fallbackScrollY
-    },
-    question: {
-      id: questionId,
-      sourceId,
-      anchorId,
-      parentQuestionId: null,
-      parentMessageId: null,
-      title: autoTitle(state.initialQuestion ?? '', focus),
-      titleSource: 'auto',
-      retention: 'durable',
-      providerMode: 'normal',
-      entryAction: state.entryAction
-    },
-    draft: {
-      text: state.initialQuestion ?? '',
-      excludedBlockIds: state.excludedPlanIds ?? [],
-      background: state.context?.userBackground ?? ''
-    }
-  });
-
-  if (!outcome || outcome.status !== 'applied') {
-    appendPanelLog(runtime, 'Question record could not be created', {
-      reason: outcome ? (outcome.status === 'error' || outcome.status === 'rejected' ? outcome.reason : outcome.status) : 'no response'
-    });
-    unsavedPanelIds.add(state.panelId);
-    syncPanelUI(runtime);
-    return;
-  }
-  state.questionId = questionId;
-  questionRevs.set(questionId, outcome.rev);
-  draftRevs.set(questionId, 1);
-  state.updatedAt = Date.now();
-  persistPanels(state.panelId);
-  void refreshQuestionList();
-}
-
-/** Deliberate save points write the draft to the canonical record. */
-async function syncDraftToStore(runtime: PanelRuntime): Promise<void> {
-  const { state } = runtime;
-  if (!state.questionId || state.snapshotId) {
-    return;
-  }
-  const questionId = state.questionId;
-  const attempt = async (baseRev: number): Promise<void> => {
-    const outcome = await runCommand({
-      type: 'UpdateDraft',
-      questionId,
-      baseRev,
-      text: runtime.questionInput.value,
-      excludedBlockIds: state.excludedPlanIds ?? [],
-      background: state.context?.userBackground ?? ''
-    });
-    if (!outcome) {
-      return;
-    }
-    if (outcome.status === 'applied') {
-      draftRevs.set(questionId, outcome.rev);
-      return;
-    }
-    if (outcome.status === 'conflict') {
-      // Another tab saved a different draft. Keep this tab's text visible and
-      // say so; the Owner decides which version wins by editing again.
-      draftRevs.set(questionId, outcome.current.rev);
-      if (outcome.current.text !== undefined && outcome.current.text !== runtime.questionInput.value) {
-        state.statusLabel = 'Another tab saved a different draft; this box still shows yours. Edit to save it over theirs.';
-        syncPanelUI(runtime);
-        return;
-      }
-      await attempt(outcome.current.rev);
-    }
-  };
-  await attempt(draftRevs.get(questionId) ?? 1);
-}
-
-/** The exact prompt becomes an immutable snapshot, and a run is recorded. */
-async function freezeSnapshotForPanel(
-  runtime: PanelRuntime,
-  plan: ContextPlan,
-  prompt: string,
-  question: string
-): Promise<void> {
-  const { state } = runtime;
-  if (!state.questionId || !state.attemptId) {
-    return;
-  }
-  // The draft — and with it the local title — is saved at the moment of sending,
-  // not only when the box loses focus: Enter can submit without a blur.
-  await syncDraftToStore(runtime);
-  const snapshotId = newSnapshotId();
-  const linkId = newLinkId();
-  const scopeKey = scopeKeyForState(state);
-  const sourceId = sourceIdFor(provider.id, scopeKey);
-  const outcome = await runCommand({
-    type: 'FreezeSnapshot',
-    questionId: state.questionId,
-    snapshot: {
-      id: snapshotId,
-      questionId: state.questionId,
-      prompt,
-      question,
-      blocks: plan.blocks.map((block) => ({
-        blockId: blockIdFor(sourceId, fnv1a(block.text)),
-        contentHash: fnv1a(block.text),
-        role: block.role,
-        included: block.included,
-        omitReason: block.omitReason
-      })),
-      missing: plan.missing,
-      compilerVersion: COMPILER_VERSION,
-      templateVersion: TEMPLATE_VERSION,
-      charCount: prompt.length
-    },
-    link: {
-      id: linkId,
-      questionId: state.questionId,
-      providerId: provider.id,
-      conversationUrl: null,
-      attemptId: state.attemptId,
-      snapshotId,
-      run: 'submitting',
-      acknowledgement: null,
-      capture: 'link-only',
-      capturedThroughMessageId: null,
-      lastCaptureAt: null,
-      model: null
-    }
-  });
-  if (!outcome || outcome.status !== 'applied') {
-    appendPanelLog(runtime, 'Snapshot could not be frozen in the question database', {
-      reason: outcome ? outcome.status : 'no response'
-    });
-    unsavedPanelIds.add(state.panelId);
-    return;
-  }
-  state.snapshotId = snapshotId;
-  state.linkId = linkId;
-  linkRevs.set(linkId, 1);
-  runtime.writtenCapture.clear();
-  persistPanels(state.panelId);
-  void refreshQuestionList();
-}
-
-async function recordRunForPanel(
-  runtime: PanelRuntime,
-  patch: { run?: 'submitted' | 'streaming' | 'completed' | 'failed' | 'submission-unknown'; conversationUrl?: string | null; acknowledgement?: string | null }
-): Promise<void> {
-  const { state } = runtime;
-  if (!state.linkId || !state.attemptId) {
-    return;
-  }
-  const linkId = state.linkId;
-  const attempt = async (baseRev: number, retry: boolean): Promise<void> => {
-    const outcome = await runCommand({ type: 'UpdateRun', linkId, baseRev, attemptId: state.attemptId!, ...patch });
-    if (!outcome) {
-      return;
-    }
-    if (outcome.status === 'applied') {
-      linkRevs.set(linkId, outcome.rev);
-    } else if (outcome.status === 'conflict' && retry) {
-      linkRevs.set(linkId, outcome.current.rev);
-      await attempt(outcome.current.rev, false);
-    }
-  };
-  await attempt(linkRevs.get(linkId) ?? 1, true);
-}
-
-/** Bounded, incremental capture writes: only ordinals whose text changed. */
-async function recordCaptureForPanel(runtime: PanelRuntime, event: BranchCapturedEvent): Promise<void> {
-  const { state } = runtime;
-  if (!state.questionId || !state.linkId || !state.attemptId) {
-    return;
-  }
-  for (const message of event.messages) {
-    const fingerprint = `${message.partial ? 'p' : 'c'}:${fnv1a(message.text)}`;
-    if (runtime.writtenCapture.get(message.ordinal) === fingerprint) {
-      continue;
-    }
-    const outcome = await runCommand({
-      type: 'AppendOrReviseCapturedMessage',
-      questionId: state.questionId,
-      linkId: state.linkId,
-      attemptId: state.attemptId,
-      message: {
-        role: message.role,
-        text: message.text,
-        partial: message.partial,
-        providerMessageId: message.providerMessageId,
-        ordinal: message.ordinal,
-        snapshotId: state.snapshotId ?? null,
-        attemptId: state.attemptId
-      },
-      capture: event.capture,
-      capturedThroughMessageId: event.capturedThroughMessageId
-    });
-    if (outcome?.status === 'applied') {
-      runtime.writtenCapture.set(message.ordinal, fingerprint);
-    } else if (outcome && outcome.status === 'rejected') {
-      appendPanelLog(runtime, 'Capture write rejected', { reason: outcome.reason, ordinal: message.ordinal });
-      return;
-    }
-  }
-  if (state.linkId) {
-    const link = state.linkId;
-    void link;
-  }
-}
-
 /* ---------------- capture watcher (runs in the branch page) ---------------- */
-
-let captureWatcher: TranscriptCaptureWatcher | null = null;
-
-function readObservedTurns(): ObservedTurn[] {
-  return extractTranscript(document).map((turn) => ({
-    role: turn.role,
-    text: extractStructuredNodeText(turn.element) || turn.text,
-    providerMessageId:
-      turn.element.getAttribute('data-message-id') ??
-      turn.element.querySelector('[data-message-id]')?.getAttribute('data-message-id') ??
-      null,
-    // Claude marks a finished turn with data-is-streaming="false", so the
-    // attribute's presence alone is not evidence of streaming; only a value
-    // other than "false" is.
-    streaming: isStreamingMarker(turn.element)
-  }));
-}
-
-function isStreamingMarker(element: HTMLElement): boolean {
-  const own = element.getAttribute('data-is-streaming');
-  if (own !== null && own !== 'false') {
-    return true;
-  }
-  const nested = element.querySelector<HTMLElement>('[data-is-streaming]');
-  const nestedValue = nested?.getAttribute('data-is-streaming');
-  return nestedValue !== undefined && nestedValue !== null && nestedValue !== 'false';
-}
-
-function startCaptureWatcher(): void {
-  captureWatcher?.stop();
-  const turns = readObservedTurns();
-  let firstUserTurnIndex = 0;
-  for (let index = turns.length - 1; index >= 0; index -= 1) {
-    if (turns[index].role === 'user') {
-      firstUserTurnIndex = index;
-      break;
-    }
-  }
-  captureWatcher = new TranscriptCaptureWatcher({
-    read: readObservedTurns,
-    stopControlVisible: () => Boolean(findStopButton()),
-    observeTarget: () => provider.layout.getConversationScrollContainer(document) ?? document.body,
-    emit: (snapshot) => {
-      void sendAutomationEvent({
-        kind: 'captured',
-        messages: snapshot.messages,
-        capture: snapshot.capture,
-        capturedThroughMessageId: snapshot.capturedThroughMessageId
-      });
-    }
-  });
-  captureWatcher.start(firstUserTurnIndex);
-}
 
 /* ---------------- source-scoped question list ---------------- */
 
@@ -8117,6 +3975,9 @@ function renderQuestionListPanel(): void {
 
 function toggleQuestionList(): void {
   questionListOpen = !questionListOpen;
+  if (questionListOpen) {
+    yieldHandoffCards();
+  }
   renderQuestionListPanel();
   if (questionListOpen) {
     void refreshQuestionList();
@@ -8137,9 +3998,7 @@ async function deleteQuestionEverywhere(questionId: string): Promise<void> {
   }
   const runtime = [...panelRuntimes.values()].find((candidate) => candidate.state.questionId === questionId);
   if (runtime) {
-    clearPanelWatchdog(runtime);
     closedPanelIds.add(runtime.state.panelId);
-    runtime.iframeEl.src = 'about:blank';
     runtime.element.remove();
     panelRuntimes.delete(runtime.state.panelId);
     void deletePanelRecord(runtime.state.panelId);
@@ -8228,7 +4087,7 @@ async function openQuestionFromRecord(questionId: string): Promise<void> {
     return;
   }
   minimizeOtherPanels(state.panelId);
-  const runtime = createPanelRuntime(state);
+  createPanelRuntime(state);
   questionRevs.set(questionId, bundle.question.rev);
   draftRevs.set(questionId, bundle.draft?.rev ?? 1);
   const link = bundle.links.at(-1);
@@ -8316,70 +4175,208 @@ function createStateFromBundle(bundle: QuestionBundle): BranchPanelState | null 
   };
 }
 
+/* ================================================================== *
+ * Scratch handoffs: the card in the source page, one per session.
+ * ================================================================== */
+
+const handoffCards = new Map<string, HandoffCard>();
+
+async function sendHandoff(message: HandoffRequest): Promise<HandoffResponse | null> {
+  if (!hasRuntimeAccess()) {
+    return null;
+  }
+  try {
+    return (await chrome.runtime.sendMessage(message)) as HandoffResponse;
+  } catch (error) {
+    if (!isInvalidatedError(error)) {
+      console.warn('[Aside] Handoff message failed');
+    }
+    return null;
+  }
+}
+
+function currentScopeKey(): string {
+  return currentIdentity(lastKnownUrl).scopeKey;
+}
+
+function jumpToHandoffPassage(session: ScratchHandoff): AnchorResult {
+  if (currentScopeKey() !== session.source.scopeKey) {
+    return 'different-conversation';
+  }
+  return scrollToOrigin(session.selection);
+}
+
+function handoffDeps(): HandoffCardDeps {
+  return {
+    buildId: BUILD_ID,
+    mount: (element) => {
+      mountInExtensionHost(element);
+    },
+    notify: notifyAside,
+    send: sendHandoff,
+    writeClipboard: (text) => writeClipboardText(text, ensureExtensionHost()),
+    jumpToPassage: jumpToHandoffPassage,
+    sourceTitle: () => compactWhitespace(document.title).slice(0, 120),
+    openLibrary: () => {
+      void sendStoreMessage({ type: 'OPEN_LIBRARY' });
+    },
+    onVisibilityChange: () => {
+      renderTabs();
+    },
+    onDisposed: (card) => {
+      if (handoffCards.get(card.sessionId) === card) {
+        handoffCards.delete(card.sessionId);
+      }
+      renderTabs();
+    }
+  };
+}
+
+/** Hide every visible card without recording a preference: something else took the slot. */
+function yieldHandoffCards(except?: HandoffCard): void {
+  handoffCards.forEach((card) => {
+    if (card !== except && !card.hidden) {
+      card.yieldSlot();
+    }
+  });
+}
+
+/** One visible thing at a time in the panel slot. */
+function showHandoffCard(card: HandoffCard): void {
+  yieldHandoffCards(card);
+  getVisiblePanels().forEach((runtime) => minimizePanel(runtime.state.panelId));
+  if (questionListOpen) {
+    questionListOpen = false;
+    renderQuestionListPanel();
+  }
+  card.show();
+  fitSlotToFreeSpace(card.element);
+  renderTabs();
+}
+
+function mountHandoffCard(session: ScratchHandoff, options: { memoryOnly: boolean }): HandoffCard {
+  const existing = handoffCards.get(session.sessionId);
+  if (existing) {
+    existing.adoptSession(session, { keepLocalDraft: true });
+    return existing;
+  }
+  const card = new HandoffCard(session, handoffDeps(), { memoryOnly: options.memoryOnly });
+  handoffCards.set(session.sessionId, card);
+  card.element.hidden = true;
+  card.mount();
+  return card;
+}
+
+/** A new scratch session from a selection. Different questions never share one. */
+async function openHandoff(entry: HandoffEntry, selection: SelectionPayload, question?: string): Promise<void> {
+  const draft: HandoffDraft = {
+    question: question ?? (entry === 'why' ? WHY_QUESTION : ''),
+    excludedBlockIds: [],
+    background: ''
+  };
+  const response = await sendHandoff({
+    type: 'HANDOFF_CREATE',
+    buildId: BUILD_ID,
+    providerId: provider.id,
+    entry,
+    scopeKey: currentScopeKey(),
+    sourceUrl: normalizeChatUrl(window.location.href),
+    selection,
+    draft
+  });
+  if (!response) {
+    notifyAside('Aside could not reach its extension worker. Reload this page to use it.');
+    return;
+  }
+  if (response.code === 'stale-client') {
+    notifyAside('Aside was updated. Reload this page to use the new version.');
+    return;
+  }
+  if (!response.ok || !response.session) {
+    notifyAside('This passage could not be prepared. Select it again and retry.');
+    return;
+  }
+  const card = mountHandoffCard(response.session, { memoryOnly: response.code === 'storage-unavailable' });
+  showHandoffCard(card);
+  card.focusQuestion();
+}
+
+/** Cards for this tab's active sessions, after a reload or a navigation. */
+async function restoreHandoffs(): Promise<void> {
+  const response = await sendHandoff({ type: 'HANDOFF_LIST_FOR_TAB', buildId: BUILD_ID });
+  if (!response?.ok || !response.sessions) {
+    if (response?.code === 'stale-client') {
+      reportStaleClient(null, 'service worker', response.buildId);
+    }
+    return;
+  }
+  const scope = currentScopeKey();
+  let shown = false;
+  response.sessions
+    .slice()
+    .sort((left, right) => left.updatedAt - right.updatedAt)
+    .forEach((session) => {
+      const card = mountHandoffCard(session, { memoryOnly: response.code === 'storage-unavailable' });
+      const eligible = session.source.scopeKey === scope && !session.hidden;
+      if (eligible && !shown && !getVisiblePanels().length && !questionListOpen) {
+        shown = true;
+        showHandoffCard(card);
+      } else if (!card.hidden) {
+        card.yieldSlot();
+      }
+    });
+  renderTabs();
+}
+
+/** A card whose conversation is no longer on screen steps aside. */
+function syncHandoffCardsToScope(): void {
+  const scope = currentScopeKey();
+  handoffCards.forEach((card) => {
+    if (!card.hidden && card.session.source.scopeKey !== scope) {
+      card.yieldSlot();
+    }
+  });
+}
+
+function flushHandoffDrafts(): void {
+  handoffCards.forEach((card) => {
+    void card.flushDraft();
+  });
+}
+
+function handleHandoffChanged(message: HandoffChangedMessage): void {
+  const card = handoffCards.get(message.sessionId);
+  if (!card) {
+    return;
+  }
+  if (message.session) {
+    card.adoptSession(message.session, { keepLocalDraft: true });
+    renderTabs();
+    return;
+  }
+  const label = routeFor(card.session.providerId).label;
+  card.markEnded(
+    message.reason === 'target-closed'
+      ? `The ${label} tab for this question was closed, so the temporary question was cleared from Aside.`
+      : 'Cleared from Aside.'
+  );
+}
+
 function cleanup(): void {
   cleanupFns.forEach((fn) => fn());
   cleanupFns = [];
-  stopTitleWatcher();
-  captureWatcher?.stop();
-  captureWatcher = null;
 
-  // Everything Aside put on the page goes, including the iframes inside the host:
-  // an in-place extension update runs this and then a new content script, and a
-  // surviving host would leave dead panels the new one does not own.
-  panelRuntimes.forEach((runtime) => {
-    clearPanelWatchdog(runtime);
-    runtime.iframeEl.src = 'about:blank';
-  });
+  // Everything Aside put on the page goes: an in-place extension update runs
+  // this and then a new content script, and a surviving host would leave dead
+  // views the new one does not own. Scratch sessions are not ended here; the
+  // worker still holds them for the next content script.
+  [...handoffCards.values()].forEach((card) => card.detach());
+  handoffCards.clear();
   panelRuntimes.clear();
   extensionHost?.remove();
   document.getElementById(EXTENSION_HOST_ID)?.remove();
   extensionHost = null;
   delete document.documentElement.dataset.asideTheme;
-}
-
-function initEmbeddedFrame(): void {
-  ensureFrameAutomationStyles();
-
-  const postReady = () => {
-    window.parent.postMessage(
-      {
-        source: 'aside',
-        target: 'parent',
-        type: 'SB_FRAME_READY',
-        currentUrl: normalizeChatUrl(window.location.href),
-        buildId: BUILD_ID
-      } satisfies FrameReadyMessage,
-      window.location.origin
-    );
-  };
-
-  const frameMessageListener = (event: MessageEvent<FrameStartBranchMessage>) => {
-    // Only the embedding page may start a branch here, and only from our own origin.
-    if (event.source !== window.parent || event.origin !== window.location.origin) {
-      return;
-    }
-
-    const data = event.data;
-    if (
-      !data ||
-      typeof data !== 'object' ||
-      data.source !== 'aside' ||
-      data.target !== 'frame' ||
-      data.type !== 'SB_FRAME_START_BRANCH' ||
-      !isBranchAttemptRef(data)
-    ) {
-      return;
-    }
-
-    void runBranchPromptAutomation(data, 'frame');
-  };
-
-  window.addEventListener('message', frameMessageListener);
-  window.addEventListener('pageshow', postReady);
-  cleanupFns.push(() => window.removeEventListener('message', frameMessageListener));
-  cleanupFns.push(() => window.removeEventListener('pageshow', postReady));
-
-  postReady();
 }
 
 /**
@@ -8395,7 +4392,6 @@ function bindProviderForDocument(): boolean {
 
   provider = adapter;
   setActiveTranscriptAdapter(adapter.transcript);
-  setActiveComposerAdapter(adapter.composer);
   setActiveScopeResolver(() => {
     const url = adapter.normalizeUrl(window.location.href);
     return {
@@ -8407,20 +4403,32 @@ function bindProviderForDocument(): boolean {
   return true;
 }
 
+/**
+ * A page Aside opened as a native destination stays exactly as the provider
+ * made it: no toolbar, no rail, no restored views, nothing injected. The
+ * worker knows the role before the provider document exists, because the tab
+ * is registered while it is still blank.
+ */
+async function pageRole(): Promise<'page' | 'target'> {
+  const response = await sendHandoff({ type: 'HANDOFF_ROLE', buildId: BUILD_ID });
+  return response?.role === 'target' ? 'target' : 'page';
+}
+
 function init(): void {
   window.__asideCleanup?.();
   window.__asideCleanup = cleanup;
 
-  if (!bindProviderForDocument()) {
+  // Only the top document of a provider page: Aside no longer runs in frames.
+  if (!isTopFrame() || !bindProviderForDocument()) {
     return;
   }
 
-  if (isTopFrame()) {
+  void pageRole().then((role) => {
+    if (role === 'target') {
+      return;
+    }
     initTopFrame();
-    return;
-  }
-
-  initEmbeddedFrame();
+  });
 }
 
 init();

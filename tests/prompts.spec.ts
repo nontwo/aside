@@ -1,5 +1,4 @@
-import { buildLocalInitialPrompt, stripHiddenTitle } from '../src/shared/prompts';
-import type { SelectionPayload } from '../src/shared/types';
+import { answerContract, buildPrompt, TEMPLATE_VERSION } from '../src/context/template';
 import {
   getBranchLaunchUrl,
   getChatContainerBaseUrl,
@@ -8,76 +7,7 @@ import {
   isSameChatContainer
 } from '../src/shared/utils';
 
-function makeSelection(): SelectionPayload {
-  return {
-    rootConversationId: 'conv-1',
-    rootChatUrl: 'https://chatgpt.com/c/conv-1',
-    selectedText: 'convexity assumption guarantees the relaxation stays tight',
-    selectedBlocks: [
-      {
-        messageId: 'assistant-7',
-        role: 'assistant',
-        turnIndex: 7,
-        text: 'The convexity assumption guarantees the relaxation stays tight and keeps optimization stable.',
-        excerpt: 'convexity assumption guarantees'
-      }
-    ],
-    branchBaseMessageId: 'assistant-7',
-    rangeQuotes: {
-      exact: 'convexity assumption guarantees the relaxation stays tight',
-      prefix: 'The ',
-      suffix: ' and keeps'
-    },
-    fallbackScrollY: 420
-  };
-}
-
-describe('prompt builders', () => {
-  it('builds a local-only prompt from selected passage and touched assistant answer', () => {
-    const selection = makeSelection();
-    const localPrompt = buildLocalInitialPrompt(selection, 'Why does this matter?');
-
-    expect(localPrompt.prompt).toContain('SELECTED PASSAGE');
-    expect(localPrompt.prompt).toContain(selection.selectedText);
-    expect(localPrompt.prompt).toContain('SOURCE ANSWER 1');
-    expect(localPrompt.prompt).toContain(selection.selectedBlocks[0].text);
-    expect(localPrompt.prompt).toContain('Why does this matter?');
-    expect(localPrompt.prompt).not.toContain('full conversation history');
-    expect(localPrompt.prompt).not.toContain('native branch');
-  });
-
-  it('does not include non-assistant selected blocks as source answers', () => {
-    const selection = makeSelection();
-    selection.selectedBlocks.push({
-      messageId: 'user-8',
-      role: 'user',
-      turnIndex: 8,
-      text: 'This user turn should not be copied into the local source answer.',
-      excerpt: 'This user turn should not be copied'
-    });
-
-    const localPrompt = buildLocalInitialPrompt(selection, 'Explain locally.');
-
-    expect(localPrompt.prompt).toContain(selection.selectedBlocks[0].text);
-    expect(localPrompt.prompt).not.toContain('This user turn should not be copied');
-  });
-
-  it('removes the hidden title envelope from assistant text', () => {
-    const parsed = stripHiddenTitle('[[BRANCH_TITLE: why convexity matters]]\nThis is the answer.');
-
-    expect(parsed.title).toBe('why convexity matters');
-    expect(parsed.cleanText).toBe('This is the answer.');
-  });
-
-  it('removes leading reasoning status before the hidden title envelope', () => {
-    const parsed = stripHiddenTitle(
-      '已思考 6s\n[[BRANCH_TITLE: 人民币亏损换算日元]]\n按当前大致汇率计算。'
-    );
-
-    expect(parsed.title).toBe('人民币亏损换算日元');
-    expect(parsed.cleanText).toBe('按当前大致汇率计算。');
-  });
-
+describe('chat container URLs', () => {
   it('preserves the chat container path for project or custom-gpt chats', () => {
     expect(
       getChatContainerBaseUrl(
@@ -135,56 +65,37 @@ describe('prompt builders', () => {
   });
 });
 
-describe('prompt semantics', () => {
-  const selection = makeSelection();
+describe('prompt semantics (template 3)', () => {
+  const contract = answerContract();
 
-  it('does not confine the model to the quoted text', () => {
-    // The old wording said "use only the local context", which asked the model to
-    // answer a maths question without using maths it knows.
-    const prompt = buildLocalInitialPrompt(selection, 'Why does this hold?').prompt;
-
-    expect(prompt).not.toMatch(/use only the local context/i);
-    expect(prompt).toMatch(/not limited to the quoted text/i);
-    expect(prompt).toMatch(/own knowledge and reasoning freely/i);
+  it('is short: six instruction lines', () => {
+    expect(TEMPLATE_VERSION).toBe('3.0.0');
+    expect(contract.split('\n')).toHaveLength(6);
   });
 
-  it('frames the excerpt as fallible rather than authoritative', () => {
-    const prompt = buildLocalInitialPrompt(selection, 'Why does this hold?').prompt;
-
-    expect(prompt).toMatch(/fallible excerpt/i);
-    expect(prompt).toMatch(/not as truth to defend/i);
-    // Quoted source is data, not instructions.
-    expect(prompt).toMatch(/not as instructions to follow/i);
+  it('treats quotations as fallible evidence, not instructions', () => {
+    expect(contract).toMatch(/fallible evidence/);
+    expect(contract).toMatch(/not instructions/);
   });
 
-  it('asks for missing conditions to be stated instead of invented', () => {
-    const prompt = buildLocalInitialPrompt(selection, 'Why does this hold?').prompt;
-
-    expect(prompt).toMatch(/do not invent/i);
-    expect(prompt).toMatch(/no file or project contents/i);
-    expect(prompt).toMatch(/state any condition/i);
+  it('allows relevant knowledge without inventing source facts', () => {
+    expect(contract).toMatch(/Use relevant knowledge/);
+    expect(contract).toMatch(/do not invent facts about the source/);
   });
 
-  it('defines Why as examine, not justify', () => {
-    const prompt = buildLocalInitialPrompt(selection, 'Why?').prompt;
-    expect(prompt).toMatch(/examine and explain, not justify/i);
+  it('asks for assumptions, corrections and missing material to be stated', () => {
+    expect(contract).toMatch(/State any assumption/);
+    expect(contract).toMatch(/correct the passage where it is wrong/);
+    expect(contract).toMatch(/say what is missing/);
   });
 
-  it('does not let brevity cut off a derivation the question needs', () => {
-    const prompt = buildLocalInitialPrompt(selection, 'Derive it.').prompt;
-
-    expect(prompt).toMatch(/do not cut short a derivation/i);
-    // And it must never ask for private chain-of-thought.
-    expect(prompt).not.toMatch(/chain[- ]of[- ]thought|show your reasoning steps/i);
+  it('matches the question language and requested depth', () => {
+    expect(contract).toMatch(/language and the depth/);
   });
 
-  it('never asks the model for a title marker or a bootstrap acknowledgement', () => {
-    // Titles are local now. The old protocol made the model emit
-    // [[BRANCH_TITLE: ...]] and, for New-tab, a "Ready for your question." line
-    // that sent a message purely to initialise a branch.
-    const prompt = buildLocalInitialPrompt(selection, 'Why?').prompt;
-    expect(prompt).not.toMatch(/BRANCH_TITLE/);
-    expect(prompt).not.toMatch(/Ready for your question/);
-    expect(prompt).toMatch(/begin with the answer/i);
+  it('never asks for a title, a summary, a ready handshake or hidden reasoning', () => {
+    const prompt = buildPrompt({ contextText: 'CONTEXT', question: 'Why?' });
+    expect(prompt).not.toMatch(/BRANCH_TITLE|title line|summary line|ready for your question|reasoning steps|chain of thought/i);
+    expect(prompt.endsWith('QUESTION\nWhy?')).toBe(true);
   });
 });

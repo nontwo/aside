@@ -101,8 +101,12 @@ export interface Question {
   titleSource: 'auto' | 'user';
   lifecycle: QuestionLifecycle;
   retention: RetentionPolicy;
-  /** The provider's own conversation mode the question was asked in. */
-  providerMode: 'normal' | 'private';
+  /**
+   * The provider's own conversation mode the question was asked in.
+   * 'native-handoff': the question was handed to a native temporary
+   * conversation the Owner ran themselves; Aside never observed its mode.
+   */
+  providerMode: 'normal' | 'private' | 'native-handoff';
   entryAction: 'ask' | 'why' | 'new_tab';
   createdAt: number;
   updatedAt: number;

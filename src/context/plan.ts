@@ -177,6 +177,10 @@ const REFERENCE_PATTERNS: RegExp[] = [
   /\((\d{1,3})\)/g
 ];
 
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 export interface ReferenceHint {
   label: string;
   /** The turn id the definition seems to live in, if any. */
@@ -196,11 +200,17 @@ export function detectReferences(focusAndUnit: string, turns: SourceTurn[], anch
       seen.add(key);
       // A definition is an earlier turn that states the same label near a
       // colon/verb — "Theorem 2:" / "Theorem 2 states" — not merely mentions it.
-      const number = match[2] ?? match[1];
-      const definitionPattern = new RegExp(
-        `(${label.split(/\s+/)[0]}\\s*\\(?${number}\\)?\\s*[:：.（(]|${label.split(/\s+/)[0]}\\s*\\(?${number}\\)?\\s*(states|says|is|be|设|为|定义|称))`,
-        'i'
-      );
+      // Source text is data: both parts are escaped before they reach a RegExp,
+      // so a selection such as "Eq.(3" can never break or steer the matcher.
+      const keyword = match[2] !== undefined ? match[1] : '';
+      const number = escapeRegExp(match[2] ?? match[1]);
+      const head = escapeRegExp(keyword);
+      const definitionPattern = keyword
+        ? new RegExp(
+            `(${head}\\s*\\(?${number}\\)?\\s*[:：.（(]|${head}\\s*\\(?${number}\\)?\\s*(states|says|is|be|设|为|定义|称))`,
+            'i'
+          )
+        : new RegExp(`\\(${number}\\)\\s*(?:$|[:：.])`, 'm');
       // A label the anchor turn itself defines — "Step 2:" heading its own
       // paragraph — is local structure, not a reference to material elsewhere.
       const anchorTurn = turns.find((turn) => turn.id === anchorTurnId);

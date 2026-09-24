@@ -1,162 +1,102 @@
-# Owner visual acceptance
+# Owner acceptance — native temporary-chat handoff
 
-Everything below is offline-verified against fixtures unless marked **live**. Live
-checks on real accounts are the part only you can do; this build has not been
-run against one by the maintainer.
+What this build does automatically, and what only you do:
 
-## Load the build
-
-```bash
-npm run build
-```
-
-1. `chrome://extensions/` → Developer Mode → **Load unpacked** → select `dist/`.
-   If Aside is already loaded, press **Reload** on its card. Chrome will not grant
-   a new host permission to an extension that is merely refreshed in the page;
-   confirm the card lists `claude.ai` under *Site access*.
-2. The card's toolbar icon now opens Aside's **library** (a toolbar action; no
-   new permission was added).
-3. Hard-reload `chatgpt.com` and `claude.ai`. The content script is injected on
-   page load only.
-4. The build identifier appears in the library footer and in any **Copy log**
-   report (header **More → Copy log**) as `build: <sha>[-dirty]+<timestamp>`.
-   Compare it with the PR head. The report also lists the service worker's and
-   the branch frame's build; if any differ, the page shows "Aside was updated.
-   Reload this page" and the log carries a `stale-client` line — reload before
-   judging anything else.
-
-Reference images captured from fixtures live in
-[`docs/layout-evidence/`](./layout-evidence/).
-
-## Walkthrough
-
-### 1. Native controls still work
-
-- [ ] Select text in an assistant answer. The provider's own selection actions
-      appear as before, in the same place. Aside's toolbar sits beside them; both
-      are fully clickable. Right-click, copy, keyboard selection and Escape on a
-      provider menu all behave normally.
-
-### 2. Ask, with visible context
-
-- [ ] Select a **math** passage inside a longer derivation and press `Ask`. The
-      panel shows *Selected local focus*, and **Context** summarises the actual
-      plan: the passage, its enclosing step/paragraph, the question that produced
-      the answer.
-- [ ] Open Context. Untick the enclosing unit; the preview shrinks. Tick it back.
-      The preview is the complete prompt, instructions and question included.
-- [ ] Type a question and press **Start branch**. On ChatGPT the answer runs in
-      the panel frame. On Claude it also tries the panel frame first; if claude.ai
-      refuses framing on your account it moves to a window Aside opens, with no
-      error — note which of the two you see (**live**).
-- [ ] The title is taken from your question and is renameable from the list. No
-      `[[BRANCH_TITLE …]]` line is requested from the model.
-- [ ] As the answer streams, **Saved so far** appears in the panel and settles to
-      *Captured through message N*.
-
-### 3. Why and New-tab
-
-- [ ] `Why` asks in one click and runs the same pipeline.
-- [ ] `New-tab` opens a **draft** first; nothing is sent until you type and press
-      Start branch, and then the real question is sent once, in its own window.
-
-### 4. Follow-up and continuation
-
-- [ ] Type a follow-up in the branch conversation itself. It stays in the same
-      provider conversation; the panel's saved thread grows.
-- [ ] Press **Close**. The panel disappears; nothing is deleted. Open
-      **Questions (n)** in the left rail: the question is listed as active.
-- [ ] Reload the page. The question is still listed. Open it: the saved thread is
-      shown read-only; no provider tab opens by itself. **Open branch** continues
-      at the provider.
-
-### 5. Retention actions
-
-- [ ] From the list: **Resolve**, then **Reopen**, then **Archive**; the status
-      filter reflects each. **Rename** changes the title everywhere.
-- [ ] **Delete** asks for confirmation, removes the local record only, and says
-      provider history is untouched. The question does not come back after a
-      reload or from another tab.
-
-### 6. Library, export, backup
-
-- [ ] Toolbar icon → library. Sources on the left; questions with status filters;
-      search finds a word from a saved answer.
-- [ ] **Export this page as Markdown** (from the list or the library) downloads a
-      file with the selected passage, the exact prompt, the saved thread and its
-      capture state.
-- [ ] **Backup** downloads JSON. **Restore…** of that same file reports
-      everything skipped as older (nothing duplicated).
-
-### 7. Private branches (**live**)
-
-- [ ] Choose the provider's private mode on the toggle (`Temporary Chat` /
-      `Incognito chat`). Its documented constraints are behind the collapsed
-      note; the note does not open by itself. From a project conversation the
-      note's own line says once that the branch starts outside the project.
-- [ ] Send. The status line narrates preparation (`opening the menu…`,
-      `Turning on …`, `Verifying …`, `… verified. Sending the question…`). It
-      proceeds only once the provider's own control or active-mode interface
-      reads as on.
-- [ ] **ChatGPT:** if Temporary sits behind the composer menu, Aside opens the
-      menu and selects it. If ChatGPT then asks Personalized / Unpersonalized,
-      Aside stops (`This branch was not sent.`), says ChatGPT is asking for a
-      choice, and shows **Show branch window / Check again**. Make the choice
-      in the branch window, press **Check again**: the same window is used and
-      the question is sent once.
-- [ ] **Claude:** with Incognito already active (the "Incognito chat" label in
-      the header), the branch is verified from that label and sent. If starting
-      Incognito opens a new page, the pending question follows it; nothing is
-      typed twice.
-- [ ] Turn the provider's private mode off and try again: Aside refuses before
-      typing anything, keeps your question, the provider composer is empty, and
-      the panel shows one error, no blank branch frame, and the recovery row.
-      **Use ordinary mode…** asks first and sends as a saved chat only after
-      **Send as ordinary chat**; **Keep …** backs out.
-- [ ] A private question never appears in the library, export or backup. Close
-      and reopen keeps it in this session only; a browser restart loses it and
-      the panel warns about that in advance.
-
-### 7a. Mathematics in a selection
-
-- [ ] In an answer containing a rendered formula (for example `S_2 \ne S^2`),
-      select from inside the formula, or across formula and prose. The panel's
-      "Selected local focus" and the Context preview show `$S_2 \ne S^2$`, not
-      `S2≠S2`; the submitted prompt (Copy log + text) contains the same.
-- [ ] Select only part of a formula: the preview says the selection covers only
-      part of the equation, and the Context section lists the whole equation as
-      context, not as the selection.
-
-### 7b. Findings from the acceptance screenshots (what to re-check)
-
-| Finding | Where to look now |
+| Aside does | You do |
 | --- | --- |
-| "temporary is not working on chatgpt" | 7: menu is opened, chooser is respected, Check again continues on the same window; the log names the step it stopped at |
-| "temporary is not working on claude" | 7: the header label verifies Incognito; a new-page navigation carries the question; no "control not found" verdict |
-| garbled formula (`S2≠S2`) in preview and prompt | 7a |
-| failed panel: two errors, blank live frame, six header buttons, note popped open, project warning twice | 7: one error, hidden frame with Show branch window, More menu, collapsed note, one project line |
+| Shows the Aside toolbar when you select text in an answer | Choose **Ask**, **Why** or **New-tab** |
+| Prepares one readable prompt: the passage (formulas as their TeX source), its paragraph or block, the question before it, definitions it can see, and anything you add — the full prompt is visible before you copy | Type or edit the question, and remove or add context if you want |
+| On **Copy & open temporary chat**: copies exactly the previewed prompt, then opens a new ChatGPT/Claude window (New-tab: a tab) | Check the native page is in Temporary / Incognito mode, choose Personalized/Unpersonalized and a model if you want, paste, and send |
+| Nothing in the native page: no clicks, no typing, no paste, no send, no reading the answer back | Read the answer and ask follow-ups there |
+| Returns you to the passage (the card's **Jump to passage**, or the toolbar popup's **Return to source**) | Keep reading |
+| On **End & discard**: clears the question from Aside and closes the tab it opened (after telling you) | Decide when a question is done |
+| On **Save local note…**: saves the passage, question and your note as a permanent library record — only then | Decide what is worth keeping |
 
-### 8. Cross-tab
+Everything is offline-verified against fixtures unless marked **live**. Live
+checks on your signed-in accounts are the part only you can do.
 
-- [ ] Open the same conversation in two tabs. Edit a draft in one; the other
-      shows it after you leave the box. Close the view in tab A; tab B's view is
-      **not** closed.
-- [ ] Delete from tab A. It disappears from tab B and does not come back.
+## Load / update the build
+
+1. Put the new build's files in the directory Aside is already loaded from
+   (the staged acceptance directory), then `chrome://extensions/` → Developer
+   Mode → press **Reload** on the Aside card. Do not remove the extension — that
+   would delete its saved data. Restarting the browser alone is not enough: a
+   same-version unpacked extension can keep its previous service worker until
+   it is reloaded.
+2. Reload makes Chrome clear session storage, so any temporary handoff or
+   private branch that is open at that moment is dropped. End or note what you
+   need first.
+3. Hard-reload open `chatgpt.com` and `claude.ai` tabs (content scripts are
+   injected on page load).
+4. Click the Aside toolbar icon: the popup lists active temporary handoffs and
+   shows `Aside build <id>` at the bottom. Compare it with the PR head. The
+   library (popup → **Open library**) shows the same build id.
+
+## Walkthrough (**live**, once per provider)
+
+For ChatGPT, then Claude:
+
+1. Open a conversation with a mathematical answer. Select part of a formula and
+   the sentence around it.
+2. Choose **Why** (or **Ask** and type a question). The card says
+   `Temporary handoff · Not saved in Aside`. The selected passage shows the
+   formula as TeX (for example `$S_2 \ne S^2$`), not as `S2≠S2`.
+3. Open **Edit context and see the full prompt**: the passage, its paragraph,
+   the question before it, and — when you selected only part of a formula — the
+   whole equation labelled as context. Missing material is listed as missing.
+4. Press **Copy & open temporary chat**. The card reports the copy and the
+   opening separately. A new window opens:
+   - ChatGPT: `chatgpt.com/?temporary-chat=true`. Check that Temporary is
+     selected (select it if not); if asked, choose Unpersonalized for a
+     context-isolated answer.
+   - Claude: `claude.ai/new`. Start Incognito with the ghost icon (outside any
+     Project); the chat shows an "Incognito chat" label.
+5. Choose a model there if you want, paste (⌘V / Ctrl+V), check the pasted text,
+   and send. Ask one follow-up in the same native chat.
+6. Back on the source tab (or popup → **Return to source**), the passage is
+   highlighted where you left it; the conversation has not changed.
+7. **End & discard** → confirm. The native tab closes; the card is gone.
+8. Popup: no active handoffs. Library: no new record for this question.
+
+Also check once:
+
+- **Hide** (or Escape inside the card) puts it in the left rail as `temporary`;
+  clicking the rail entry brings it back. Escape elsewhere is the provider's.
+- **Save local note…** shows exactly what will be saved and says it is a
+  permanent local record; after **Save to library** it appears in the library.
+- Closing the native tab yourself clears that question from Aside.
+- Closing the source tab leaves the native chat open; the popup still offers
+  **End & discard**.
+- Existing saved questions are still in the library (search, view, resolve,
+  export, backup). A saved branch on its source page is read-only: **Open
+  conversation** opens the saved chat; **Ask about this passage** starts a new
+  temporary handoff and leaves the record as it was.
+
+## What is not claimed
+
+- Aside does not see or verify the native Temporary/Incognito mode; the native
+  page and your check before pasting are the safeguard. A missing observation is
+  expected, not a defect.
+- `chatgpt.com/?temporary-chat=true` is an observed entry, not an API; if it
+  lands on a normal chat, a sign-in or a choice screen, select Temporary there.
+- Claude's `incognito` URL shortcut is not used (unverified); the base
+  `claude.ai/new` page is the route.
+- The clipboard keeps the prompt until you copy something else. **More → Clear
+  clipboard now** replaces it with empty text in this browser; clipboard history
+  or synced clipboards may keep a copy.
+- Provider retention is the provider's: ChatGPT may keep a temporary chat up to
+  30 days for safety; Anthropic keeps Incognito chats 30 days by default. Saving
+  a chat in the provider changes its lifecycle.
 
 ## Known limitations
 
-- Live provider coverage is pending until you run the steps marked **live**.
-  Claude's composer and selection popup selectors are fixture-verified; a
-  failure there now writes a structural census to the debug log (**More → Copy
-  log**) instead of a bare timeout.
-- The private-mode menu opener, active-interface and chooser selectors for both
-  providers are candidates taken from the providers' own documentation and the
-  owner's logs; they are exercised against fixtures shaped like those logs, not
-  against a live account. If a live page differs, the panel reports which step
-  it stopped at (not "unsupported") and Check again works on the fixed window.
-- Follow-ups are typed in the provider's own conversation; Aside does not offer a
-  second composer of its own.
-- A branch still running is not resumed after a hard navigation; it comes back as
-  a saved thread with whatever was captured, and continuing is explicit.
-- Attachment and file contents are never read; a referenced file is listed as
-  missing in the plan, not fetched.
+- Aside does not capture new answers. To keep part of one, paste it into
+  **Save local note…** yourself.
+- A temporary handoff lives only for the browser session; a browser or extension
+  restart clears it (by design, never restored from disk).
+- If a native tab is navigated to another conversation, Aside will focus it but
+  not close it on End.
+- The open card occupies the right of the page; it stops above the composer, but
+  at narrow widths it can sit over reading text. Check that ChatGPT's/Claude's own
+  selection popup is not left under the card on your screen (**Hide** or Escape
+  frees the space).

@@ -1,38 +1,95 @@
 # Aside
 
-Aside is a Chromium extension for asking focused follow-up questions from long ChatGPT and Claude answers without losing your place in the main conversation.
+Aside is a Chromium extension that helps you ask about a passage of a long
+ChatGPT or Claude answer **in the provider's own temporary chat**, without losing
+your place in the conversation you are reading.
 
-It keeps the reading flow centered on the selected passage:
-- select text inside an assistant answer on ChatGPT or Claude
-- open a branch with `Ask` or `Why`, or `New-tab` for its own window
-- review the Context section to see exactly what will be sent, then adjust it
-- type the question and press `Enter` to send it (`Shift+Enter` for a new line)
-- keep reading while branches run in parallel
-- press `Escape` to tuck the open branch back into the rail
-- restore minimized branches later and jump back to the original selected text
+- Select text in an assistant answer on ChatGPT or Claude.
+- Choose `Ask`, `Why` or `New-tab`. A card prepares one readable prompt from the
+  passage and the context around it; you can see the whole prompt and change it.
+- Press **Copy & open temporary chat**. Aside copies exactly that prompt and
+  opens a new ChatGPT or Claude page in its own window (`New-tab`: a tab).
+- In that native page you confirm Temporary Chat / Incognito chat, pick a model
+  if you want, paste, and send. Answers and follow-ups stay there.
+- Come back to the passage, and **End & discard** when you are done.
 
-A branch always runs on the provider you selected in. Aside never moves a
-selection from one provider to the other, and copying context into a new
-conversation is not a server-side fork: it does not carry attachments, project
-knowledge, memory, hidden reasoning or model state.
+Aside is a helper for handing a question to the provider's web page yourself. It
+does not use a provider API, does not type, paste or send anything in a provider
+page, and does not read the answer back. It is not affiliated with or endorsed by
+OpenAI or Anthropic.
 
-## What Aside does
+## What happens automatically, and what you do
 
-- Opens a question beside the main conversation instead of making you scroll the original chat.
-- Plans the context structurally and shows it before sending — the selected passage, the paragraph, step or code block it sits in, the question that produced the answer, definitions the passage refers to, and anything you add — with a preview that is the complete prompt, byte for byte.
-- Runs the question on the same provider, in an embedded panel where the provider allows it and in a window Aside drives where it does not.
-- Reads the answer back and keeps it with the question: every saved thread says whether it is link only, partially captured, or captured through a given message.
-- Keeps questions attached to their source. Closing a view deletes nothing; a source's questions are listed on its page and in the library, where they can be resolved, reopened, archived, renamed, exported as Markdown, backed up, or explicitly deleted.
-- Fails with a real error and a way to retry instead of an endless spinner.
+| Aside does | You do |
+| --- | --- |
+| Shows its toolbar next to (never over) the provider's own selection actions | Choose Ask, Why or New-tab |
+| Prepares the prompt: the passage (formulas as their TeX source), its paragraph or block, the question before it, definitions it can find in what it read, and anything you add — with a preview that is exactly what will be copied | Edit the question; remove or add context |
+| Copies the prompt only when you press Copy (or Copy & open) | Paste it yourself |
+| Opens a new top-level provider page — no text in the URL, no referrer | Confirm the native temporary mode and personalization, choose a model, send |
+| Nothing in the native page: no clicks, typing, paste, send, or answer capture | Read and follow up there |
+| Brings you back to the passage | — |
+| **End & discard**: clears the question from Aside and closes the tab it opened | Decide when a question is done |
+| **Save local note…**: a permanent library record of the passage, question and your note | Decide what is worth keeping |
 
-### Questions, not windows
+### Temporary by default, not saved
 
-A question is a record attached to the passage it was asked about. The panel is a
-view of it. **Close** and **Minimize** hide the view; **Resolved**, **Archived**
-and **Delete** are separate, explicit actions on the question itself, and delete
-removes only Aside's local record — provider history is never touched. Titles are
-generated locally from the question and can be renamed; the model is never asked
-to emit one.
+Every new Ask/Why/New-tab question is a *scratch handoff*: temporary-intended,
+and kept only for this browser session — in the extension's worker and
+`chrome.storage.session` (restricted to the extension's own trusted contexts).
+It is never written to extension local storage, the question database, logs,
+exports or backups. It is cleared when you **End & discard** it, when its native
+tab closes, or when the browser or the extension restarts. **Hide** (or Escape
+inside the card) only tucks it into the left rail. Aside never switches a
+question to an ordinary saved chat for you.
+
+Separate things, not one guarantee:
+
+- **The provider's mode** — you set it in the native page. Aside cannot see or
+  verify it; the card tells you to check it before pasting.
+- **Aside's local copy** — session-only, cleared as above ("Cleared from Aside"
+  means Aside's copy; garbage collection and browser internals are outside that).
+- **The clipboard** — keeps what you copied until you copy something else.
+  **More → Clear clipboard now** replaces it with empty text in this browser;
+  clipboard managers, synced clipboards and other apps may still hold a copy.
+- **The provider's retention** — theirs. ChatGPT may keep a temporary chat for
+  up to 30 days for safety; Anthropic keeps Incognito chats 30 days by default
+  (longer under some organization settings). Saving a chat in the provider
+  changes its lifecycle.
+
+### Where the handoff goes
+
+| | ChatGPT | Claude |
+| --- | --- | --- |
+| Opens | `https://chatgpt.com/?temporary-chat=true` — an observed entry that may pre-select Temporary; if it lands on an ordinary chat, a sign-in or a choice screen, select Temporary there. **Open a plain new chat instead** opens `https://chatgpt.com/`. | `https://claude.ai/new`, outside any Project; start Incognito with the ghost icon. An `incognito` URL shortcut is not used (not established on a signed-in page). |
+| Mode name | Temporary Chat (choose Unpersonalized for a context-isolated answer; Personalized also keeps the chat out of memory) | Incognito chat (no memory; profile preferences and styles can still apply; may open in the previous chat experience) |
+| Evidence | fixture-tested; the native steps are yours | fixture-tested; the native steps are yours |
+
+Aside does not populate or change the model, the account's settings, memory, the
+source conversation's mode, or its Project. A new native conversation does not
+inherit attachments, Project files, tools or hidden state from the source.
+
+### Different questions, different chats
+
+Each Ask/Why/New-tab is a new session with its own native tab. **Continue in
+ChatGPT/Claude** focuses the tab of *that* question; it never reuses another
+question's chat and never copies again (follow-ups are typed in the native chat).
+If that tab was closed, its temporary conversation cannot be reopened and the
+question is cleared from Aside; select the passage again for a new one.
+
+The toolbar popup lists the active handoffs — useful while you are looking at the
+native chat — with **Return to source**, **Continue**, **Copy prompt** and **End &
+discard**. It is not a history.
+
+### Saved records from earlier versions
+
+Questions saved before this release stay in the library: search, view, rename,
+resolve, archive, delete (with tombstones), Markdown export, backup and restore.
+A saved branch shown on its source page is read-only: **Open conversation** opens
+the saved provider chat as ordinary navigation, and **Ask about this passage**
+starts a new temporary handoff, leaving the record unchanged. The earlier
+automatic runner (framed chats, driven windows, private-mode switching,
+typing/sending, answer capture) is retired; its requests are refused, including
+from a page still running an older content script.
 
 ### Coexisting with the provider's own interface
 
@@ -40,85 +97,10 @@ Aside does not hide, disable, restyle or reparent anything the provider renders.
 Its own controls are labelled `Aside`, measured against the provider's selection
 toolbar, sidebar, header, composer and tool panes, and placed where they do not
 overlap. When there is no safe position the toolbar collapses to a compact `Aside`
-entry rather than covering a native control.
-
-Minimized branches live in free whitespace in the **left gutter** — between the
-provider's own navigation and the reading column. Where the gutter is too narrow
-to be readable, the rail is replaced by the compact entry in verified free space.
-
-### Provider support
-
-| | ChatGPT | Claude |
-| --- | --- | --- |
-| Origins | `chatgpt.com`, `chat.openai.com` | `claude.ai` |
-| Branch surface | embedded panel | embedded panel attempted first; falls back to a window Aside drives if claude.ai refuses to be framed |
-| Private mode | Temporary Chat | Incognito chat |
-| Private mode caveats | controls history, not personalization; can later be saved to history from ChatGPT | unavailable inside projects, so starting one leaves the project; a closed Incognito chat cannot be reopened |
-| Evidence level | `fixture-only` | `fixture-only` (embedded surface: `unverified`, attempted once and observed) |
-| Verified against | offline fixtures and the live site's DOM conventions | offline fixtures only |
-
-No surface is declared `verified`. In this codebase that level means the adapter
-positively observed the capability in a live DOM, and nothing here does: neither
-provider was run against a live logged-in account in this work. `fixture-only`
-means implemented and exercised against local fixtures — Aside offers it, and does
-not claim it is proven.
-
-Claude's selectors are candidates ordered semantic-first and are re-detected after
-navigation. Claude's interface is mid-migration between the current and previous
-experiences, so a rollout may change them; Aside reports a capability as
-unavailable rather than guessing.
-
-### Private branches
-
-Two things are kept apart: the provider's own conversation mode (normal, or its
-verified Temporary/Incognito mode) and Aside's local retention (durable, or
-session-only). A private question is session-only — it has no record in the
-question database, no export, no backup — and it is only sent once Aside can
-positively see that the provider's private mode is on. Nothing is ever downgraded
-from private to persistent automatically, and a selection made inside a private
-chat defaults to a private branch.
-
-**Preparing the mode is a workflow, not a selector lookup.** Aside observes the
-branch document as three separate facts — whether the mode is offered here at
-all, what the page currently says the conversation is, and how far preparation
-has got — and acts on the next step only:
-
-| Observed | What Aside does |
-| --- | --- |
-| the provider's own control reads as on, or the provider's own active-mode interface is shown (Claude's "Incognito chat" label) | verified; the prompt is typed and sent once |
-| the control reads as off | it is activated once, then re-observed; only a provider-owned on-state counts |
-| the control exists but sits behind a menu (present, enabled, no box) | the menu opener is used, then the control; never reported as "unsupported" |
-| the provider asks a question (ChatGPT's Personalized / Unpersonalized choice) | Aside stops without choosing and waits for you |
-| the page navigated during preparation (Claude opens Incognito as a new page) | the pending question is carried to the new document — only while nothing has been typed yet |
-| the control is disabled | reported as unavailable in this branch window (usually a project or workspace rule) |
-| nothing observed yet | reported as not observed; unknown stays unknown |
-
-Every stop happens **before anything is typed**, with the question preserved and
-a recovery row under it: **Show branch window** (see the document Aside is
-looking at, and act in it), **Check again** (re-observe the *same* document and
-continue the pending question there — no reload, no new window), and, where it
-makes sense, **Use ordinary mode…** — a two-step choice that sends the question
-as an ordinary, saved chat only after you confirm. Aside never makes that switch
-by itself. Try again after such a stop reuses the branch window you may just
-have fixed.
-
-Before a private branch runs, the panel shows what that provider documents about
-its own private mode. The note stays collapsed until you open it; inside a
-project it says once, on its own line, that the branch will start outside the
-project. The toggle carries the provider's own name for the mode, so it is
-recognisable in the provider's own interface.
-
-Private branch text, prompts, answers and logs are kept in session storage, which
-the browser clears when the session ends. They never reach durable storage. If a
-browser does not make session storage available, Aside says so in the panel and
-keeps refusing to write private branch content to disk — a private branch still
-runs, it just cannot be kept. That is a statement about this extension only: Aside
-can observe the page, and cannot make any claim about what a provider retains on
-its servers.
-
-The mode is re-checked after the composer is acquired and again before every
-submit attempt, not only the first: the fallback chain that handles providers
-where a click does not send spans several seconds of further attempts.
+entry rather than covering a native control. Hidden cards live in free whitespace
+in the **left gutter**; where the gutter is too narrow, the compact entry is used.
+A native page Aside opened stays exactly as the provider made it: Aside mounts
+nothing there.
 
 ### Mathematics in a selection
 
@@ -133,33 +115,21 @@ no readable source). Nothing is "cleaned up" by a model or a regex.
 
 ## Local development
 
-1. Install dependencies:
-
 ```bash
-npm install
-```
-
-2. Build the extension:
-
-```bash
+npm ci
 npm run build
 ```
 
-3. Open `chrome://extensions/`, enable Developer Mode, and load the `dist/` directory as an unpacked extension.
+Open `chrome://extensions/`, enable Developer Mode, and **Load unpacked** the
+`dist/` directory. To update an already-loaded copy, replace the directory's
+contents and press **Reload** on the Aside card — do not remove the extension,
+which would delete its saved data. A browser restart alone can keep the previous
+service worker running for a same-version unpacked extension; the card's Reload
+is what switches it. Reloading clears session storage, so any open temporary
+handoff is dropped. Then reload the open `chatgpt.com` / `claude.ai` tabs.
 
-4. If you are upgrading an already-loaded copy, press **Reload** on the Aside card.
-   The manifest now requests `https://claude.ai/*`, and Chrome will not grant a new
-   host permission to an extension that is only refreshed in the page — check the
-   card shows claude.ai under "Site access" and approve it if prompted.
-
-5. Reload `chatgpt.com` **and** `claude.ai` (the content script is only injected on
-   a fresh load), select assistant text, and try `Ask`, `Why`, or `New-tab`.
-
-6. The toolbar icon opens Aside's **library**: every source and question, search,
-   Markdown export, JSON backup and restore, and the build identifier of the
-   installed copy. On first run after upgrading, existing branches are migrated
-   into the question database; the legacy copies are kept until you remove them
-   from the library footer. See [`docs/migration-and-recovery.md`](docs/migration-and-recovery.md).
+The toolbar icon opens the popup (active temporary handoffs, the build id, and
+**Open library**).
 
 ## Course submission package
 
@@ -182,34 +152,35 @@ The GitHub Pages workflow publishes `course-submission/` as the public project s
 ## Verification
 
 ```bash
-npm test
 npx tsc --noEmit
+npm test
 npm run build
 npm run smoke:local
+OLD_DIST=<previous build dir> node scripts/upgrade-smoke.mjs
 ```
 
-`npm test` covers the question database (commands, conflicts, tombstones,
-reference-counted deletion, migration, backup/restore) with an in-memory
-IndexedDB, the context planner against a small grounding corpus, capture honesty,
-placement geometry and the provider adapters.
+`npm test` covers the scratch-handoff authority (retention, ownership, events,
+authorization, retired requests), the prepared prompt (preview equals copied
+text, revisions, context, math, delimiters, budget), the handoff card (copy/open
+independence, double clicks, clipboard fallback, explicit clearing, End, local
+note), passage re-anchoring, the question database, and the provider adapters.
 
-`npm run smoke:local` runs the extension against fake `chatgpt.com` and `claude.ai`
-fixtures in a disposable Chrome profile: selection toolbar, context preview equal
-to the submitted prompt, branch creation, answer capture settling to "captured
-through", local titles, New-tab drafting, close-without-delete and explicit delete
-across two tabs, privacy verification, and the layout matrix across widths,
-themes and sidebar states. Requests are intercepted at the browser
-level, so windows the extension opens itself are covered too, and any request to a
-host the harness does not serve **fails the run** — the default smoke can never
-reach a real ChatGPT or Claude account.
+`npm run smoke:local` runs the built extension against fake `chatgpt.com` and
+`claude.ai` fixtures in a disposable Chrome profile. The fixtures record every
+click, input, key and paste in the native page, so the smoke proves Aside never
+touches it; the Owner's paste-and-send is simulated in the fixture, explicitly.
+It observes durable writes while the lifecycle runs (storage change events and
+storage-authority messages), covers Ask/Why/New-tab on both providers, the popup,
+source and target closure, many sessions, saved-data retention, and the layout
+matrix. Any request to a host the harness does not serve, or any provider page it
+did not serve, **fails the run**. `CAPTURE_SCREENSHOTS=<dir>` writes screenshots.
 
-Set `CAPTURE_SCREENSHOTS=<dir>` to write the layout-matrix screenshots to disk.
-
-The native-window scenarios (`Why` recovery and `New-tab`) run as part of that command. To skip them for a faster loop:
-
-```bash
-SKIP_NATIVE_WINDOW_SMOKE=true npm run smoke:local
-```
+`scripts/upgrade-smoke.mjs` loads a previous build from one directory, writes
+data with it, replaces the directory's contents with the current `dist/`,
+restarts on the same profile, reloads as the card would, and checks the extension
+id, every pre-existing record, the migration journal and that a new handoff
+writes nothing durable. Run it locally with the previous build; it is not part of
+CI.
 
 ## Safe open-source release workflow
 
@@ -232,18 +203,17 @@ The export script creates a clean staged repo tree in a separate directory so yo
 
 ## Diagnostics
 
-The panel header keeps the everyday actions; **More** holds the diagnostics:
-**Copy log** (redacted: URLs, status, automation steps, private-mode
-observations as attributes only), **Copy log + text** (adds your selected text
-and the generated prompt) and **Select log** (shows the redacted report in the
-panel when the clipboard is blocked). Every report starts with the build ids of
-the page's content script, the service worker and the branch frame; the worker,
-frame and branch-tab handshakes all carry their build, and a mismatch is logged
-as `stale-client` and shown as a notice asking for a page reload.
+A handoff card's **More → Copy diagnostics** copies build ids (page and worker),
+provider, route category, clipboard and target states and result codes — no
+content, no URLs. A saved-record view keeps **Copy log** (redacted) and **Copy
+log + text** (includes the selected text and prompt). Page and worker builds are
+compared on every exchange; a mismatch is refused as `stale-client` and the page
+asks for a reload.
 
 ## Privacy note
 
-Aside's branch debug logs can include selected text, the generated first prompt, root and branch URLs, and branch status details (only with **Copy log + text**; the default report is redacted). Review logs before sharing them in issues or public discussions.
+**Copy log + text** on a saved-record view includes selected text and prompts;
+review it before sharing. Temporary handoffs are never written to disk by Aside.
 
 ## License
 

@@ -81,7 +81,35 @@ initialised. No command overwrites or initialises over data it could not read.
 ## Installed-extension upgrade
 
 The Owner's installed extension keeps its identity and storage scope; upgrading
-is a Reload on the existing card, never an uninstall. The manifest now declares
-a toolbar `action` (no new permission). Clean-install checks belong in the
-disposable smoke profile; the retained-data path is what the migration tests and
-the Owner's own profile exercise.
+is replacing the files in the same unpacked directory and pressing **Reload** on
+the existing card — never an uninstall, which would delete the data.
+
+Observed in `scripts/upgrade-smoke.mjs`: after the files are replaced, a browser
+restart alone kept the previous build's service worker answering (same version
+`0.1.0`); the card's Reload (loading the same directory again) switched it, with
+the same extension id and the same storage. Pages still running the old content
+script are refused by the new worker as `stale-client` and ask for a reload.
+
+## Upgrading to the native-handoff build
+
+No data migration is needed and none runs for it:
+
+- The question database schema is unchanged (`aside-questions` v1). The only
+  command change is additive: `CreateQuestion` may carry one `note`, written in
+  the same transaction. `providerMode` gained `native-handoff` for such notes.
+- Scratch handoffs are new and session-only; nothing is converted into them.
+- Legacy panel view records stay in `chrome.storage.local` and are shown
+  read-only. The journaled legacy migration keeps running on each worker start as
+  before, so a legacy panel written after the previous cutover becomes a
+  `q_legacy_…` question on the next start (observed in the upgrade check).
+- `chrome.storage.session` is now restricted to trusted extension contexts; the
+  worker was already the only reader. Reloading the extension clears session
+  storage, so private legacy panels and open handoffs do not survive an update.
+- The manifest drops the unused `scripting` permission, sets
+  `all_frames: false` for the content script, and turns the toolbar action into
+  a popup (library reachable from it). No permission is added.
+- The last-used branch kind stored by earlier builds is left in place and no
+  longer read: every new question is a temporary handoff.
+
+Rollback to the previous build loses nothing that existed before; notes saved
+from handoffs are ordinary durable questions and are included in backups.

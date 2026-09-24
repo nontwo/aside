@@ -7,7 +7,6 @@
     "storage",
     "clipboardWrite",
     "tabs",
-    "scripting",
     "windows"
   ],
   "host_permissions": [
@@ -29,11 +28,12 @@
       "js": [
         "assets/root-content.js"
       ],
-      "all_frames": true,
+      "all_frames": false,
       "run_at": "document_idle"
     }
   ],
   "action": {
-    "default_title": "Aside library"
+    "default_title": "Aside",
+    "default_popup": "popup.html"
   }
 }

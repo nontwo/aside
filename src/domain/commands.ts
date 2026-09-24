@@ -28,6 +28,11 @@ export interface CreateQuestionCommand {
   anchor: Omit<Anchor, 'createdAt'>;
   question: Omit<Question, 'createdAt' | 'updatedAt' | 'rev' | 'lifecycle'>;
   draft?: Pick<QuestionDraft, 'text' | 'excludedBlockIds' | 'background'>;
+  /**
+   * A note written in the same transaction, so an explicit "save local note"
+   * either creates the question and its note together or creates nothing.
+   */
+  note?: { id: string; text: string };
 }
 
 export interface UpdateDraftCommand {

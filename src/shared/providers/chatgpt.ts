@@ -283,83 +283,9 @@ export const chatgptAdapter: ProviderAdapter = {
     }
   },
 
-  composer: {
-    composerSelectors: [
-      '#prompt-textarea',
-      'textarea#prompt-textarea',
-      'textarea[placeholder]',
-      'textarea',
-      'div[contenteditable="true"][role="textbox"]',
-      'div[contenteditable="true"][data-testid]',
-      'div[role="textbox"][contenteditable="true"]'
-    ],
-    sendButtonSelectors: [
-      '[data-testid="send-button"]',
-      'button',
-      '[role="button"]',
-      'input[type="submit"]',
-      'input[type="image"]'
-    ],
-    stopButtonSelectors: [
-      'button[data-testid="stop-button"]',
-      'button[aria-label*="Stop" i]',
-      'button[aria-label*="停止"]'
-    ],
-    privacyControlSelectors: [
-      'button[aria-label*="临时聊天"]',
-      'button[title*="临时聊天"]',
-      '[role="button"][aria-label*="临时聊天"]',
-      '[role="button"][title*="临时聊天"]',
-      'button[aria-label*="temporary" i]',
-      'button[title*="temporary" i]',
-      '[role="button"][aria-label*="temporary" i]',
-      '[role="button"][title*="temporary" i]'
-    ],
-    privacyControlLabelPattern: /temporary\s*chat|临时聊天|^temporary$/i,
-    // ChatGPT documents Temporary as a selection made in a NEW chat, before the
-    // first message, followed by a Personalized/Unpersonalized choice. Where the
-    // selection sits behind a menu, these openers are tried first; an opener is
-    // identified by aria-haspopup, so a plain button is never clicked blind.
-    privacyMenuTriggerSelectors: [
-      'form button[aria-haspopup="menu"]',
-      'form button[aria-haspopup="true"]',
-      'form [role="button"][aria-haspopup="menu"]',
-      '[data-testid*="composer" i] button[aria-haspopup]'
-    ],
-    // Candidates for the provider's own active indicator; observed at run time,
-    // never assumed.
-    privacyActiveInterfaceSelectors: [
-      '[data-testid*="temporary-chat" i][data-state="on"]',
-      '[data-testid*="temporary-chat" i][aria-pressed="true"]',
-      'main [aria-label*="temporary chat" i][aria-pressed="true"]',
-      'main [aria-label*="临时聊天"][aria-pressed="true"]'
-    ],
-    privacyChooserSelectors: ['[role="dialog"]', '[role="alertdialog"]', '[data-testid*="personaliz" i]'],
-    privacyInactiveLabelPattern:
-      /开启临时聊天|启用临时聊天|开始临时聊天|temporary chat off|turn on temporary chat|start temporary chat|enable temporary chat/i,
-    privacyActiveLabelPattern:
-      /关闭临时聊天|退出临时聊天|结束临时聊天|停止临时聊天|temporary chat on|turn off temporary chat|disable temporary chat|exit temporary chat|leave temporary chat/i
-  },
-
-  surfaces: {
-    // Both paths shipped and are exercised against fixtures on every run. They
-    // were not re-confirmed against a live ChatGPT account in this work, so they
-    // are not labelled `verified`: that level means observed in the live DOM.
-    embedded: 'fixture-only',
-    nativeWindow: 'fixture-only',
-    detail: 'ChatGPT can be driven in an embedded frame and in a window Aside opens.'
-  },
-
+  // The provider's own name for its temporary conversation mode. Aside names it
+  // in the handoff guidance; it never operates the mode itself.
   privacy: {
-    label: 'Temporary Chat',
-    constraints: [
-      'ChatGPT starts a temporary chat from a new chat: select Temporary, then choose Personalized or Unpersonalized before the first message. Personalization is on by default; the choice cannot be changed after the conversation starts, and Aside never makes it for you.',
-      'A chat cannot be added to a project while it is temporary, so a private branch started from a project conversation runs outside the project: its files and instructions do not travel with the branch.',
-      'Temporary Chat keeps the conversation out of history and out of model training while it stays temporary; ChatGPT may keep a copy for up to 30 days for safety. It can later be saved as a regular chat from ChatGPT itself.',
-      'Aside can only observe the page. It cannot prove anything about server-side retention.'
-    ],
-    // A temporary chat cannot live inside a project (ChatGPT Projects help), so
-    // a private branch from a project conversation starts outside it.
-    leavesContainer: true
+    label: 'Temporary Chat'
   }
 };

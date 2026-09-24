@@ -58,11 +58,14 @@ async function copyManifest() {
   // The library is an extension-owned page: local resources only, no inline
   // script, so it complies with the default extension CSP.
   await cp(resolve(root, 'public/library.html'), resolve(dist, 'library.html'));
+  // The toolbar popup: active temporary handoffs only. Same CSP rules.
+  await cp(resolve(root, 'public/popup.html'), resolve(dist, 'popup.html'));
 }
 
 await rm(dist, { recursive: true, force: true });
 await buildEntry('src/content/root.ts', 'AsideRootContent', 'assets/root-content.js');
 await buildEntry('src/background/index.ts', 'AsideBackground', 'assets/background.js', ['es']);
 await buildEntry('src/ui/library.ts', 'AsideLibrary', 'assets/library.js');
+await buildEntry('src/ui/popup.ts', 'AsidePopup', 'assets/popup.js');
 await copyManifest();
 console.log(`[aside] build id ${BUILD_ID}`);

@@ -1067,6 +1067,112 @@ export function findTurnElementByAnchor(anchor: {
   return null;
 }
 
+/**
+ * Where a saved passage is on the page now, validated rather than guessed.
+ *
+ *  - exact: one occurrence whose recorded context (the words before and after
+ *    it) still agrees, in the message the passage came from or, failing message
+ *    identity, anywhere on the page;
+ *  - message-only: the message is identifiable but the passage in it changed;
+ *  - ambiguous: more than one place agrees equally — Aside does not pick one;
+ *  - not-found: nothing agrees. No positional or scroll-offset fallback.
+ */
+export type PassageLocation =
+  | { status: 'exact'; element: HTMLElement; range: Range }
+  | { status: 'message-only'; element: HTMLElement }
+  | { status: 'ambiguous' }
+  | { status: 'not-found' };
+
+function passageOccurrences(
+  element: HTMLElement,
+  quote: string,
+  prefix: string,
+  suffix: string
+): { all: number; agreeing: Array<{ start: number; end: number }>; index: ReturnType<typeof buildNormalizedTextIndex> } {
+  const index = buildNormalizedTextIndex(element);
+  const agreeing: Array<{ start: number; end: number }> = [];
+  let all = 0;
+  if (!quote || !index.text) {
+    return { all, agreeing, index };
+  }
+  let from = 0;
+  for (;;) {
+    const start = index.text.indexOf(quote, from);
+    if (start < 0) {
+      break;
+    }
+    all += 1;
+    const end = start + quote.length;
+    const before = compactWhitespace(index.text.slice(0, start));
+    const after = compactWhitespace(index.text.slice(end));
+    const prefixOk = !prefix || before.endsWith(prefix);
+    const suffixOk = !suffix || after.startsWith(suffix);
+    if (prefixOk && suffixOk) {
+      agreeing.push({ start, end });
+    }
+    from = start + 1;
+  }
+  return { all, agreeing, index };
+}
+
+function rangeFromIndex(
+  index: ReturnType<typeof buildNormalizedTextIndex>,
+  start: number,
+  end: number
+): Range | null {
+  const startPoint = index.points[start]?.start;
+  const endPoint = index.points[end - 1]?.end;
+  if (!startPoint || !endPoint) {
+    return null;
+  }
+  const range = document.createRange();
+  range.setStart(startPoint.node, startPoint.offset);
+  range.setEnd(endPoint.node, endPoint.offset);
+  return range;
+}
+
+export function locatePassage(
+  selection: Pick<SelectionPayload, 'selectedText' | 'rangeQuotes' | 'selectedBlocks'>
+): PassageLocation {
+  const quote = compactWhitespace(selection.rangeQuotes.exact || selection.selectedText);
+  const prefix = compactWhitespace(selection.rangeQuotes.prefix);
+  const suffix = compactWhitespace(selection.rangeQuotes.suffix);
+  if (!quote) {
+    return { status: 'not-found' };
+  }
+  const transcript = extractTranscript(document).filter((turn) => turn.element);
+  const blockIds = new Set(selection.selectedBlocks.map((block) => block.messageId));
+  const identified = transcript.filter((turn) => blockIds.has(turn.id));
+
+  const decide = (turns: typeof transcript): PassageLocation | null => {
+    const hits: Array<{ element: HTMLElement; start: number; end: number; index: ReturnType<typeof buildNormalizedTextIndex> }> = [];
+    turns.forEach((turn) => {
+      const found = passageOccurrences(turn.element as HTMLElement, quote, prefix, suffix);
+      found.agreeing.forEach((hit) => hits.push({ element: turn.element as HTMLElement, ...hit, index: found.index }));
+    });
+    if (hits.length === 1) {
+      const range = rangeFromIndex(hits[0].index, hits[0].start, hits[0].end);
+      return range ? { status: 'exact', element: hits[0].element, range } : { status: 'message-only', element: hits[0].element };
+    }
+    if (hits.length > 1) {
+      return { status: 'ambiguous' };
+    }
+    return null;
+  };
+
+  if (identified.length) {
+    const inMessage = decide(identified);
+    if (inMessage) {
+      return inMessage;
+    }
+    // The message is still here but the passage in it is not (edited or regenerated).
+    return { status: 'message-only', element: identified[identified.length - 1].element as HTMLElement };
+  }
+  const roles = new Set(selection.selectedBlocks.map((block) => block.role));
+  const anywhere = decide(transcript.filter((turn) => !roles.size || roles.has(turn.role)));
+  return anywhere ?? { status: 'not-found' };
+}
+
 export function getLatestAssistantText(root: ParentNode = document): string {
   const transcript = extractTranscript(root).filter((turn) => turn.role === 'assistant');
   return transcript.at(-1)?.text ?? '';

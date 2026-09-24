@@ -1,3 +1,12 @@
+/**
+ * Offline browser smoke for Aside's native temporary-chat handoff.
+ *
+ * Every provider page is a local fixture served through CDP request
+ * interception; any request to a host the harness does not serve fails the run.
+ * The fixtures record every click, input, key and paste, so the smoke proves
+ * what Aside does NOT do in a native page as well as what it does. The Owner's
+ * own paste-and-send is simulated in the fixture, explicitly, after Aside is done.
+ */
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
@@ -9,24 +18,13 @@ const profilePath = process.env.SMOKE_PROFILE ?? '/tmp/aside-embedded-smoke';
 const chromePath =
   process.env.CHROME_PATH ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const headless = process.env.HEADLESS !== 'false';
-// The native-window scenarios used to be opt-in because extension-created windows raced
-// request interception and loaded the real chatgpt.com. Interception is now installed
-// before a new target runs, so they are part of the default run.
-const includeNativeWindowSmoke = process.env.SKIP_NATIVE_WINDOW_SMOKE !== 'true';
-
 let routeMap = {};
 
-/** Paths the fixture server should refuse to let be framed. Reset per scenario. */
-let refuseFramingForPaths = [];
 let claudeRouteMap = {};
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
-// Unique per-run text so a storage assertion cannot be satisfied by another
-// scenario's content in the shared browser profile.
-const PRIVATE_PROBE_QUESTION = 'private probe marker 4711';
 
 const LAYOUT_CHROME_CSS = `    <style>
       :root { color-scheme: light; }
@@ -71,247 +69,81 @@ ${LAYOUT_CHROME_CSS}</head>
           <p>Older unrelated details should not matter.</p>
         </div>
       </article>
+      <form id="composer-form"><textarea name="prompt-textarea" placeholder="Ask anything" style="width:100%;height:56px"></textarea></form>
     </main>
   </body>
 </html>`;
 }
 
-function buildSuccessComposerHtml({
-  conversationPath,
-  dark = false,
-  includeDecoyComposer = false,
-  includeConfusingAction = false,
-  includeTemporaryChatToggle = false,
-  temporaryChatInitiallyActive = false,
-  temporaryChatDisableable = true,
-  temporaryChatEnableable = true,
-  temporaryChatActivationStyle = 'visible',
-  temporaryChatChooser = false,
-  temporaryModeSkipsConversationUrl = false,
-  conversationUrlMode = 'always',
-  conversationUrlStorageKey = '__asideSubmitCount',
-  realComposerId = 'prompt-textarea',
-  realSendMode = 'explicit',
-  enterOnlySubmit = false,
-  sendInShadowRoot = false,
-  assistantReplyText = 'This uses only the selected passage.'
-}) {
-  const htmlClass = dark ? ' class="dark" data-theme="dark"' : '';
-  const fakeAnswerMarkup = `
-    <article data-message-author-role="user"><div data-message-content></div></article>
-    <article data-message-author-role="assistant">
-      <div data-message-content>${assistantReplyText}</div>
-    </article>`;
-  const decoyComposerMarkup = includeDecoyComposer
-    ? `
-    <form id="search-form">
-      <textarea placeholder="Search chats"></textarea>
-      <button type="button" aria-label="Search">Search</button>
-    </form>`
-    : '';
-  const confusingActionMarkup = includeConfusingAction
-    ? `<button type="button" aria-label="开始群聊" style="position:fixed;right:32px;bottom:48px;">开始群聊</button>`
-    : '';
-  // 'menu' models the live ChatGPT shape from the owner's log: the control exists,
-  // is enabled, and has a 0x0 box because it sits inside a closed composer menu.
-  // Once selected, the menu closes and the mode shows as an interface indicator.
-  const temporaryChatMarkup = includeTemporaryChatToggle
-    ? temporaryChatActivationStyle === 'menu'
-      ? `<button id="composer-tools" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Tools">+</button>
-      <div id="composer-menu" role="menu" data-state="closed" style="display:none">
-        <button id="temporary-chat-toggle" type="button" role="menuitem" aria-label="开启临时聊天">开启临时聊天</button>
-      </div>
-      <div id="temporary-indicator" data-testid="temporary-chat-indicator" data-state="off" style="display:none">Temporary chat</div>`
-      : `<button id="temporary-chat-toggle" type="submit" aria-label="开启临时聊天">开启临时聊天</button>`
-    : '';
-  const chooserMarkup = temporaryChatChooser
-    ? `<div id="temporary-chooser" role="dialog" aria-modal="true" style="display:none;position:fixed;left:20%;top:30%;width:60%;background:#fff;border:1px solid #999;padding:16px;">
-        <p>Temporary chat: Personalized or Unpersonalized?</p>
-        <button id="chooser-personalized" type="button">Personalized</button>
-        <button id="chooser-unpersonalized" type="button">Unpersonalized</button>
-      </div>`
-    : '';
-  const sendButtonMarkup =
-    sendInShadowRoot
-      ? `<div id="shadow-send-host"></div>`
-      : realSendMode === 'unlabeled'
-        ? `<button class="real-send-icon" type="submit"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M1 8h12M9 2l4 6-4 6"/></svg></button>`
-        : realSendMode === 'none'
-          ? ''
-          : `<button data-testid="send-button" aria-label="发送" type="submit">Send</button>`;
+/**
+ * Unique per run: scratch content carries this, so a persistence assertion
+ * cannot be satisfied (or defeated) by another run's leftovers.
+ */
+const MARK = `scratchmark${process.pid}${Date.now().toString(36)}`;
+const WHY_TEXT = 'Why does this step hold? Explain the reasoning and state any necessary assumptions.';
+const CARD = '.aside-handoff:not([hidden])';
 
-  return `<!doctype html>
-<html${htmlClass}>
-  <head><meta charset="utf-8"><title>Fake ChatGPT Branch</title>${LAYOUT_CHROME_CSS}</head>
-  <body data-sidebar="open">
-    ${SIDEBAR_MARKUP}
-    <main><header>Fake header</header><div id="turns"></div>
-    ${decoyComposerMarkup}
-    <form id="composer-form">
-      <textarea ${realComposerId ? `id="${realComposerId}"` : ''} placeholder="有问题，尽管问" name="prompt-textarea" aria-label="与 ChatGPT 聊天"></textarea>
-      ${temporaryChatMarkup}
-      ${sendButtonMarkup}
-    </form>
-    </main>
-    ${confusingActionMarkup}
-    ${chooserMarkup}
-    <script>
-      const temporaryChatToggle = document.getElementById('temporary-chat-toggle');
-      if (temporaryChatToggle) {
-        let temporaryChatModeActive = ${temporaryChatInitiallyActive ? 'true' : 'false'};
-        window.__temporaryChatModeActive = temporaryChatModeActive;
-        const composerTools = document.getElementById('composer-tools');
-        const composerMenu = document.getElementById('composer-menu');
-        const temporaryIndicator = document.getElementById('temporary-indicator');
-        const chooser = document.getElementById('temporary-chooser');
-        const setMenuOpen = (open) => {
-          if (!composerMenu) {
-            return;
-          }
-          composerMenu.dataset.state = open ? 'open' : 'closed';
-          composerMenu.style.display = open ? 'block' : 'none';
-          composerTools?.setAttribute('aria-expanded', open ? 'true' : 'false');
-        };
-        if (composerTools) {
-          composerTools.addEventListener('click', (event) => {
-            event.preventDefault();
-            window.__menuTriggerClicks = (window.__menuTriggerClicks || 0) + 1;
-            setMenuOpen(composerMenu.dataset.state !== 'open');
-          });
-        }
-        if (chooser) {
-          chooser.querySelectorAll('button').forEach((button) => {
-            button.addEventListener('click', () => {
-              window.__personalizationChoice = button.id;
-              chooser.style.display = 'none';
-            });
-          });
-        }
-        const reflectTemporaryChatState = (active) => {
-          temporaryChatToggle.dataset.temporaryChatState = active ? 'active' : 'inactive';
-          temporaryChatToggle.setAttribute('aria-pressed', active ? 'true' : 'false');
-          temporaryChatToggle.setAttribute('aria-label', active ? '关闭临时聊天' : '开启临时聊天');
-          temporaryChatToggle.textContent = active ? '关闭临时聊天' : '开启临时聊天';
-          if (temporaryIndicator) {
-            temporaryIndicator.dataset.state = active ? 'on' : 'off';
-            temporaryIndicator.style.display = active ? 'block' : 'none';
-          }
-        };
-        // The owner fixing it by hand in the branch window: the harness's stand-in
-        // for a real click on the provider's own control.
-        window.__forceTemporaryChatState = (active) => {
-          temporaryChatModeActive = active;
-          window.__temporaryChatModeActive = active;
-          reflectTemporaryChatState(active);
-        };
-        const setTemporaryChatState = (active) => {
-          temporaryChatModeActive = active;
-          window.__temporaryChatModeActive = active;
-          if (${JSON.stringify(temporaryChatActivationStyle)} === 'silent' && active) {
-            reflectTemporaryChatState(false);
-            return;
-          }
-          reflectTemporaryChatState(active);
-        };
-        reflectTemporaryChatState(${temporaryChatInitiallyActive ? 'true' : 'false'});
-        temporaryChatToggle.addEventListener('click', (event) => {
-          event.preventDefault();
-          window.__temporaryChatToggleClicks = (window.__temporaryChatToggleClicks || 0) + 1;
-          if (${temporaryChatEnableable ? 'true' : 'false'} === false && temporaryChatToggle.dataset.temporaryChatState !== 'active') {
-            return;
-          }
-          if (!${temporaryChatDisableable ? 'true' : 'false'} && temporaryChatToggle.dataset.temporaryChatState === 'active') {
-            return;
-          }
-          setTemporaryChatState(temporaryChatToggle.dataset.temporaryChatState !== 'active');
-          setMenuOpen(false);
-          if (chooser && temporaryChatModeActive) {
-            chooser.style.display = 'block';
-          }
-        });
-      }
-
-      if (${enterOnlySubmit ? 'true' : 'false'}) {
-        const textarea = document.querySelector('#composer-form textarea');
-        textarea.addEventListener('keydown', (event) => {
-          if (event.key !== 'Enter') {
-            return;
-          }
-          event.preventDefault();
-          document.getElementById('composer-form').dispatchEvent(
-            new SubmitEvent('submit', { bubbles: true, cancelable: true })
-          );
-        });
-      }
-
-      if (${sendInShadowRoot ? 'true' : 'false'}) {
-        const host = document.getElementById('shadow-send-host');
-        const root = host.attachShadow({ mode: 'open' });
-        root.innerHTML = '<button type="submit" aria-label="发送"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M1 8h12M9 2l4 6-4 6"/></svg></button>';
-        root.querySelector('button').addEventListener('click', (event) => {
-          event.preventDefault();
-          document.getElementById('composer-form').dispatchEvent(
-            new SubmitEvent('submit', { bubbles: true, cancelable: true })
-          );
-        });
-      }
-
-      document.getElementById('composer-form').addEventListener('submit', (event) => {
-        event.preventDefault();
-        const textarea = document.querySelector('#composer-form textarea');
-        const prompt = textarea.value;
-        window.__lastPrompt = prompt;
-        window.__submitCount = (window.__submitCount || 0) + 1;
-        textarea.value = '';
-        const temporaryModeActive = window.__temporaryChatModeActive === true;
-        const nextSubmitCount = Number(localStorage.getItem(${JSON.stringify(conversationUrlStorageKey)}) || '0') + 1;
-        localStorage.setItem(${JSON.stringify(conversationUrlStorageKey)}, String(nextSubmitCount));
-        const shouldPersistConversationUrl =
-          ${JSON.stringify(conversationUrlMode)} === 'never'
-            ? false
-            : ${JSON.stringify(conversationUrlMode)} === 'after-first-submit'
-              ? nextSubmitCount > 1
-              : true;
-        if (
-          shouldPersistConversationUrl &&
-          !(temporaryModeActive && ${temporaryModeSkipsConversationUrl ? 'true' : 'false'})
-        ) {
-          history.pushState(null, '', ${JSON.stringify(conversationPath)});
-        }
-        const main = document.getElementById('turns');
-        main.innerHTML = ${JSON.stringify(fakeAnswerMarkup)};
-        main.querySelector('[data-message-author-role="user"] [data-message-content]').textContent = prompt;
-      });
-    </script>
-  </body>
-</html>`;
-}
-
-function buildFalsePositiveComposerHtml() {
+/**
+ * A native destination page: what ChatGPT or Claude shows at a new chat. It
+ * records every interaction, so the smoke can prove Aside never clicks the mode
+ * control, types, sends or presses Enter there. The Owner's own paste-and-send
+ * is simulated through an explicit helper, and only after Aside is done.
+ */
+function buildNativeChatHtml({ provider = 'chatgpt', title = 'Native chat' } = {}) {
+  const isClaude = provider === 'claude';
+  const modeButton = isClaude
+    ? '<button id="mode" type="button" aria-label="Start incognito chat" aria-pressed="false">👻</button>'
+    : '<button id="mode" type="button" aria-label="Temporary chat" aria-pressed="false">Temporary</button>';
+  const composer = isClaude
+    ? '<div id="composer" class="ProseMirror" contenteditable="true" role="textbox" aria-label="Write your prompt to Claude"></div>'
+    : '<textarea id="composer" name="prompt-textarea" placeholder="Ask anything"></textarea>';
   return `<!doctype html>
 <html>
-  <head><meta charset="utf-8"><title>Fake ChatGPT Failure</title>${LAYOUT_CHROME_CSS}</head>
+  <head><meta charset="utf-8"><title>${title}</title>${LAYOUT_CHROME_CSS}</head>
   <body data-sidebar="open">
     ${SIDEBAR_MARKUP}
-    <main><header>Fake header</header><div id="turns"></div></main>
-    <form id="composer-form">
-      <textarea id="prompt-textarea" placeholder="有问题，尽管问" name="prompt-textarea" aria-label="与 ChatGPT 聊天"></textarea>
-    </form>
+    <main>
+      <header>${modeButton}</header>
+      <div id="turns"></div>
+      <form id="composer-form">${composer}<button id="send" type="button" aria-label="Send">Send</button></form>
+    </main>
     <script>
-      const textarea = document.getElementById('prompt-textarea');
-      document.getElementById('composer-form').addEventListener('submit', (event) => {
-        event.preventDefault();
-        window.__syntheticSubmitTriggered = true;
+      const composer = document.getElementById('composer');
+      const read = () => (composer.tagName === 'TEXTAREA' ? composer.value : composer.innerText);
+      const write = (value) => { if (composer.tagName === 'TEXTAREA') { composer.value = value; } else { composer.textContent = value; } };
+      window.__native = {
+        url: location.href,
+        referrer: document.referrer,
+        modeClicks: 0,
+        sendClicks: 0,
+        composerInputs: 0,
+        keydowns: 0,
+        pastes: 0,
+        prompts: []
+      };
+      document.getElementById('mode').addEventListener('click', (event) => {
+        window.__native.modeClicks += 1;
+        const on = event.currentTarget.getAttribute('aria-pressed') !== 'true';
+        event.currentTarget.setAttribute('aria-pressed', on ? 'true' : 'false');
       });
-      textarea.addEventListener('keydown', (event) => {
-        if (event.key !== 'Enter') {
-          return;
-        }
-        event.preventDefault();
-        window.__enterFallbackTriggered = true;
-        textarea.value = '';
-        textarea.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+      composer.addEventListener('input', () => { window.__native.composerInputs += 1; });
+      composer.addEventListener('paste', () => { window.__native.pastes += 1; });
+      document.addEventListener('keydown', () => { window.__native.keydowns += 1; }, true);
+      document.getElementById('send').addEventListener('click', () => {
+        window.__native.sendClicks += 1;
+        const prompt = read();
+        if (!prompt.trim()) { return; }
+        window.__native.prompts.push(prompt);
+        write('');
+        const turn = document.createElement('article');
+        turn.setAttribute('data-message-author-role', 'assistant');
+        turn.innerHTML = '<div data-message-content><p>A native answer the Owner reads here.</p></div>';
+        document.getElementById('turns').append(turn);
       });
+      // The Owner, not Aside: switch the mode on, paste what they copied, send.
+      window.__ownerTurnOnMode = () => document.getElementById('mode').click();
+      window.__ownerPasteAndSend = (text) => { write(text); document.getElementById('send').click(); };
+      window.__fixtureReady = true;
     </script>
   </body>
 </html>`;
@@ -327,6 +159,42 @@ const SERVED_HOSTS = new Set(['chatgpt.com', 'chat.openai.com', 'claude.ai']);
  * entry: a default smoke must never touch a real provider.
  */
 const networkEscapes = [];
+
+/**
+ * Provider-host documents that were NOT served by the harness. A request that
+ * starts before interception attaches would load the real site; every served
+ * fixture marks its document, so an unmarked provider document is an escape.
+ */
+const unservedProviderPages = [];
+
+function watchForUnservedProviderPages(browser) {
+  browser.on('targetchanged', (target) => {
+    if (target.type() !== 'page') {
+      return;
+    }
+    let url;
+    try {
+      url = new URL(target.url());
+    } catch {
+      return;
+    }
+    if (!SERVED_HOSTS.has(url.hostname)) {
+      return;
+    }
+    void (async () => {
+      try {
+        const page = await target.page();
+        await sleep(1_500);
+        const served = await page.evaluate(() => document.documentElement.hasAttribute('data-aside-fixture'));
+        if (!served) {
+          unservedProviderPages.push(target.url());
+        }
+      } catch {
+        // Closed before it could be checked.
+      }
+    })();
+  });
+}
 
 function resolveRouteBody(hostname, pathname) {
   const hostRoutes = hostname === 'claude.ai' ? claudeRouteMap : routeMap;
@@ -361,16 +229,8 @@ async function fulfillPausedRequest(session, event) {
     return;
   }
 
-  const servedBody = resolveRouteBody(url.hostname, url.pathname);
+  const servedBody = resolveRouteBody(url.hostname, url.pathname).replace('<html', '<html data-aside-fixture');
   const headers = [{ name: 'Content-Type', value: 'text/html; charset=utf-8' }];
-
-  // Lets a scenario model a provider that refuses to be framed, so the fallback
-  // is proved by observation rather than asserted from an assumption about
-  // headers — which is exactly the assumption that turned out to be wrong.
-  if (refuseFramingForPaths.some((path) => url.pathname.startsWith(path))) {
-    headers.push({ name: 'X-Frame-Options', value: 'DENY' });
-    headers.push({ name: 'Content-Security-Policy', value: "frame-ancestors 'none'" });
-  }
 
   await session
     .send('Fetch.fulfillRequest', {
@@ -456,6 +316,9 @@ async function createSourcePage(browser, pathName) {
     waitUntil: 'domcontentloaded',
     timeout: 60_000
   });
+  // Aside confirms the page's role with its worker before it listens for
+  // selections; wait until it has mounted its host.
+  await page.waitForSelector('#aside-root', { timeout: 15_000 });
   return page;
 }
 
@@ -718,1354 +581,6 @@ function isDarkRgb(backgroundColor) {
   return red < 80 && green < 90 && blue < 110;
 }
 
-async function waitForBranchFrame(page, timeoutMs = 30_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const iframeHandle = await page.$('.aside-panel:not([hidden]) .aside-frame');
-    const frame = await iframeHandle?.contentFrame();
-    if (frame) {
-      return frame;
-    }
-    await sleep(200);
-  }
-
-  throw new Error('The embedded ChatGPT branch frame did not appear.');
-}
-
-async function dumpPanelState(page, label) {
-  try {
-    const state = await page.evaluate(() => {
-      const panel = document.querySelector('.aside-panel:not([hidden])');
-      return {
-        status: panel?.querySelector('.aside-panel-heading p')?.textContent ?? null,
-        error: panel?.querySelector('.aside-error-copy')?.textContent ?? null,
-        submitDisabled: panel?.querySelector('button[type="submit"]')?.disabled ?? null,
-        contextSize: panel?.querySelector('.aside-context-size')?.textContent ?? null,
-        overBudget: panel?.querySelector('.aside-context-size')?.getAttribute('data-over-budget') ?? null
-      };
-    });
-    console.error(`PANEL[${label}]`, JSON.stringify(state));
-  } catch (error) {
-    console.error(`PANEL[${label}] unavailable`, error instanceof Error ? error.message : error);
-  }
-}
-
-async function waitForPanelStatus(page, matcher, timeoutMs = 30_000) {
-  try {
-    await page.waitForFunction(
-      (patternSource) => {
-        const panel = document.querySelector('.aside-panel:not([hidden])');
-        const status = panel?.querySelector('.aside-panel-heading p');
-        if (!(status instanceof HTMLElement)) {
-          return false;
-        }
-        return new RegExp(patternSource).test(status.textContent || '');
-      },
-      { timeout: timeoutMs },
-      matcher.source
-    );
-  } catch (error) {
-    await dumpPanelState(page, 'status-timeout');
-    throw error;
-  }
-}
-
-async function waitForPanelTitle(page, title, timeoutMs = 15_000) {
-  await page.waitForFunction(
-    (expectedTitle) =>
-      document.querySelector('.aside-panel:not([hidden]) h2')?.textContent?.trim() === expectedTitle,
-    { timeout: timeoutMs },
-    title
-  );
-}
-
-async function clickPanelAction(page, label) {
-  await page.evaluate((buttonLabel) => {
-    const panel = document.querySelector('.aside-panel:not([hidden])');
-    const button = Array.from(panel?.querySelectorAll('.aside-panel-actions button') ?? []).find((candidate) =>
-      candidate.textContent?.trim() === buttonLabel
-    );
-    if (!(button instanceof HTMLElement)) {
-      throw new Error(`Panel action not found: ${buttonLabel}`);
-    }
-    button.click();
-  }, label);
-}
-
-// Selected by role, not by label: the private mode's visible name is the
-// provider's own ("Temporary Chat" on ChatGPT, "Incognito chat" on Claude).
-async function setPanelBranchKind(page, kind) {
-  await page.evaluate((branchKind) => {
-    const panel = document.querySelector('.aside-panel:not([hidden])');
-    const button = panel?.querySelector(`.aside-kind-toggle button[data-aside-role="branch-kind-${branchKind}"]`);
-    if (!(button instanceof HTMLButtonElement)) {
-      throw new Error(`Branch kind button not found: ${branchKind}`);
-    }
-    button.click();
-  }, kind);
-}
-
-async function openDraft(page) {
-  await selectAssistantText(page);
-  await page.waitForFunction(() => {
-    const toolbar = document.querySelector('#aside-selection-toolbar');
-    return toolbar instanceof HTMLElement && !toolbar.hidden;
-  });
-  await page.evaluate(() => {
-    const button = document.querySelector('#aside-ask-button');
-    if (!(button instanceof HTMLButtonElement)) {
-      throw new Error('Ask button is not visible');
-    }
-    button.click();
-  });
-  await page.waitForSelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', { timeout: 10_000 });
-}
-
-async function clickSelectionAction(page, selector) {
-  await page.evaluate((actionSelector) => {
-    const button = document.querySelector(actionSelector);
-    if (!(button instanceof HTMLButtonElement)) {
-      throw new Error(`Selection action not found: ${actionSelector}`);
-    }
-    button.click();
-  }, selector);
-}
-
-async function openDraftAndSubmit(page, question) {
-  await openDraft(page);
-  await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', question);
-  const pageCountBefore = (await page.browser().pages()).length;
-  await page.evaluate(() => {
-    const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
-    if (!(button instanceof HTMLButtonElement)) {
-      throw new Error('Panel submit button not found');
-    }
-    button.click();
-  });
-  const branchFrame = await waitForBranchFrame(page);
-  return { branchFrame, pageCountBefore };
-}
-
-async function runNonProjectScenario(browser) {
-  routeMap = {
-    '/c/source-local': buildSourceHtml({ dark: true }),
-    '/': buildSuccessComposerHtml({
-      conversationPath: '/c/generated-local',
-      dark: true,
-      includeDecoyComposer: true,
-      includeConfusingAction: true,
-      includeTemporaryChatToggle: true,
-      realComposerId: '',
-      realSendMode: 'none',
-      sendInShadowRoot: true
-    })
-  };
-
-  const page = await createSourcePage(browser, '/c/source-local');
-
-  try {
-    await selectAssistantText(page);
-    await page.waitForSelector('#aside-selection-toolbar', { timeout: 10_000 });
-    await page.waitForFunction(() => {
-      const toolbar = document.querySelector('#aside-selection-toolbar');
-      return toolbar instanceof HTMLElement && !toolbar.hidden;
-    });
-    // The live case: the popup is centred above the selection, exactly where Aside
-    // wants to be, and carries nothing any selector was written for.
-    await injectNativeAskButton(page, {
-      placement: 'above',
-      variant: 'bare',
-      shape: 'nested'
-    });
-    await sleep(500);
-    const askOcclusion = await readAsideOcclusion(page);
-    const nativeOcclusion = await readNativePopupOcclusion(page);
-
-    const askState = await page.evaluate(() => {
-      const buttons = Array.from(
-        document.querySelectorAll('#aside-selection-toolbar button')
-      ).filter((button) => {
-        const rect = button.getBoundingClientRect();
-        const style = getComputedStyle(button);
-        return (
-          rect.width > 0 &&
-          rect.height > 0 &&
-          style.display !== 'none' &&
-          style.visibility !== 'hidden' &&
-          Number(style.opacity || '1') > 0.01
-        );
-      });
-      const nativeAsk = document.querySelector('button[aria-label="Ask ChatGPT"]');
-      const nativeStyle = nativeAsk instanceof HTMLElement ? getComputedStyle(nativeAsk) : null;
-      const nativeRect = nativeAsk?.getBoundingClientRect();
-      // Only when the toolbar is actually showing. A hidden toolbar has a zero rect
-      // that overlaps nothing, so reading it unconditionally let "collapsed to the
-      // launcher" and "placed clear of the native pill" share one green signal.
-      const toolbarEl = document.querySelector('#aside-selection-toolbar');
-      const toolbarShown = toolbarEl instanceof HTMLElement && !toolbarEl.hidden;
-      const toolbarRect = toolbarShown ? toolbarEl.getBoundingClientRect() : null;
-
-      // The provider's own action must stay fully usable, and Aside must sit beside
-      // it rather than on top of it.
-      const nativeAskUsable = Boolean(
-        nativeAsk instanceof HTMLElement &&
-          nativeStyle &&
-          nativeStyle.display !== 'none' &&
-          nativeStyle.visibility !== 'hidden' &&
-          Number(nativeStyle.opacity || '1') > 0.01 &&
-          nativeStyle.pointerEvents !== 'none' &&
-          !nativeAsk.hasAttribute('disabled') &&
-          nativeAsk.getAttribute('aria-hidden') !== 'true' &&
-          (nativeRect?.width ?? 0) > 0 &&
-          (nativeRect?.height ?? 0) > 0
-      );
-
-      // What the user's click would actually reach at the native button's centre.
-      const hitTarget =
-        nativeRect && nativeRect.width > 0
-          ? document.elementFromPoint(
-              nativeRect.left + nativeRect.width / 2,
-              nativeRect.top + nativeRect.height / 2
-            )
-          : null;
-
-      return {
-        visibleActions: buttons.map((button) => button.textContent?.trim() ?? ''),
-        toolbarIsLabelledAside:
-          document.querySelector('#aside-selection-toolbar')?.getAttribute('aria-label') ??
-          null,
-        nativeAskUsable,
-        toolbarShown,
-        nativeAskHitTargetIsNative: hitTarget === nativeAsk || Boolean(nativeAsk?.contains(hitTarget)),
-        nativeAskClassList: nativeAsk instanceof HTMLElement ? nativeAsk.className : null,
-        asideOverlapsNativeAsk: Boolean(
-          nativeRect &&
-            toolbarRect &&
-            nativeRect.left < toolbarRect.right &&
-            nativeRect.right > toolbarRect.left &&
-            nativeRect.top < toolbarRect.bottom &&
-            nativeRect.bottom > toolbarRect.top
-        )
-      };
-    });
-
-    await clickSelectionAction(page, '#aside-ask-button');
-    await page.waitForSelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', { timeout: 10_000 });
-
-    // The Context section must show exactly what will be submitted. The question
-    // that produced the source answer is included by default and can be unticked.
-    const contextBefore = await page.evaluate(() => {
-      const panel = document.querySelector('.aside-panel:not([hidden])');
-      const rows = Array.from(panel?.querySelectorAll('.aside-context-block') ?? []);
-      return {
-        preview: panel?.querySelector('.aside-context-preview')?.textContent ?? '',
-        source: panel?.querySelector('.aside-context-source')?.textContent ?? '',
-        blockLabels: rows.map((row) => row.querySelector('span')?.textContent ?? ''),
-        precedingIncluded: rows
-          .filter((row) => row.textContent?.includes('question that produced'))
-          .map((row) => row.querySelector('input')?.checked ?? null)
-      };
-    });
-
-    // Untick the preceding question and confirm it leaves the preview.
-    await page.evaluate(() => {
-      const row = Array.from(
-        document.querySelectorAll('.aside-panel:not([hidden]) .aside-context-block')
-      ).find((candidate) => candidate.textContent?.includes('question that produced'));
-      row?.querySelector('input')?.click();
-    });
-    const contextAfterOptIn = await page.evaluate(
-      () =>
-        document.querySelector('.aside-panel:not([hidden]) .aside-context-preview')?.textContent ?? ''
-    );
-    // Put it back: the rest of the scenario asserts the default context.
-    await page.evaluate(() => {
-      const row = Array.from(
-        document.querySelectorAll('.aside-panel:not([hidden]) .aside-context-block')
-      ).find((candidate) => candidate.textContent?.includes('question that produced'));
-      row?.querySelector('input')?.click();
-    });
-
-    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
-    // Captured after the question is typed: the preview is the complete prompt,
-    // instructions and question included, and must equal what is submitted.
-    const contextPreview = await page.evaluate(
-      () =>
-        document.querySelector('.aside-panel:not([hidden]) .aside-context-preview')?.textContent ?? ''
-    );
-
-    const darkThemeState = await page.evaluate(() => ({
-      theme: document.documentElement.dataset.asideTheme ?? null,
-      panelBackground: getComputedStyle(document.querySelector('.aside-panel:not([hidden])')).backgroundColor
-    }));
-
-    const pageCountBefore = (await browser.pages()).length;
-    await page.evaluate(() => {
-      const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
-      if (!(button instanceof HTMLButtonElement)) {
-        throw new Error('Panel submit button not found');
-      }
-      button.click();
-    });
-    const branchFrame = await waitForBranchFrame(page);
-    await waitForPanelStatus(page, /Branch answer is ready in this window\./);
-    // Titles are local: derived from the question, never from the model.
-    await waitForPanelTitle(page, 'Why this assumption?');
-
-    // The answer is read back from the branch conversation and shown, read-only,
-    // in the panel — and its capture state is stated, not assumed.
-    // Wait for the capture to SETTLE: the watcher promotes a message to complete
-    // only after a second identical read with no generating evidence, so a
-    // "partial" sample a moment earlier is expected, not a failure.
-    await page.waitForFunction(
-      () =>
-        Array.from(
-          document.querySelectorAll('.aside-panel:not([hidden]) .aside-archive-message[data-role="assistant"]')
-        ).some(
-          (node) =>
-            node.textContent?.includes('This uses only the selected passage.') &&
-            node.getAttribute('data-partial') === 'false'
-        ),
-      { timeout: 25_000 }
-    );
-    const nonProjectPanelId = await page.evaluate(
-      () => document.querySelector('.aside-panel:not([hidden])')?.getAttribute('data-panel-id') ?? null
-    );
-    const nonProjectQuestionId = nonProjectPanelId
-      ? JSON.parse((await readExtensionStorage(browser)).local)[`aside:panel:${nonProjectPanelId}`]?.state?.questionId ?? null
-      : null;
-    const captureState = await page.evaluate(() => ({
-      archiveStatus:
-        document.querySelector('.aside-panel:not([hidden]) .aside-archive-status')?.textContent ?? null,
-      assistantPartial:
-        document
-          .querySelector('.aside-panel:not([hidden]) .aside-archive-message[data-role="assistant"]')
-          ?.getAttribute('data-partial') ?? null,
-      dialogs: []
-    }));
-
-    const pageCountAfter = (await browser.pages()).length;
-    const liveResult = await Promise.all([
-      page.evaluate(() => ({
-        status:
-          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
-          null,
-        title: document.querySelector('.aside-panel:not([hidden]) h2')?.textContent ?? null,
-        openBranchVisible: Array.from(
-          document.querySelectorAll('.aside-panel:not([hidden]) .aside-panel-actions button')
-        ).some((button) => button.textContent?.trim() === 'Open branch' && getComputedStyle(button).display !== 'none')
-      })),
-      branchFrame.evaluate(() => ({
-        branchLocation: window.location.href,
-        prompt: window.__lastPrompt ?? null,
-        assistantText:
-          document.querySelector('[data-message-author-role="assistant"] [data-message-content]')?.textContent ?? null
-      }))
-    ]).then(([source, branch]) => ({
-      ...source,
-      ...branch,
-      pageCountBefore,
-      pageCountAfter,
-      captureState,
-      questionId: nonProjectQuestionId,
-      promptContainsSelectedPassage: Boolean(
-        branch.prompt?.includes('convexity assumption guarantees the relaxation stays tight')
-      ),
-      promptContainsLocalSourceAnswer: Boolean(
-        branch.prompt?.includes('The convexity assumption guarantees the relaxation stays tight')
-      ),
-      contextPreviewMatchesPrompt: Boolean(contextPreview && branch.prompt === contextPreview),
-      contextSource: contextBefore.source,
-      precedingQuestionOffered: contextBefore.blockLabels.some((label) =>
-        label.includes('preceding question')
-      ),
-      // The question that produced the source answer is part of the default
-      // plan now; unticking it removes it from the preview.
-      precedingQuestionDefaultOn: contextBefore.precedingIncluded.every((checked) => checked === true),
-      precedingQuestionPresentByDefault: contextBefore.preview.includes('Tell me about convexity'),
-      precedingQuestionGoneWhenUnticked: !contextAfterOptIn.includes('Tell me about convexity')
-    }));
-
-    await clickPanelAction(page, 'Minimize');
-    await page.waitForFunction(() => Boolean(document.querySelector('#aside-tabbar:not([hidden])')), {
-      timeout: 10_000
-    });
-
-    const minimizedState = await page.evaluate(() => {
-      const tabBar = document.querySelector('#aside-tabbar');
-      const tab = document.querySelector('.aside-tab');
-      const panel = document.querySelector('.aside-panel');
-      const tabBarRect = tabBar?.getBoundingClientRect();
-      const tabRect = tab?.getBoundingClientRect();
-      const tabBarStyle = tabBar ? getComputedStyle(tabBar) : null;
-      const sidebarRect = document.querySelector('nav[aria-label]')?.getBoundingClientRect();
-      const columnRect = document.querySelector('main article, main #turns')?.getBoundingClientRect();
-      const overlaps = (a, b) =>
-        Boolean(a && b) && a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
-      return {
-        placement: tabBar?.getAttribute('data-placement'),
-        tabBarLeft: tabBarRect ? Math.round(tabBarRect.left) : null,
-        sidebarRight: sidebarRect ? Math.round(sidebarRect.right) : null,
-        readingColumnLeft: columnRect ? Math.round(columnRect.left) : null,
-        overlapsSidebar: overlaps(tabBarRect, sidebarRect),
-        overlapsReadingColumn: overlaps(tabBarRect, columnRect),
-        // The hit target the user actually clicks must be inside the rail.
-        tabHitInsideRail: Boolean(
-          tabBarRect && tabRect && tabRect.left >= tabBarRect.left - 1 && tabRect.right <= tabBarRect.right + 1
-        ),
-        flexDirection: tabBar ? getComputedStyle(tabBar).flexDirection : null,
-        tabVisible: Boolean(tab),
-        panelHidden: panel instanceof HTMLElement ? panel.hidden : null,
-        tabBarWidth: tabBarRect ? Math.round(tabBarRect.width) : null,
-        tabWidth: tabRect ? Math.round(tabRect.width) : null,
-        tabBarRight: tabBarRect ? Math.round(tabBarRect.right - window.innerWidth) : null,
-        tabBarComputedRight: tabBarStyle?.right ?? null
-      };
-    });
-
-    await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded' });
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForFunction(() => Boolean(document.querySelector('#aside-tabbar:not([hidden])')), {
-      timeout: 10_000
-    });
-
-    const homeRestoreState = await page.evaluate(() => {
-      const tabBar = document.querySelector('#aside-tabbar');
-      const tab = document.querySelector('.aside-tab');
-      const panel = document.querySelector('.aside-panel');
-      const tabBarRect = tabBar?.getBoundingClientRect();
-      const tabRect = tab?.getBoundingClientRect();
-      const sidebarRect = document.querySelector('nav[aria-label]')?.getBoundingClientRect();
-      const columnRect = document
-        .querySelector('main article, main #turns, main #composer-form')
-        ?.getBoundingClientRect();
-      const overlaps = (a, b) =>
-        Boolean(a && b) && a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
-      return {
-        location: window.location.href,
-        placement: tabBar?.getAttribute('data-placement'),
-        tabVisible: Boolean(tab),
-        panelHidden: panel instanceof HTMLElement ? panel.hidden : null,
-        tabBarWidth: tabBarRect ? Math.round(tabBarRect.width) : null,
-        tabWidth: tabRect ? Math.round(tabRect.width) : null,
-        tabBarLeft: tabBarRect ? Math.round(tabBarRect.left) : null,
-        overlapsSidebar: overlaps(tabBarRect, sidebarRect),
-        overlapsReadingColumn: overlaps(tabBarRect, columnRect)
-      };
-    });
-
-    return {
-      askState,
-      askOcclusion,
-      nativeOcclusion,
-      darkThemeState,
-      liveResult,
-      minimizedState,
-      homeRestoreState
-    };
-  } finally {
-    await page.close();
-  }
-}
-
-async function runWhyScenario(browser) {
-  routeMap = {
-    '/c/source-why': buildSourceHtml(),
-    '/': buildSuccessComposerHtml({
-      conversationPath: '/c/generated-why',
-      conversationUrlMode: 'after-first-submit',
-      conversationUrlStorageKey: '__asideWhySubmitCount'
-    })
-  };
-
-  const page = await createSourcePage(browser, '/c/source-why');
-
-  try {
-    await selectAssistantText(page);
-    await page.waitForSelector('#aside-selection-toolbar', { timeout: 10_000 });
-    await page.waitForFunction(() => {
-      const toolbar = document.querySelector('#aside-selection-toolbar');
-      return toolbar instanceof HTMLElement && !toolbar.hidden;
-    });
-    const existingPages = await browser.pages();
-    await clickSelectionAction(page, '#aside-why-button');
-    let newPage;
-    try {
-      newPage = await waitForAdditionalPage(browser, existingPages, 45_000);
-    } catch (error) {
-      const sourceDebug = await page.evaluate(() => ({
-        status:
-          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
-          null,
-        error:
-          document.querySelector('.aside-panel:not([hidden]) .aside-error-copy')?.textContent ??
-          null,
-        title: document.querySelector('.aside-panel:not([hidden]) h2')?.textContent ?? null,
-        openBranchVisible: Array.from(
-          document.querySelectorAll('.aside-panel:not([hidden]) .aside-panel-actions button')
-        ).some((button) => button.textContent?.trim() === 'Open branch' && getComputedStyle(button).display !== 'none'),
-        debugTextarea:
-          document.querySelector('.aside-panel:not([hidden]) .aside-debug-log textarea')
-            ?.value ?? null
-      }));
-      throw new Error(
-        `Why recovery did not open a native page: ${JSON.stringify(sourceDebug)} :: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
-    }
-    try {
-      await newPage.waitForFunction(() => window.location.href.includes('/c/generated-why'), {
-        timeout: 45_000
-      });
-    } catch (error) {
-      await page.evaluate(() => {
-        const button = Array.from(
-          document.querySelectorAll('.aside-panel:not([hidden]) .aside-panel-actions button')
-        ).find((candidate) => candidate.textContent?.trim() === 'Copy log');
-        if (button instanceof HTMLButtonElement) {
-          button.click();
-        }
-      });
-      const sourceDebug = await page.evaluate(() => ({
-        status:
-          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
-          null,
-        error:
-          document.querySelector('.aside-panel:not([hidden]) .aside-error-copy')?.textContent ??
-          null,
-        title: document.querySelector('.aside-panel:not([hidden]) h2')?.textContent ?? null,
-        openBranchVisible: Array.from(
-          document.querySelectorAll('.aside-panel:not([hidden]) .aside-panel-actions button')
-        ).some((button) => button.textContent?.trim() === 'Open branch' && getComputedStyle(button).display !== 'none'),
-        debugTextarea:
-          document.querySelector('.aside-panel:not([hidden]) .aside-debug-log textarea')
-            ?.value ?? null
-      }));
-      const copiedLog = await page
-        .evaluate(async () => {
-          try {
-            return await navigator.clipboard.readText();
-          } catch {
-            return null;
-          }
-        })
-        .catch(() => null);
-      const newPageDebug = await newPage.evaluate(() => ({
-        location: window.location.href,
-        assistantText:
-          document.querySelector('[data-message-author-role="assistant"] [data-message-content]')?.textContent ?? null,
-        userPrompt:
-          document.querySelector('[data-message-author-role="user"] [data-message-content]')?.textContent ?? null,
-        composerVisible: Boolean(
-          document.querySelector('#prompt-textarea') ??
-            document.querySelector('textarea[name="prompt-textarea"]')
-        )
-      }));
-      throw new Error(
-        `Why recovery native page did not become persistent: ${JSON.stringify({
-          sourceDebug,
-          newPageDebug,
-          copiedLog
-        })} :: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-    await waitForPanelStatus(page, /ready in its ChatGPT window/i, 30_000);
-
-    return await Promise.all([
-      page.evaluate(() => ({
-        status:
-          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
-          null,
-        formVisible:
-          getComputedStyle(document.querySelector('.aside-panel:not([hidden]) form')).display !== 'none',
-        openBranchVisible: Array.from(
-          document.querySelectorAll('.aside-panel:not([hidden]) .aside-panel-actions button')
-        ).some((button) => button.textContent?.trim() === 'Open branch' && getComputedStyle(button).display !== 'none')
-      })),
-      newPage.evaluate(() => ({
-        branchLocation: window.location.href,
-        prompt: window.__lastPrompt ?? null,
-        assistantText:
-          document.querySelector('[data-message-author-role="assistant"] [data-message-content]')?.textContent ?? null
-      }))
-    ]).then(([source, branch]) => ({ ...source, ...branch }));
-  } finally {
-    const pages = await browser.pages();
-    const extraPages = pages.filter((candidate) => candidate !== page);
-    await Promise.all(extraPages.map((candidate) => candidate.close().catch(() => {})));
-    await page.close();
-  }
-}
-
-async function runNewTabScenario(browser) {
-  routeMap = {
-    '/c/source-new-tab': buildSourceHtml(),
-    '/': buildSuccessComposerHtml({
-      conversationPath: '/c/generated-new-window',
-      assistantReplyText: 'This answers the question in its own window.'
-    })
-  };
-
-  const page = await createSourcePage(browser, '/c/source-new-tab');
-
-  try {
-    await selectAssistantText(page);
-    await page.waitForSelector('#aside-selection-toolbar', { timeout: 10_000 });
-    const existingPages = await browser.pages();
-    await clickSelectionAction(page, '#aside-new-tab-button');
-    // New-tab opens a draft: nothing is sent merely because the button was
-    // pressed. The real question is typed and sent once, in its own window.
-    await page.waitForSelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', { timeout: 10_000 });
-    const pageCountAfterClick = (await browser.pages()).length;
-    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
-    await page.evaluate(() => {
-      document.querySelector('.aside-panel:not([hidden]) button[type="submit"]')?.click();
-    });
-    const newPage = await waitForAdditionalPage(browser, existingPages);
-    await newPage.waitForFunction(() => window.location.href.includes('/c/generated-new-window'), {
-      timeout: 45_000
-    });
-    // The composer is focused asynchronously once the branch reports live, so wait for
-    // that instead of sampling document.activeElement at an arbitrary moment.
-    await newPage.waitForFunction(
-      () => {
-        const composer =
-          document.querySelector('#prompt-textarea') ??
-          document.querySelector('textarea[name="prompt-textarea"]');
-        return composer instanceof HTMLElement && document.activeElement === composer;
-      },
-      { timeout: 20_000 }
-    );
-
-    return await Promise.all([
-      page.evaluate(() => ({
-        sourceLocation: window.location.href,
-        panelVisible: Boolean(document.querySelector('.aside-panel:not([hidden])')),
-        panelStatus:
-          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ?? null
-      })),
-      newPage.evaluate(() => {
-        const composer =
-          document.querySelector('#prompt-textarea') ??
-          document.querySelector('textarea[name="prompt-textarea"]');
-        return {
-          location: window.location.href,
-          branchPanelVisible: Boolean(document.querySelector('.aside-panel:not([hidden])')),
-          userPrompt:
-            document.querySelector('[data-message-author-role="user"] [data-message-content]')?.textContent ?? null,
-          assistantText:
-            document.querySelector('[data-message-author-role="assistant"] [data-message-content]')?.textContent ?? null,
-          composerVisible: composer instanceof HTMLElement,
-          composerFocused: document.activeElement === composer
-        };
-      })
-    ]).then(([source, branch]) => ({ ...source, ...branch, noWindowBeforeQuestion: pageCountAfterClick === existingPages.length }));
-  } finally {
-    const pages = await browser.pages();
-    const extraPages = pages.filter((candidate) => candidate !== page);
-    await Promise.all(extraPages.map((candidate) => candidate.close().catch(() => {})));
-    await page.close();
-  }
-}
-
-async function runEnterOnlyScenario(browser) {
-  routeMap = {
-    '/c/source-enter-only': buildSourceHtml(),
-    '/': buildSuccessComposerHtml({
-      conversationPath: '/c/generated-enter-only',
-      realComposerId: '',
-      realSendMode: 'none',
-      enterOnlySubmit: true
-    })
-  };
-
-  const page = await createSourcePage(browser, '/c/source-enter-only');
-
-  try {
-    const { branchFrame } = await openDraftAndSubmit(page, 'Why this assumption?');
-    await waitForPanelStatus(page, /Branch answer is ready in this window\./);
-
-    return await Promise.all([
-      page.evaluate(() => ({
-        status:
-          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
-          null
-      })),
-      branchFrame.evaluate(() => ({
-        branchLocation: window.location.href,
-        prompt: window.__lastPrompt ?? null
-      }))
-    ]).then(([source, branch]) => ({ ...source, ...branch }));
-  } finally {
-    await page.close();
-  }
-}
-
-async function runTemporaryChatUnconfirmedScenario(browser) {
-  // The toggle flips internally but never reflects an active state in the DOM, so
-  // Aside cannot positively verify privacy. Nothing may be typed or sent.
-  routeMap = {
-    '/c/source-temp-recovery': buildSourceHtml(),
-    '/': buildSuccessComposerHtml({
-      conversationPath: '/c/generated-temp-recovery',
-      includeTemporaryChatToggle: true,
-      temporaryChatInitiallyActive: false,
-      temporaryChatDisableable: true,
-      temporaryChatActivationStyle: 'silent',
-      temporaryModeSkipsConversationUrl: true,
-      realComposerId: ''
-    })
-  };
-
-  const page = await createSourcePage(browser, '/c/source-temp-recovery');
-
-  try {
-    await openDraft(page);
-    await setPanelBranchKind(page, 'temporary');
-    // Evidence for the owner checklist: the ChatGPT panel with its Context
-    // section and ChatGPT's own name for the private mode.
-    await page.evaluate(() => {
-      const note = document.querySelector('.aside-panel:not([hidden]) .aside-privacy-note');
-      if (note instanceof HTMLDetailsElement) {
-        note.open = true;
-      }
-      const context = document.querySelector('.aside-panel:not([hidden]) .aside-context details');
-      if (context instanceof HTMLDetailsElement) {
-        context.open = true;
-      }
-    });
-    await sleep(150);
-    await capture(page, 'panel-chatgpt-context-and-privacy');
-    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
-    await page.evaluate(() => {
-      const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
-      if (!(button instanceof HTMLButtonElement)) {
-        throw new Error('Panel submit button not found');
-      }
-      button.click();
-    });
-    const branchFrame = await waitForBranchFrame(page);
-    await waitForPanelStatus(page, /This branch was not sent\./);
-    await capture(page, 'panel-chatgpt-private-not-verified');
-
-    const failed = await Promise.all([
-      page.evaluate(() => ({
-        status:
-          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
-          null,
-        errorText:
-          document.querySelector('.aside-panel:not([hidden]) .aside-error-copy')?.textContent ??
-          null,
-        // The question must survive so the user can retry or switch mode.
-        questionPreserved:
-          document.querySelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]')?.value ?? null,
-        formVisible:
-          getComputedStyle(document.querySelector('.aside-panel:not([hidden]) form')).display !==
-          'none'
-      })),
-      branchFrame.evaluate(() => {
-        const composer = document.querySelector('#composer-form textarea');
-        return {
-          branchLocation: window.location.href,
-          temporaryChatToggleClicks: window.__temporaryChatToggleClicks ?? 0,
-          // The two facts that matter: nothing was typed, nothing was submitted.
-          composerValue: composer instanceof HTMLTextAreaElement ? composer.value : null,
-          lastPrompt: window.__lastPrompt ?? null,
-          turnsRendered: document.querySelectorAll('#turns [data-message-author-role]').length
-        };
-      })
-    ]).then(([source, branch]) => ({ ...source, ...branch }));
-
-    const failedLayout = await readFailedPanelLayout(page);
-    // Show branch window reveals the same frame; it was hidden, not destroyed.
-    await page.evaluate(() => {
-      document
-        .querySelector('.aside-panel:not([hidden]) button[data-aside-role="recovery-show-target"]')
-        ?.click();
-    });
-    const shellVisibleAfterShow = await page.evaluate(() => {
-      const shell = document.querySelector('.aside-panel:not([hidden]) .aside-frame-shell');
-      return shell instanceof HTMLElement && !shell.hidden && getComputedStyle(shell).display !== 'none';
-    });
-
-    // The owner turns the mode on in the branch window by hand, then asks Aside to
-    // look again. The same document must be checked and the prompt sent there once.
-    await branchFrame.evaluate(() => {
-      window.__docToken = 'unconfirmed-doc';
-      window.__forceTemporaryChatState(true);
-    });
-    await page.evaluate(() => {
-      document
-        .querySelector('.aside-panel:not([hidden]) button[data-aside-role="recovery-check-again"]')
-        ?.click();
-    });
-    await waitForPanelStatus(page, /Branch answer is ready in this window\./);
-    const recheck = await branchFrame.evaluate(() => ({
-      docToken: window.__docToken ?? null,
-      submitCount: window.__submitCount ?? 0,
-      lastPrompt: window.__lastPrompt ?? null,
-      location: window.location.href,
-      temporaryChatToggleClicks: window.__temporaryChatToggleClicks ?? 0
-    }));
-    recheck.status = await page.evaluate(
-      () =>
-        document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
-        null
-    );
-
-    return { ...failed, failedLayout: { ...failedLayout, shellVisibleAfterShow }, recheck };
-  } finally {
-    await page.close();
-  }
-}
-
-/** The failed-state layout the owner's screenshots objected to, measured. */
-async function readFailedPanelLayout(page) {
-  return page.evaluate(() => {
-    const panel = document.querySelector('.aside-panel:not([hidden])');
-    const shell = panel?.querySelector('.aside-frame-shell');
-    const errors = Array.from(panel?.querySelectorAll('.aside-error-copy') ?? []).filter((element) =>
-      (element.textContent || '').trim()
-    );
-    const visibleHeaderButtons = Array.from(panel?.querySelectorAll('.aside-panel-actions > button') ?? [])
-      .filter((button) => getComputedStyle(button).display !== 'none')
-      .map((button) => button.textContent?.trim());
-    const more = panel?.querySelector('details.aside-panel-more');
-    const moreButtons = Array.from(more?.querySelectorAll('button') ?? []).map((button) =>
-      button.textContent?.trim()
-    );
-    const recovery = panel?.querySelector('.aside-recovery');
-    const recoveryButtons = Array.from(recovery?.querySelectorAll(':scope > .aside-recovery-actions button') ?? [])
-      .filter((button) => !button.hidden && getComputedStyle(button).display !== 'none')
-      .map((button) => button.textContent?.trim());
-    const note = panel?.querySelector('.aside-privacy-note');
-    const text = panel?.innerText ?? '';
-    return {
-      frameShellHidden:
-        shell instanceof HTMLElement && (shell.hidden || getComputedStyle(shell).display === 'none'),
-      errorCount: errors.length,
-      errorTextOccurrences: errors.length
-        ? (text.match(new RegExp(errors[0].textContent.trim().slice(0, 40).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || [])
-            .length
-        : 0,
-      visibleHeaderButtons,
-      moreButtons,
-      moreOpen: more instanceof HTMLDetailsElement ? more.open : null,
-      recoveryVisible: recovery instanceof HTMLElement && !recovery.hidden,
-      recoveryButtons,
-      privacyNoteOpen: note instanceof HTMLDetailsElement ? note.open : null,
-      projectWarningCount: (text.match(/project/gi) || []).length
-    };
-  });
-}
-
-async function runTemporaryChatVerifiedScenario(browser) {
-  // The happy path: the toggle reports active, so the branch proceeds and stays
-  // out of persistent history.
-  routeMap = {
-    '/c/source-temp-ok': buildSourceHtml(),
-    '/': buildSuccessComposerHtml({
-      conversationPath: '/c/generated-temp-ok',
-      includeTemporaryChatToggle: true,
-      temporaryChatInitiallyActive: false,
-      temporaryChatDisableable: true,
-      temporaryChatActivationStyle: 'visible',
-      temporaryModeSkipsConversationUrl: true,
-      realComposerId: ''
-    })
-  };
-
-  const page = await createSourcePage(browser, '/c/source-temp-ok');
-
-  try {
-    await openDraft(page);
-    await setPanelBranchKind(page, 'temporary');
-    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', PRIVATE_PROBE_QUESTION);
-    await page.evaluate(() => {
-      const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
-      if (!(button instanceof HTMLButtonElement)) {
-        throw new Error('Panel submit button not found');
-      }
-      button.click();
-    });
-    const branchFrame = await waitForBranchFrame(page);
-    await waitForPanelStatus(page, /Branch answer is ready in this window\./);
-
-    const storage = await readExtensionStorage(browser);
-
-    return await Promise.all([
-      page.evaluate(() => ({
-        status:
-          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
-          null
-      })),
-      branchFrame.evaluate(() => {
-        const toggle = document.getElementById('temporary-chat-toggle');
-        return {
-          branchLocation: window.location.href,
-          temporaryChatToggleClicks: window.__temporaryChatToggleClicks ?? 0,
-          temporaryChatModeActive: window.__temporaryChatModeActive ?? false,
-          temporaryChatState: toggle?.getAttribute('aria-pressed') ?? null,
-          lastPrompt: window.__lastPrompt ?? null
-        };
-      })
-    ]).then(([source, branch]) => ({
-      ...source,
-      ...branch,
-      // The question text must be findable in session storage and absent from local.
-      privateTextInLocalStorage: storage.local.includes(PRIVATE_PROBE_QUESTION),
-      privateTextInSessionStorage: storage.session.includes(PRIVATE_PROBE_QUESTION)
-    }));
-  } finally {
-    await page.close();
-  }
-}
-
-async function runTemporaryChatBlockedScenario(browser) {
-  routeMap = {
-    '/c/source-temp-blocked': buildSourceHtml(),
-    '/': buildSuccessComposerHtml({
-      conversationPath: '/c/generated-temp-blocked',
-      includeTemporaryChatToggle: true,
-      temporaryChatInitiallyActive: false,
-      temporaryChatEnableable: false,
-      realComposerId: ''
-    })
-  };
-
-  const page = await createSourcePage(browser, '/c/source-temp-blocked');
-
-  try {
-    await openDraft(page);
-    await setPanelBranchKind(page, 'temporary');
-    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
-    await page.evaluate(() => {
-      const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
-      if (!(button instanceof HTMLButtonElement)) {
-        throw new Error('Panel submit button not found');
-      }
-      button.click();
-    });
-    const branchFrame = await waitForBranchFrame(page);
-    await waitForPanelStatus(page, /This branch was not sent\./);
-
-    const blocked = await Promise.all([
-      page.evaluate(() => ({
-        status:
-          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
-          null,
-        errorText:
-          document.querySelector('.aside-panel:not([hidden]) .aside-error-copy')?.textContent ??
-          null,
-        openBranchVisible: Array.from(
-          document.querySelectorAll('.aside-panel:not([hidden]) .aside-panel-actions button')
-        ).some(
-          (button) =>
-            button.textContent?.trim() === 'Open branch' &&
-            getComputedStyle(button).display !== 'none'
-        ),
-        bodyText: document.body.innerText
-      })),
-      branchFrame.evaluate(() => {
-        const temporaryChatToggle = document.getElementById('temporary-chat-toggle');
-        const composer = document.querySelector('#composer-form textarea');
-        return {
-          branchLocation: window.location.href,
-          temporaryChatToggleClicks: window.__temporaryChatToggleClicks ?? 0,
-          temporaryChatLabel: temporaryChatToggle?.getAttribute('aria-label') ?? null,
-          temporaryChatText: temporaryChatToggle?.textContent ?? null,
-          composerValue: composer instanceof HTMLTextAreaElement ? composer.value : null,
-          lastPrompt: window.__lastPrompt ?? null,
-          turnsRendered: document.querySelectorAll('#turns [data-message-author-role]').length
-        };
-      })
-    ]).then(([source, branch]) => ({ ...source, ...branch }));
-    const failedLayout = await readFailedPanelLayout(page);
-
-    // Ordinary mode is an explicit two-step choice: the first click only asks.
-    await page.evaluate(() => {
-      document.querySelector('.aside-panel:not([hidden]) button[data-aside-role="recovery-ordinary"]')?.click();
-    });
-    const afterFirstClick = await Promise.all([
-      page.evaluate(() => {
-        const confirm = document.querySelector('.aside-panel:not([hidden]) .aside-recovery-confirm');
-        return {
-          confirmVisible: confirm instanceof HTMLElement && !confirm.hidden,
-          confirmText: confirm?.textContent ?? '',
-          status:
-            document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
-            null
-        };
-      }),
-      branchFrame.evaluate(() => ({ lastPrompt: window.__lastPrompt ?? null }))
-    ]).then(([panel, branch]) => ({ ...panel, ...branch }));
-
-    await page.evaluate(() => {
-      document
-        .querySelector('.aside-panel:not([hidden]) button[data-aside-role="recovery-ordinary-confirm"]')
-        ?.click();
-    });
-    await waitForPanelStatus(page, /Branch answer is ready in this window\./);
-    const ordinaryFrame = await waitForBranchFrame(page);
-    const ordinary = await ordinaryFrame.evaluate(() => ({
-      location: window.location.href,
-      lastPrompt: window.__lastPrompt ?? null,
-      temporaryChatModeActive: window.__temporaryChatModeActive ?? false
-    }));
-    ordinary.selectedKind = await page.evaluate(
-      () =>
-        document.querySelector('.aside-panel:not([hidden]) .aside-kind-toggle button[data-selected="true"]')
-          ?.dataset.asideRole ?? null
-    );
-
-    return { ...blocked, failedLayout, afterFirstClick, ordinary };
-  } finally {
-    await page.close();
-  }
-}
-
-/**
- * The live ChatGPT shape from the owner's log: the Temporary control is inside a
- * closed composer menu (present, enabled, 0x0), and ChatGPT asks Personalized /
- * Unpersonalized once it is selected. Aside opens the menu, selects the control,
- * stops at the chooser without choosing, and continues on the same document after
- * the owner chooses and presses Check again — with exactly one send.
- */
-async function runTemporaryChatMenuChooserScenario(browser) {
-  routeMap = {
-    '/c/source-temp-menu': buildSourceHtml(),
-    '/': buildSuccessComposerHtml({
-      conversationPath: '/c/generated-temp-menu',
-      includeTemporaryChatToggle: true,
-      temporaryChatInitiallyActive: false,
-      temporaryChatActivationStyle: 'menu',
-      temporaryChatChooser: true,
-      temporaryModeSkipsConversationUrl: true,
-      realComposerId: ''
-    })
-  };
-
-  const page = await createSourcePage(browser, '/c/source-temp-menu');
-
-  try {
-    await openDraft(page);
-    await setPanelBranchKind(page, 'temporary');
-    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', PRIVATE_PROBE_QUESTION);
-    await page.evaluate(() => {
-      const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
-      if (!(button instanceof HTMLButtonElement)) {
-        throw new Error('Panel submit button not found');
-      }
-      button.click();
-    });
-    const branchFrame = await waitForBranchFrame(page);
-    await waitForPanelStatus(page, /This branch was not sent\./);
-    await capture(page, 'panel-chatgpt-private-awaiting-choice');
-
-    const awaiting = await page.evaluate(() => ({
-      status:
-        document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ?? null,
-      errorText:
-        document.querySelector('.aside-panel:not([hidden]) .aside-error-copy')?.textContent ?? null,
-      hint: document.querySelector('.aside-panel:not([hidden]) .aside-recovery > p')?.textContent ?? null
-    }));
-    Object.assign(awaiting, await readFailedPanelLayout(page));
-    const frameBefore = await branchFrame.evaluate(() => {
-      window.__docToken = 'menu-doc';
-      const composer = document.querySelector('#composer-form textarea');
-      const chooser = document.getElementById('temporary-chooser');
-      return {
-        menuTriggerClicks: window.__menuTriggerClicks ?? 0,
-        toggleClicks: window.__temporaryChatToggleClicks ?? 0,
-        chooserVisible: chooser instanceof HTMLElement && getComputedStyle(chooser).display !== 'none',
-        choice: window.__personalizationChoice ?? null,
-        composerValue: composer instanceof HTMLTextAreaElement ? composer.value : null,
-        lastPrompt: window.__lastPrompt ?? null,
-        submitCount: window.__submitCount ?? 0
-      };
-    });
-
-    // The owner answers ChatGPT's question in the branch window, then Check again.
-    await branchFrame.evaluate(() => document.getElementById('chooser-unpersonalized')?.click());
-    await page.evaluate(() => {
-      document
-        .querySelector('.aside-panel:not([hidden]) button[data-aside-role="recovery-check-again"]')
-        ?.click();
-    });
-    await waitForPanelStatus(page, /Branch answer is ready in this window\./);
-    const after = await branchFrame.evaluate(() => ({
-      docToken: window.__docToken ?? null,
-      submitCount: window.__submitCount ?? 0,
-      lastPrompt: window.__lastPrompt ?? null,
-      location: window.location.href,
-      toggleClicks: window.__temporaryChatToggleClicks ?? 0,
-      menuTriggerClicks: window.__menuTriggerClicks ?? 0,
-      choice: window.__personalizationChoice ?? null,
-      temporaryChatModeActive: window.__temporaryChatModeActive ?? false
-    }));
-    const storage = await readExtensionStorage(browser);
-
-    return {
-      awaiting,
-      frameBefore,
-      after,
-      privateTextInLocalStorage: storage.local.includes(PRIVATE_PROBE_QUESTION),
-      privateTextInSessionStorage: storage.session.includes(PRIVATE_PROBE_QUESTION)
-    };
-  } finally {
-    await page.close();
-  }
-}
-
-async function runProjectScenario(browser) {
-  const sourcePath = '/g/g-p-demo-project/c/source-project';
-  const launchPath = '/g/g-p-demo-project/project';
-  const conversationPath = '/g/g-p-demo-project/c/generated-project';
-  routeMap = {
-    [sourcePath]: buildSourceHtml(),
-    [launchPath]: buildSuccessComposerHtml({ conversationPath })
-  };
-
-  const page = await createSourcePage(browser, sourcePath);
-
-  try {
-    await openDraft(page);
-    // Inside a project, choosing the private mode must say ONCE that the branch
-    // leaves the project — as the note's own warning line, with the duplicate
-    // bullet hidden — and must not pop the note open on the owner.
-    await setPanelBranchKind(page, 'temporary');
-    const privacyNote = await page.evaluate(() => {
-      const note = document.querySelector('.aside-panel:not([hidden]) .aside-privacy-note');
-      const warning = note?.querySelector('.aside-privacy-warning:not([hidden])');
-      const bullets = Array.from(note?.querySelectorAll('li') ?? []);
-      return {
-        noteOpen: note instanceof HTMLDetailsElement ? note.open : null,
-        containerWarningVisible: Boolean(warning && /project/i.test(warning.textContent ?? '')),
-        projectBulletHidden: bullets
-          .filter((item) => /project/i.test(item.textContent ?? ''))
-          .every((item) => item.hidden),
-        projectMentionsShown: (note instanceof HTMLElement ? note.innerText : '').match(/project/gi)?.length ?? 0
-      };
-    });
-    await setPanelBranchKind(page, 'persistent');
-    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
-    await page.evaluate(() => {
-      const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
-      if (!(button instanceof HTMLButtonElement)) {
-        throw new Error('Panel submit button not found');
-      }
-      button.click();
-    });
-    const branchFrame = await waitForBranchFrame(page);
-    await waitForPanelStatus(page, /Branch answer is ready in this window\./);
-
-    return await Promise.all([
-      page.evaluate(() => ({
-        status:
-          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
-          null
-      })),
-      branchFrame.evaluate(() => ({
-        branchLocation: window.location.href
-      }))
-    ]).then(([source, branch]) => ({ ...source, ...branch, privacyNote }));
-  } finally {
-    await page.close();
-  }
-}
-
-
-async function runCrossTabScenario(browser) {
-  // Two tabs on the SAME conversation, so both mount the same panel. Covers the
-  // two failures the per-panel protocol exists to prevent: a stale whole-store
-  // write losing another tab's edit, and a closed panel being resurrected.
-  routeMap = {
-    '/c/source-cross-tab': buildSourceHtml(),
-    '/': buildSuccessComposerHtml({ conversationPath: '/c/generated-cross-tab' })
-  };
-
-  const tabA = await createSourcePage(browser, '/c/source-cross-tab');
-  let tabB;
-
-  try {
-    await openDraft(tabA);
-    // Pin the mode: a previous scenario may have left "Temporary" remembered, which
-    // would route this panel to session storage and make the assertions ambiguous.
-    await setPanelBranchKind(tabA, 'persistent');
-    await tabA.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'question from tab A');
-    // Finish editing in tab A before handing over, as a user would. Without this
-    // both tabs keep saving and the test measures a race between two live editors
-    // rather than the protocol.
-    await tabA.evaluate(() => {
-      document
-        .querySelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]')
-        ?.blur();
-    });
-    await sleep(900);
-
-    // The panel under test, named explicitly: the shared profile also holds
-    // minimized panels from earlier scenarios.
-    const panelId = await tabA.evaluate(
-      () => document.querySelector('.aside-panel:not([hidden])')?.getAttribute('data-panel-id') ?? null
-    );
-    if (!panelId) {
-      throw new Error('Cross-tab scenario could not identify the panel under test.');
-    }
-
-    tabB = await createSourcePage(browser, '/c/source-cross-tab');
-    // Wait until tab B has actually caught up with tab A's draft. Editing before
-    // both tabs agree on a revision tests the race, not the protocol.
-    try {
-      await tabB.waitForFunction(
-        (id) => {
-          const textarea = document.querySelector(
-            `.aside-panel[data-panel-id="${id}"] textarea[data-aside-role="question"]`
-          );
-          return textarea instanceof HTMLTextAreaElement && textarea.value === 'question from tab A';
-        },
-        { timeout: 15_000 },
-        panelId
-      );
-    } catch (error) {
-      // A bare timeout here says nothing about why. Report what the store holds
-      // and what tab B actually mounted.
-      const stored = await readExtensionStorage(browser);
-      const mounted = await tabB.evaluate(() =>
-        Array.from(document.querySelectorAll('.aside-panel')).map((panel) => ({
-          panelId: panel.getAttribute('data-panel-id'),
-          hidden: panel.hidden,
-          question: panel.querySelector('textarea[data-aside-role="question"]')?.value ?? null
-        }))
-      );
-      throw new Error(
-        `Tab B never picked up tab A's draft: ${JSON.stringify({
-          panelId,
-          mounted,
-          storedRecord: JSON.parse(stored.local)[`aside:panel:${panelId}`] ?? null,
-          storedKeys: Object.keys(JSON.parse(stored.local))
-        })}`
-      );
-    }
-
-    // Tab B edits the shared panel; the authority accepts it.
-    await tabB.evaluate((id) => {
-      const textarea = document.querySelector(`.aside-panel[data-panel-id="${id}"] textarea[data-aside-role="question"]`);
-      textarea.focus();
-      textarea.value = 'edited in tab B';
-      textarea.dispatchEvent(new Event('input', { bubbles: true }));
-      textarea.blur();
-    }, panelId);
-    await sleep(900);
-
-    const tabBWriteState = await tabB.evaluate((id) => {
-      const panel = document.querySelector(`.aside-panel[data-panel-id="${id}"]`);
-      const textarea = panel?.querySelector('textarea');
-      return {
-        found: Boolean(panel),
-        storeStatus: panel?.getAttribute('data-store-status') ?? null,
-        unsaved: panel?.getAttribute('data-unsaved') ?? null,
-        storeRev: panel?.getAttribute('data-store-rev') ?? null,
-        textareaValue: textarea instanceof HTMLTextAreaElement ? textarea.value : null,
-        hidden: panel instanceof HTMLElement ? panel.hidden : null
-      };
-    }, panelId);
-
-    const afterEdit = await readExtensionStorage(browser);
-
-    // Tab A closes its VIEW. That deletes nothing: the record stays, no
-    // tombstone is written, and tab B's own view is not forced shut.
-    await clickPanelAction(tabA, 'Close');
-    await sleep(900);
-    const afterCloseOnly = await readExtensionStorage(browser);
-    const tabBAfterClose = await tabB.evaluate(
-      (id) => {
-        const panel = document.querySelector(`.aside-panel[data-panel-id="${id}"]`);
-        return { mounted: Boolean(panel), hidden: panel instanceof HTMLElement ? panel.hidden : null };
-      },
-      panelId
-    );
-
-    // Now tab A deletes the question explicitly, from the question list. That is
-    // the action that leaves a tombstone.
-    await tabA.evaluate(() => {
-      window.confirm = () => true;
-      const button = Array.from(document.querySelectorAll('#aside-tabbar button')).find((candidate) =>
-        candidate.textContent?.startsWith('Questions')
-      );
-      if (!(button instanceof HTMLElement)) {
-        throw new Error('Questions list entry not found in the rail');
-      }
-      button.click();
-    });
-    await tabA.waitForSelector('#aside-qlist:not([hidden]) .aside-qlist-row', { timeout: 10_000 });
-    const listRowCount = await tabA.evaluate(() => document.querySelectorAll('#aside-qlist .aside-qlist-row').length);
-    await tabA.evaluate(() => {
-      const row = document.querySelector('#aside-qlist .aside-qlist-row');
-      const del = Array.from(row?.querySelectorAll('button') ?? []).find((b) => b.textContent === 'Delete');
-      if (!(del instanceof HTMLElement)) {
-        throw new Error('Delete action not found in the question list');
-      }
-      del.click();
-    });
-    await sleep(1200);
-
-    // Tab B, which still had it mounted a moment ago, writes again. A stale
-    // whole-store write would bring the panel straight back.
-    await tabB.evaluate((id) => {
-      const textarea = document.querySelector(`.aside-panel[data-panel-id="${id}"] textarea[data-aside-role="question"]`);
-      if (textarea) {
-        textarea.focus();
-        textarea.value = 'late write from tab B';
-        textarea.dispatchEvent(new Event('input', { bubbles: true }));
-        textarea.blur();
-      }
-    }, panelId);
-    await sleep(900);
-
-    const afterClose = await readExtensionStorage(browser);
-
-    return {
-      panelId,
-      editVisibleInStore: afterEdit.local.includes('edited in tab B'),
-      storedQuestionAfterEdit:
-        JSON.parse(afterEdit.local)[`aside:panel:${panelId}`]?.state?.initialQuestion ?? null,
-      storedRevAfterEdit: JSON.parse(afterEdit.local)[`aside:panel:${panelId}`]?.rev ?? null,
-      tabBWriteState: tabBWriteState,
-      panelStoredAfterEdit: afterEdit.local.includes(`aside:panel:${panelId}`),
-      // Close is presentation only.
-      panelKeptAfterClose: afterCloseOnly.local.includes(`aside:panel:${panelId}`),
-      tombstoneAfterCloseOnly: afterCloseOnly.local.includes(`aside:gone:${panelId}`),
-      tabBViewSurvivedClose: tabBAfterClose.mounted && tabBAfterClose.hidden === false,
-      listRowCount,
-      // Delete is explicit and leaves a tombstone.
-      panelResurrectedAfterClose: afterClose.local.includes(`aside:panel:${panelId}`),
-      tombstoneWritten: afterClose.local.includes(`aside:gone:${panelId}`),
-      lateWriteLanded: afterClose.local.includes('late write from tab B'),
-      // Tab B should have dropped the panel once the deletion was broadcast.
-      tabBStillShowsPanel: await tabB.evaluate(
-        (id) => Boolean(document.querySelector(`.aside-panel[data-panel-id="${id}"]`)),
-        panelId
-      )
-    };
-  } finally {
-    if (tabB) {
-      await tabB.close().catch(() => {});
-    }
-    await tabA.close();
-  }
-}
-
-
-/**
- * Claude fixtures.
- *
- * Sanitized shapes built from the adapter's candidate selectors: user turns carry
- * data-testid="user-message", assistant turns render in .font-claude-message with
- * .standard-markdown content, and the composer is a ProseMirror contenteditable
- * with an aria-labelled send button. These exercise the adapter offline; they are
- * not a capture of a live Claude account.
- */
 function buildClaudeSourceHtml({ variant = 'current' } = {}) {
   const assistantMarkup =
     variant === 'legacy'
@@ -2092,87 +607,6 @@ function buildClaudeSourceHtml({ variant = 'current' } = {}) {
 </html>`;
 }
 
-function buildClaudeComposerHtml({ conversationPath = '/chat/generated-claude', incognito = 'available' } = {}) {
-  // 'active-interface' models the documented ACTIVE state: no launch control, the
-  // "Incognito chat" label in the provider's own header.
-  const incognitoMarkup =
-    incognito === 'none' || incognito === 'active-interface'
-      ? ''
-      : `<button id="incognito-toggle" type="button" aria-label="Start incognito chat" aria-pressed="false">Incognito</button>`;
-  const headerMarkup =
-    incognito === 'active-interface'
-      ? `<header>Fake Claude header <span id="incognito-indicator" aria-label="Incognito chat">Incognito chat</span></header>`
-      : `<header>Fake Claude header</header>`;
-
-  return `<!doctype html>
-<html>
-  <head><meta charset="utf-8"><title>Fake Claude Branch</title>${LAYOUT_CHROME_CSS}</head>
-  <body data-sidebar="open">
-    <nav aria-label="Chat history"><div>Recents</div></nav>
-    <main>
-      ${headerMarkup}
-      <div id="turns"></div>
-      <form id="composer-form">
-        <fieldset style="border:0;padding:0;margin:0;">
-          <div id="prompt" class="ProseMirror" contenteditable="true" role="textbox"
-               aria-label="Write your prompt to Claude"
-               style="min-height:56px;width:100%;border:1px solid #ccc;padding:8px;box-sizing:border-box;"></div>
-        </fieldset>
-        ${incognitoMarkup}
-        <button type="button" aria-label="Send message">Send</button>
-      </form>
-    </main>
-    <script>
-      const composer = document.getElementById('prompt');
-      const incognitoToggle = document.getElementById('incognito-toggle');
-      window.__incognitoActive = ${incognito === 'active-interface' ? 'true' : 'false'};
-      if (incognitoToggle) {
-        incognitoToggle.addEventListener('click', () => {
-          const active = incognitoToggle.getAttribute('aria-pressed') === 'true';
-          window.__incognitoClicks = (window.__incognitoClicks || 0) + 1;
-          incognitoToggle.setAttribute('aria-pressed', active ? 'false' : 'true');
-          incognitoToggle.setAttribute('aria-label', active ? 'Start incognito chat' : 'Leave incognito chat');
-          window.__incognitoActive = !active;
-        });
-      }
-
-      function submitPrompt() {
-        const prompt = composer.innerText;
-        if (!prompt.trim()) {
-          return;
-        }
-        window.__lastPrompt = prompt;
-        composer.innerHTML = '';
-        if (!window.__incognitoActive) {
-          history.pushState(null, '', ${JSON.stringify(conversationPath)});
-        }
-        document.getElementById('turns').innerHTML =
-          '<div data-testid="user-message"><div class="standard-markdown"></div></div>' +
-          '<div class="font-claude-message"><div class="standard-markdown">' +
-          '<p>This answers the selected passage.</p>' +
-          '</div></div>';
-        document.querySelector('#turns [data-testid="user-message"] .standard-markdown').textContent = prompt;
-      }
-
-      document.querySelector('button[aria-label="Send message"]').addEventListener('click', (event) => {
-        event.preventDefault();
-        window.__sendClicks = (window.__sendClicks || 0) + 1;
-        window.__sendSawText = composer.innerText.length;
-        submitPrompt();
-      });
-      composer.addEventListener('keydown', (event) => {
-        window.__enterKeys = (window.__enterKeys || 0) + 1;
-        if (event.key === 'Enter' && !event.shiftKey) {
-          event.preventDefault();
-          submitPrompt();
-        }
-      });
-      window.__fixtureReady = true;
-    </script>
-  </body>
-</html>`;
-}
-
 async function createClaudePage(browser, pathName) {
   const page = await browser.newPage();
   page.__consoleMessages = [];
@@ -2190,6 +624,9 @@ async function createClaudePage(browser, pathName) {
     waitUntil: 'domcontentloaded',
     timeout: 60_000
   });
+  // Aside confirms the page's role with its worker before it listens for
+  // selections; wait until it has mounted its host.
+  await page.waitForSelector('#aside-root', { timeout: 15_000 });
   return page;
 }
 
@@ -2213,296 +650,6 @@ async function selectClaudeAssistantText(page) {
   });
 }
 
-async function runClaudeScenario(browser, { variant = 'current' } = {}) {
-  routeMap = { '*': buildSourceHtml() };
-  // These two scenarios model a Claude that DOES refuse to be framed, so the
-  // driven-window fallback below is proved by observation. Whether the real
-  // claude.ai refuses is not something this harness can know — which is the point:
-  // the product now finds out by looking, instead of being told by a comment.
-  refuseFramingForPaths = ['/new', '/chat/'];
-  claudeRouteMap = {
-    '/chat/source-claude': buildClaudeSourceHtml({ variant }),
-    '/new': buildClaudeComposerHtml({}),
-    '*': buildClaudeComposerHtml({})
-  };
-
-  const page = await createClaudePage(browser, '/chat/source-claude');
-  const existingPages = await browser.pages();
-
-  try {
-    await selectClaudeAssistantText(page);
-    await page.waitForFunction(
-      () => {
-        const toolbar = document.querySelector('#aside-selection-toolbar');
-        return toolbar instanceof HTMLElement && !toolbar.hidden;
-      },
-      { timeout: 10_000 }
-    );
-
-    const toolbarState = await page.evaluate(() => {
-      const toolbar = document.querySelector('#aside-selection-toolbar');
-      return {
-        visible: toolbar instanceof HTMLElement && !toolbar.hidden,
-        label: toolbar?.getAttribute('aria-label') ?? null,
-        actions: Array.from(toolbar?.querySelectorAll('button') ?? []).map((b) => b.textContent)
-      };
-    });
-
-    await page.evaluate(() => document.querySelector('#aside-ask-button')?.click());
-    await page.waitForSelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', {
-      timeout: 10_000
-    });
-
-    const contextPreview = await page.evaluate(
-      () =>
-        document.querySelector('.aside-panel:not([hidden]) .aside-context-preview')?.textContent ?? ''
-    );
-
-    if (variant === 'current') {
-      // Evidence for the owner checklist: the private toggle carries Claude's own
-      // word for the mode, and its documented constraints are on screen before a
-      // private branch runs.
-      await setPanelBranchKind(page, 'temporary');
-      await page.evaluate(() => {
-        const note = document.querySelector('.aside-panel:not([hidden]) .aside-privacy-note');
-        if (note instanceof HTMLDetailsElement) {
-          note.open = true;
-        }
-      });
-      await sleep(150);
-      await capture(page, 'panel-claude-private-constraints');
-    }
-
-    await setPanelBranchKind(page, 'persistent');
-    await page.type(
-      '.aside-panel:not([hidden]) textarea[data-aside-role="question"]',
-      'Why this assumption?'
-    );
-    if (variant === 'current') {
-      await sleep(150);
-      await capture(page, 'panel-claude-context');
-    }
-    await page.evaluate(() => {
-      document.querySelector('.aside-panel:not([hidden]) button[type="submit"]')?.click();
-    });
-
-    // This fixture refuses framing, so the branch must fall back to a driven
-    // window — and must do so from the frame's observed failure, not from a
-    // hard-coded capability flag.
-
-    const branchPage = await waitForAdditionalPage(browser, existingPages, 45_000);
-    branchPage.on('pageerror', (err) => console.error('CLAUDE BRANCH PAGEERROR', err.message));
-    try {
-      await branchPage.waitForFunction(
-        () => window.location.href.includes('/chat/generated-claude'),
-        { timeout: 45_000 }
-      );
-    } catch (error) {
-      const debug = await branchPage.evaluate(() => ({
-        location: window.location.href,
-        fixtureReady: window.__fixtureReady ?? false,
-        composerText: (document.querySelector('#prompt')?.textContent ?? '').slice(0, 120),
-        sendClicks: window.__sendClicks ?? 0,
-        lastPrompt: window.__lastPrompt ? 'set' : null
-      }));
-      console.error('CLAUDE BRANCH DEBUG', JSON.stringify(debug));
-      throw error;
-    }
-
-    await waitForPanelStatus(page, /Branch/);
-
-    const branchState = await branchPage.evaluate(() => ({
-      location: window.location.href,
-      sendClicks: window.__sendClicks ?? 0,
-      lastPrompt: window.__lastPrompt ?? null,
-      assistantText:
-        document.querySelector('#turns .font-claude-message .standard-markdown')?.textContent ?? null
-    }));
-
-    const panelState = await page.evaluate(() => {
-      const panel = document.querySelector('.aside-panel:not([hidden])');
-      const nativeRect = document
-        .querySelector('nav[aria-label]')
-        ?.getBoundingClientRect();
-      const railRect = document.querySelector('#aside-tabbar')?.getBoundingClientRect();
-      return {
-        status: panel?.querySelector('.aside-panel-heading p')?.textContent ?? null,
-        surface: panel?.querySelector('.aside-frame-overlay-title')?.textContent ?? null,
-        railOverlapsSidebar: Boolean(
-          nativeRect &&
-            railRect &&
-            railRect.left < nativeRect.right &&
-            railRect.right > nativeRect.left
-        )
-      };
-    });
-
-    return { variant, toolbarState, contextPreview, branchState, panelState };
-  } finally {
-    const pages = await browser.pages();
-    await Promise.all(
-      pages.filter((candidate) => !existingPages.includes(candidate)).map((c) => c.close().catch(() => {}))
-    );
-    await page.close();
-  }
-}
-
-
-/**
- * Claude with framing allowed: the branch must run in the in-page panel.
- *
- * The owner reported every Claude branch opening a separate window. The cause was
- * a capability flag set to 'unsupported' from an unchecked assumption — and
- * because the same flag gated the attempt, nothing could ever disprove it. This
- * asserts the attempt now happens.
- */
-async function runClaudeEmbeddedScenario(browser) {
-  routeMap = { '*': buildSourceHtml() };
-  refuseFramingForPaths = [];
-  claudeRouteMap = {
-    '/chat/source-claude-embedded': buildClaudeSourceHtml({ variant: 'current' }),
-    '/new': buildClaudeComposerHtml({}),
-    '*': buildClaudeComposerHtml({})
-  };
-
-  const page = await createClaudePage(browser, '/chat/source-claude-embedded');
-  const existingPages = await browser.pages();
-
-  try {
-    await selectClaudeAssistantText(page);
-    await page.waitForFunction(
-      () => {
-        const toolbar = document.querySelector('#aside-selection-toolbar');
-        return toolbar instanceof HTMLElement && !toolbar.hidden;
-      },
-      { timeout: 10_000 }
-    );
-
-    await page.evaluate(() => document.querySelector('#aside-ask-button')?.click());
-    await page.waitForSelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', {
-      timeout: 10_000
-    });
-    await setPanelBranchKind(page, 'persistent');
-    await page.type(
-      '.aside-panel:not([hidden]) textarea[data-aside-role="question"]',
-      'Why this assumption?'
-    );
-    await page.evaluate(() => {
-      document.querySelector('.aside-panel:not([hidden]) button[type="submit"]')?.click();
-    });
-
-    // The frame is pointed at about:blank first to force a real document load, so
-    // wait for the actual provider URL rather than sampling once.
-    await page.waitForFunction(
-      () => {
-        const frame = document.querySelector('.aside-panel:not([hidden]) iframe.aside-frame');
-        return frame instanceof HTMLIFrameElement && frame.src.includes('claude.ai');
-      },
-      { timeout: 20_000 }
-    ).catch(() => {});
-
-    const pagesAfter = await browser.pages();
-
-    return {
-      framedInPanel: await page.evaluate(() => {
-        const frame = document.querySelector('.aside-panel:not([hidden]) iframe.aside-frame');
-        const shell = document.querySelector('.aside-panel:not([hidden]) .aside-frame-shell');
-        return (
-          frame instanceof HTMLIFrameElement &&
-          frame.src.includes('claude.ai') &&
-          shell instanceof HTMLElement &&
-          !shell.hidden
-        );
-      }),
-      frameSrc: await page.evaluate(
-        () =>
-          document.querySelector('.aside-panel:not([hidden]) iframe.aside-frame')?.src ?? null
-      ),
-      panelStatus: await page.evaluate(
-        () =>
-          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')
-            ?.textContent ?? null
-      ),
-      // No separate window: the whole point of the report.
-      openedSeparateWindow: pagesAfter.length > existingPages.length
-    };
-  } finally {
-    const pages = await browser.pages();
-    await Promise.all(
-      pages.filter((candidate) => !existingPages.includes(candidate)).map((c) => c.close().catch(() => {}))
-    );
-    await page.close();
-  }
-}
-
-/**
- * Claude with incognito ALREADY active in the branch document: no launch control,
- * only the documented interface label. That label is the verification, and the
- * private branch must run in the panel with a single send and no toggle click.
- */
-async function runClaudeIncognitoActiveScenario(browser) {
-  routeMap = { '*': buildSourceHtml() };
-  refuseFramingForPaths = [];
-  claudeRouteMap = {
-    '/chat/source-claude-incognito': buildClaudeSourceHtml({ variant: 'current' }),
-    '/new': buildClaudeComposerHtml({ incognito: 'active-interface' }),
-    '*': buildClaudeComposerHtml({ incognito: 'active-interface' })
-  };
-
-  const page = await createClaudePage(browser, '/chat/source-claude-incognito');
-  const existingPages = await browser.pages();
-
-  try {
-    await selectClaudeAssistantText(page);
-    await page.waitForFunction(
-      () => {
-        const toolbar = document.querySelector('#aside-selection-toolbar');
-        return toolbar instanceof HTMLElement && !toolbar.hidden;
-      },
-      { timeout: 10_000 }
-    );
-    await page.evaluate(() => document.querySelector('#aside-ask-button')?.click());
-    await page.waitForSelector('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', {
-      timeout: 10_000
-    });
-    await setPanelBranchKind(page, 'temporary');
-    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', PRIVATE_PROBE_QUESTION);
-    await page.evaluate(() => {
-      document.querySelector('.aside-panel:not([hidden]) button[type="submit"]')?.click();
-    });
-    const branchFrame = await waitForBranchFrame(page);
-    await waitForPanelStatus(page, /Branch answer is ready in this window\./);
-    await capture(page, 'panel-claude-incognito-verified');
-
-    const branch = await branchFrame.evaluate(() => ({
-      location: window.location.href,
-      sendClicks: window.__sendClicks ?? 0,
-      incognitoClicks: window.__incognitoClicks ?? 0,
-      lastPrompt: window.__lastPrompt ?? null
-    }));
-    const pagesAfter = await browser.pages();
-    const storage = await readExtensionStorage(browser);
-    const log = await page.evaluate(
-      () =>
-        document.querySelector('.aside-panel:not([hidden]) textarea[data-aside-role="debug-log"]')?.value ?? ''
-    );
-
-    return {
-      ...branch,
-      openedSeparateWindow: pagesAfter.length > existingPages.length,
-      privateTextInLocalStorage: storage.local.includes(PRIVATE_PROBE_QUESTION),
-      privateTextInSessionStorage: storage.session.includes(PRIVATE_PROBE_QUESTION),
-      logMentionsMarker: /interface-marker/.test(log) || storage.session.includes('interface-marker')
-    };
-  } finally {
-    const pages = await browser.pages();
-    await Promise.all(
-      pages.filter((candidate) => !existingPages.includes(candidate)).map((c) => c.close().catch(() => {}))
-    );
-    await page.close();
-  }
-}
-
 const SCREENSHOT_DIR = process.env.CAPTURE_SCREENSHOTS ?? null;
 
 async function capture(page, name) {
@@ -2523,7 +670,9 @@ async function runLayoutMatrixScenario(browser) {
   const viewports = [
     { name: '1440', width: 1440, height: 900 },
     { name: '1024', width: 1024, height: 768 },
-    { name: '768', width: 768, height: 800 }
+    { name: '768', width: 768, height: 800 },
+    // Browser zoom at 125% on a 1440px window: fewer CSS pixels, denser device pixels.
+    { name: '1152-zoom125', width: 1152, height: 720, deviceScaleFactor: 1.25 }
   ];
   const results = [];
 
@@ -2533,12 +682,12 @@ async function runLayoutMatrixScenario(browser) {
         const label = `${viewport.name}-${sidebar}-${dark ? 'dark' : 'light'}`;
         routeMap = {
           [`/c/layout-${label}`]: buildSourceHtml({ dark, sidebar }),
-          '/': buildSuccessComposerHtml({ conversationPath: `/c/generated-${label}`, dark })
+          '/': buildNativeChatHtml({})
         };
 
         const page = await createSourcePage(browser, `/c/layout-${label}`);
         try {
-          await page.setViewport({ width: viewport.width, height: viewport.height });
+          await page.setViewport({ width: viewport.width, height: viewport.height, deviceScaleFactor: viewport.deviceScaleFactor ?? 1 });
           await selectAssistantText(page);
           // Late mount, and no reselection: on a real page the popup appears on its
           // own after the selection has settled, and only the MutationObserver tells
@@ -2555,12 +704,21 @@ async function runLayoutMatrixScenario(browser) {
 
           await capture(page, `toolbar-${label}`);
 
-          await openDraft(page);
-          await page.type(
-            '.aside-panel:not([hidden]) textarea[data-aside-role="question"]',
-            'Why this assumption?'
-          );
-          await clickPanelAction(page, 'Minimize');
+          await openCard(page);
+          await page.type(`${CARD} textarea[data-aside-role="handoff-question"]`, 'Why this assumption?');
+          await capture(page, `card-${label}`);
+          // The open card must not paint over the provider's composer.
+          const composerUnderCard = await page.evaluate(() => {
+            const composer = document.querySelector('#composer-form');
+            if (!(composer instanceof HTMLElement)) {
+              return { applicable: false, reachable: true };
+            }
+            const rect = composer.getBoundingClientRect();
+            const points = [0.1, 0.5, 0.9].map((fraction) => [rect.left + rect.width * fraction, rect.top + rect.height / 2]);
+            const covered = points.filter(([x, y]) => Boolean(document.elementFromPoint(x, y)?.closest('#aside-root')));
+            return { applicable: true, reachable: covered.length === 0 };
+          });
+          await clickCard(page, 'handoff-hide');
           await sleep(400);
           await capture(page, `rail-${label}`);
 
@@ -2602,7 +760,7 @@ async function runLayoutMatrixScenario(browser) {
             };
           });
 
-          results.push({ label, ...measured, occlusion, nativeOcclusion });
+          results.push({ label, ...measured, occlusion, nativeOcclusion, composerUnderCard });
         } finally {
           await page.close();
         }
@@ -2613,154 +771,1137 @@ async function runLayoutMatrixScenario(browser) {
   return results;
 }
 
-/**
- * The library page: Aside's own extension page, reached through the worker's
- * extension id. It must list the sources and questions the earlier scenarios
- * created, show a captured answer read-only, and carry the build id.
- */
-async function runLibraryScenario(browser, { questionId = null } = {}) {
-  const workerTarget = browser.targets().find((target) => target.type() === 'service_worker');
-  if (!workerTarget) {
+
+/* ------------------------------------------------------------------ *
+ * Extension, worker and clipboard helpers
+ * ------------------------------------------------------------------ */
+
+async function serviceWorker(browser) {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const target = browser.targets().find((candidate) => candidate.type() === 'service_worker');
+    if (target) {
+      return target.worker();
+    }
+    await sleep(200);
+  }
+  throw new Error('Extension service worker target was not found.');
+}
+
+async function extensionIdOf(browser) {
+  const target = browser.targets().find((candidate) => candidate.type() === 'service_worker');
+  if (!target) {
     throw new Error('Extension service worker target was not found.');
   }
-  const extensionId = new URL(workerTarget.url()).hostname;
+  return new URL(target.url()).hostname;
+}
+
+async function openExtensionPage(browser, file) {
   const page = await browser.newPage();
   page.__dialogs = [];
   page.on('dialog', (dialog) => {
     page.__dialogs.push({ type: dialog.type(), message: dialog.message() });
     void dialog.accept();
   });
+  await page.goto(`chrome-extension://${await extensionIdOf(browser)}/${file}`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 30_000
+  });
+  return page;
+}
 
-  try {
-    await page.goto(`chrome-extension://${extensionId}/library.html`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    await page.waitForSelector('#sources .source', { timeout: 20_000 });
-    const sourceCount = await page.evaluate(() => document.querySelectorAll('#sources .source').length);
-    const footer = await page.evaluate(() => document.querySelector('#about')?.textContent ?? '');
-
-    // Search finds a word from a captured answer, across every source.
-    await page.type('#search', 'uses only the selected passage');
-    await page.waitForSelector('#content .q', { timeout: 10_000 });
-    // Every keystroke re-renders the results. On a slow runner the last of those
-    // renders landed AFTER the View click below and replaced the opened thread
-    // with the list again, so wait until the results have stopped changing.
-    await page.waitForFunction(
-      () => document.querySelector('#search')?.value === 'uses only the selected passage',
-      { timeout: 10_000 }
-    );
-    let previousResults = null;
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      await sleep(250);
-      const current = await page.evaluate(() => document.querySelector('#content')?.innerHTML ?? '');
-      if (current === previousResults) {
-        break;
-      }
-      previousResults = current;
+/**
+ * Every durable write, observed as it happens rather than inferred from the
+ * final state: chrome.storage local/sync change events and every storage-
+ * authority message reaching the worker. Persist-then-delete would show here.
+ */
+async function installPersistenceProbe(browser) {
+  const worker = await serviceWorker(browser);
+  await worker.evaluate(() => {
+    if (self.__asideProbe) {
+      return;
     }
-    const searchHit = await page.evaluate(() => document.querySelector('#content .q small')?.textContent ?? '');
-
-    // Open the first hit: the saved thread renders as text, read-only.
-    await page.evaluate(() => {
-      const view = Array.from(document.querySelectorAll('#content .q button')).find((b) => b.textContent === 'View');
-      view?.click();
+    self.__asideProbe = { local: [], sync: [], messages: [] };
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === 'local' || area === 'sync') {
+        self.__asideProbe[area].push(JSON.stringify(changes));
+      }
     });
-    await page.waitForSelector('#content .msg[data-role="assistant"]', { timeout: 10_000 });
-    await page.waitForFunction(
+    chrome.runtime.onMessage.addListener((message) => {
+      if (message && (message.type === 'DOMAIN_COMMAND' || message.type === 'PANEL_UPSERT' || message.type === 'DOMAIN_RESTORE')) {
+        self.__asideProbe.messages.push(JSON.stringify(message));
+      }
+      return false;
+    });
+  });
+}
+
+async function readPersistenceProbe(browser) {
+  const worker = await serviceWorker(browser);
+  return worker.evaluate(() => self.__asideProbe ?? null);
+}
+
+async function workerEval(browser, fn, ...args) {
+  const worker = await serviceWorker(browser);
+  return worker.evaluate(fn, ...args);
+}
+
+async function handoffSessionKeys(browser) {
+  return workerEval(browser, async () =>
+    Object.keys(await chrome.storage.session.get(null)).filter((key) => key.startsWith('aside:handoff:'))
+  );
+}
+
+async function tabsSnapshot(browser) {
+  return workerEval(browser, async () =>
+    (await chrome.tabs.query({})).map((tab) => ({ id: tab.id, windowId: tab.windowId, url: tab.url, active: tab.active }))
+  );
+}
+
+/** Every record in the question database, as one string, read from an extension page. */
+async function dumpQuestionDatabase(browser) {
+  const page = await openExtensionPage(browser, 'library.html');
+  try {
+    return await page.evaluate(
       () =>
-        Array.from(document.querySelectorAll('#content details summary')).some((el) =>
-          el.textContent?.includes('Exactly what was sent')
-        ),
-      { timeout: 10_000 }
-    );
-    const bundle = await page.evaluate(() => ({
-      assistantText: document.querySelector('#content .msg[data-role="assistant"]')?.textContent ?? null,
-      assistantPartial: document.querySelector('#content .msg[data-role="assistant"]')?.getAttribute('data-partial') ?? null,
-      status: document.querySelector('#content .meta')?.textContent ?? null,
-      promptShown: Boolean(Array.from(document.querySelectorAll('#content details summary')).find((el) => el.textContent?.includes('Exactly what was sent'))),
-      scripts: document.querySelectorAll('#content script').length
-    }));
-
-    // The record of the question the non-project scenario asked, read through
-    // the extension page's own channel: complete answer, captured through.
-    const record = questionId
-      ? await page.evaluate(async (id) => {
-          const response = await chrome.runtime.sendMessage({ type: 'DOMAIN_QUERY', query: 'bundle', questionId: id });
-          const bundle = response?.bundle;
-          if (!bundle) {
-            return null;
-          }
-          const last = bundle.messages.filter((m) => m.role === 'assistant').at(-1) ?? null;
-          const link = bundle.links.at(-1) ?? null;
-          return {
-            title: bundle.question.title,
-            lifecycle: bundle.question.lifecycle,
-            messageCount: bundle.messages.length,
-            lastAssistantText: last?.text ?? null,
-            lastAssistantPartial: last?.partial ?? null,
-            capture: link?.capture ?? null,
-            run: link?.run ?? null,
-            snapshotPrompt: bundle.snapshots.at(-1)?.prompt ?? null,
-            conversationUrl: link?.conversationUrl ?? null
+        new Promise((resolve, reject) => {
+          const request = indexedDB.open('aside-questions');
+          request.onerror = () => reject(request.error);
+          request.onsuccess = () => {
+            const db = request.result;
+            const names = Array.from(db.objectStoreNames);
+            const out = {};
+            let pending = names.length;
+            if (!pending) {
+              resolve('{}');
+              return;
+            }
+            const tx = db.transaction(names, 'readonly');
+            names.forEach((name) => {
+              const all = tx.objectStore(name).getAll();
+              all.onsuccess = () => {
+                out[name] = all.result;
+                pending -= 1;
+                if (!pending) {
+                  resolve(JSON.stringify(out));
+                }
+              };
+              all.onerror = () => reject(all.error);
+            });
           };
-        }, questionId)
-      : null;
-
-    const storage = await readExtensionStorage(browser);
-    const journal = JSON.parse(storage.local)['aside:migration-journal'] ?? null;
-
-    return { extensionIdKnown: Boolean(extensionId), sourceCount, footer, searchHit, bundle, record, journal, dialogs: page.__dialogs };
+        })
+    );
   } finally {
     await page.close();
   }
 }
 
-async function runFailureScenario(browser) {
-  routeMap = {
-    '/c/source-failure': buildSourceHtml(),
-    '/': buildFalsePositiveComposerHtml()
-  };
+async function readClipboard(page) {
+  await page.bringToFront();
+  return page.evaluate(() => navigator.clipboard.readText());
+}
 
-  const page = await createSourcePage(browser, '/c/source-failure');
+async function writeClipboard(page, text) {
+  await page.bringToFront();
+  await page.evaluate((value) => navigator.clipboard.writeText(value), text);
+}
 
+async function waitForPageAt(browser, url, timeoutMs = 20_000) {
+  let target;
   try {
-    await openDraft(page);
-    await setPanelBranchKind(page, 'persistent');
-    await page.type('.aside-panel:not([hidden]) textarea[data-aside-role="question"]', 'Why this assumption?');
-    const pageCountBefore = (await browser.pages()).length;
-    await page.evaluate(() => {
-      const button = document.querySelector('.aside-panel:not([hidden]) button[type="submit"]');
-      if (!(button instanceof HTMLButtonElement)) {
-        throw new Error('Panel submit button not found');
-      }
-      button.click();
-    });
-    const branchFrame = await waitForBranchFrame(page);
-    await waitForPanelStatus(page, /Local branch creation failed\./);
-    const pageCountAfter = (await browser.pages()).length;
-    await clickPanelAction(page, 'Copy log');
+    target = await browser.waitForTarget(
+      (candidate) => candidate.type() === 'page' && candidate.url() === url,
+      { timeout: timeoutMs }
+    );
+  } catch (error) {
+    const pages = browser.targets().filter((candidate) => candidate.type() === 'page').map((candidate) => candidate.url());
+    throw new Error(`No page reached ${url}; open pages: ${JSON.stringify(pages)}`, { cause: error });
+  }
+  const page = await target.page();
+  // Interval polling: a tab opened in the background does not run animation frames.
+  await page.waitForFunction(() => window.__fixtureReady === true, { timeout: timeoutMs, polling: 100 });
+  return page;
+}
 
-    return await Promise.all([
-      page.evaluate(() => ({
-        status:
-          document.querySelector('.aside-panel:not([hidden]) .aside-panel-heading p')?.textContent ??
-          null,
-        errorText:
-          document.querySelector('.aside-panel:not([hidden]) .aside-error-copy')?.textContent ??
-          null,
-        bodyText: document.body.innerText
-      })),
-      branchFrame.evaluate(() => ({
-        branchLocation: window.location.href,
-        enterFallbackTriggered: Boolean(window.__enterFallbackTriggered)
-      }))
-    ]).then(async ([source, branch]) => ({
-      ...source,
-      ...branch,
-      pageCountBefore,
-      pageCountAfter
-    }));
+/* ------------------------------------------------------------------ *
+ * Handoff card helpers
+ * ------------------------------------------------------------------ */
+
+async function openCard(page, buttonId = '#aside-ask-button') {
+  await page.waitForFunction(() => {
+    const toolbar = document.querySelector('#aside-selection-toolbar');
+    return toolbar instanceof HTMLElement && !toolbar.hidden;
+  }, { timeout: 10_000 });
+  await page.evaluate((selector) => {
+    const button = document.querySelector(selector);
+    if (!(button instanceof HTMLButtonElement)) {
+      throw new Error(`Selection action not found: ${selector}`);
+    }
+    button.click();
+  }, buttonId);
+  await page.waitForSelector(`${CARD} textarea[data-aside-role="handoff-question"]`, { timeout: 10_000 });
+}
+
+async function cardState(page) {
+  return page.evaluate((cardSelector) => {
+    const card = document.querySelector(cardSelector);
+    const role = (name) => card?.querySelector(`[data-aside-role="${name}"]`);
+    return {
+      sessionId: card?.getAttribute('data-session-id') ?? null,
+      count: document.querySelectorAll('.aside-handoff').length,
+      label: role('handoff-label')?.textContent ?? null,
+      instruction: role('handoff-instruction')?.textContent ?? null,
+      question: role('handoff-question')?.value ?? null,
+      questionFocused: document.activeElement === role('handoff-question'),
+      focus: role('handoff-focus')?.textContent ?? null,
+      preview: role('handoff-prompt')?.textContent ?? null,
+      summary: role('handoff-context-summary')?.textContent ?? null,
+      primary: role('handoff-copy-open')?.textContent ?? null,
+      clipboardStatus: role('handoff-clipboard-status')?.textContent ?? null,
+      targetStatus: role('handoff-target-status')?.textContent ?? null,
+      manualCopyShown: role('handoff-manual-copy') ? !role('handoff-manual-copy').hidden : null,
+      hasIframe: Boolean(document.querySelector('#aside-root iframe')),
+      target: card?.getAttribute('data-target') ?? null,
+      clipboard: card?.getAttribute('data-clipboard') ?? null
+    };
+  }, CARD);
+}
+
+/** A trusted click (real input events), as the Owner's click would be. */
+async function clickCard(page, role) {
+  await page.bringToFront();
+  await page.click(`${CARD} [data-aside-role="${role}"]`);
+}
+
+async function notices(page) {
+  return page.evaluate(() => document.querySelector('.aside-notice')?.textContent ?? '');
+}
+
+/* ------------------------------------------------------------------ *
+ * Scenarios
+ * ------------------------------------------------------------------ */
+
+const CHATGPT_TEMPORARY_URL = 'https://chatgpt.com/?temporary-chat=true';
+const CLAUDE_NEW_URL = 'https://claude.ai/new';
+
+/**
+ * Retained data from before this release: durable questions in the question
+ * database (with a captured thread, a snapshot and a note) and legacy panel
+ * view records in chrome.storage.local — written through the same authority
+ * messages the previous build used.
+ */
+async function seedRetainedData(browser) {
+  const page = await openExtensionPage(browser, 'library.html');
+  try {
+    return await page.evaluate(async () => {
+      const send = (message) => chrome.runtime.sendMessage(message);
+      const now = Date.now();
+      const sourceId = 'src_seed_chatgpt';
+      const source = {
+        id: sourceId,
+        providerId: 'chatgpt',
+        scopeKey: 'chatgpt:c:source-retained',
+        conversationId: 'source-retained',
+        containerId: null,
+        url: 'https://chatgpt.com/c/source-retained',
+        title: 'Retained convexity chat',
+        kind: 'assistant-answer',
+        acquisition: 'selected-fragment',
+        messageId: 'assistant:1:seed'
+      };
+      const question = (id, title) => ({
+        type: 'CreateQuestion',
+        source,
+        blocks: [],
+        anchor: {
+          id: `a_${id}`,
+          sourceId,
+          selectedText: 'convexity assumption',
+          exact: 'convexity assumption',
+          prefix: 'The ',
+          suffix: ' guarantees',
+          messageId: 'assistant:1:seed',
+          turnIndex: 1,
+          role: 'assistant',
+          contentHash: 'seed',
+          scrollHint: 0
+        },
+        question: {
+          id,
+          sourceId,
+          anchorId: `a_${id}`,
+          parentQuestionId: null,
+          parentMessageId: null,
+          title,
+          titleSource: 'user',
+          retention: 'durable',
+          providerMode: 'normal',
+          entryAction: 'ask'
+        },
+        draft: { text: title, excludedBlockIds: [], background: '' }
+      });
+      const results = [];
+      results.push(await send({ type: 'DOMAIN_COMMAND', command: question('q_seed_kept', 'Seeded kept question') }));
+      results.push(await send({ type: 'DOMAIN_COMMAND', command: question('q_seed_resolve', 'Seeded question to resolve') }));
+      results.push(await send({ type: 'DOMAIN_COMMAND', command: question('q_seed_delete', 'Seeded question to delete') }));
+      results.push(
+        await send({
+          type: 'DOMAIN_COMMAND',
+          command: {
+            type: 'FreezeSnapshot',
+            questionId: 'q_seed_kept',
+            snapshot: {
+              id: 'snap_seed',
+              questionId: 'q_seed_kept',
+              prompt: 'Seeded frozen prompt',
+              question: 'Seeded kept question',
+              blocks: [],
+              missing: [],
+              compilerVersion: '2.0.0',
+              templateVersion: '2.0.0',
+              charCount: 20
+            },
+            link: {
+              id: 'link_seed',
+              questionId: 'q_seed_kept',
+              providerId: 'chatgpt',
+              conversationUrl: 'https://chatgpt.com/c/seed-branch',
+              attemptId: null,
+              snapshotId: 'snap_seed',
+              run: 'submitted',
+              acknowledgement: 'seed',
+              capture: 'link-only',
+              capturedThroughMessageId: null,
+              lastCaptureAt: null,
+              model: null
+            }
+          }
+        })
+      );
+      results.push(
+        await send({
+          type: 'DOMAIN_COMMAND',
+          command: {
+            type: 'AppendOrReviseCapturedMessage',
+            questionId: 'q_seed_kept',
+            linkId: 'link_seed',
+            attemptId: 'seed-attempt',
+            message: {
+              id: 'msg_seed',
+              role: 'assistant',
+              text: 'Seeded saved answer about retained convexity.',
+              partial: false,
+              providerMessageId: null,
+              ordinal: 1,
+              snapshotId: 'snap_seed',
+              attemptId: null
+            },
+            capture: 'captured-through',
+            capturedThroughMessageId: 'msg_seed'
+          }
+        })
+      );
+      results.push(
+        await send({
+          type: 'DOMAIN_COMMAND',
+          command: {
+            type: 'SaveNote',
+            note: { id: 'note_seed', questionId: 'q_seed_kept', sourceId, text: 'Seeded note text', messageId: null }
+          }
+        })
+      );
+      const legacyState = (panelId, extra) => ({
+        panelId,
+        rootConversationId: 'chatgpt:c:source-retained',
+        rootChatUrl: 'https://chatgpt.com/c/source-retained',
+        selection: {
+          rootConversationId: 'chatgpt:c:source-retained',
+          rootChatUrl: 'https://chatgpt.com/c/source-retained',
+          selectedText: 'convexity assumption guarantees the relaxation stays',
+          selectedBlocks: [
+            {
+              messageId: 'assistant:1:seed',
+              role: 'assistant',
+              turnIndex: 1,
+              text: 'The convexity assumption guarantees the relaxation stays tight and keeps optimization stable.',
+              excerpt: 'The convexity assumption'
+            }
+          ],
+          branchBaseMessageId: 'assistant:1:seed',
+          rangeQuotes: { exact: 'convexity assumption guarantees the relaxation stays', prefix: 'The ', suffix: ' tight and' },
+          fallbackScrollY: 0
+        },
+        focusPreview: 'convexity assumption guarantees the relaxation stays',
+        branchKind: 'persistent',
+        entryAction: 'ask',
+        surfaceMode: 'embedded',
+        creationMode: 'local_persistent',
+        title: 'Seeded legacy branch',
+        titleStatus: 'ready',
+        minimized: false,
+        status: 'live',
+        statusLabel: 'Branch answer is ready in this window.',
+        initialQuestion: 'Seeded legacy question',
+        initialPrompt: 'Seeded legacy prompt',
+        branchChatUrl: 'https://chatgpt.com/c/seed-legacy-branch',
+        archive: {
+          messages: [{ role: 'assistant', text: 'Seeded legacy archived answer.', partial: false, providerMessageId: null, ordinal: 1 }],
+          capture: 'captured-through'
+        },
+        createdAt: now,
+        updatedAt: now,
+        ...extra
+      });
+      results.push(
+        await send({
+          type: 'PANEL_UPSERT',
+          panelId: 'panel_seed_live',
+          scopeKey: 'chatgpt:c:source-retained',
+          area: 'local',
+          baseRev: 0,
+          state: legacyState('panel_seed_live', {})
+        })
+      );
+      return results.map((result) => {
+        const status = result?.outcome?.status ?? result?.status ?? (result?.ok ? 'ok' : 'failed');
+        const reason = result?.outcome?.reason ?? result?.reason;
+        return reason && status !== 'applied' ? `${status}: ${reason}` : status;
+      });
+    });
   } finally {
     await page.close();
   }
+}
+
+/** Native selection, occlusion both ways, dark theme, rail and restore — around a handoff card. */
+async function runCoexistenceScenario(browser) {
+  routeMap = { '/c/source-local': buildSourceHtml({ dark: true }), '/': buildNativeChatHtml({}) };
+  const page = await createSourcePage(browser, '/c/source-local');
+  try {
+    await selectAssistantText(page);
+    await page.waitForFunction(() => {
+      const toolbar = document.querySelector('#aside-selection-toolbar');
+      return toolbar instanceof HTMLElement && !toolbar.hidden;
+    }, { timeout: 10_000 });
+    await injectNativeAskButton(page, { placement: 'above', variant: 'bare', shape: 'nested' });
+    await sleep(500);
+    const askOcclusion = await readAsideOcclusion(page);
+    const nativeOcclusion = await readNativePopupOcclusion(page);
+    const askState = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('#aside-selection-toolbar button')).filter((button) => {
+        const rect = button.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && getComputedStyle(button).display !== 'none';
+      });
+      const nativeAsk = document.querySelector('button[aria-label="Ask ChatGPT"]');
+      const nativeRect = nativeAsk?.getBoundingClientRect();
+      const toolbarEl = document.querySelector('#aside-selection-toolbar');
+      const toolbarRect = toolbarEl instanceof HTMLElement && !toolbarEl.hidden ? toolbarEl.getBoundingClientRect() : null;
+      const hit = nativeRect ? document.elementFromPoint(nativeRect.left + nativeRect.width / 2, nativeRect.top + nativeRect.height / 2) : null;
+      return {
+        visibleActions: buttons.map((button) => button.textContent?.trim() ?? ''),
+        toolbarIsLabelledAside: toolbarEl?.getAttribute('aria-label') ?? null,
+        nativeAskHitTargetIsNative: hit === nativeAsk || Boolean(nativeAsk?.contains(hit)),
+        asideOverlapsNativeAsk: Boolean(
+          nativeRect && toolbarRect &&
+            nativeRect.left < toolbarRect.right && nativeRect.right > toolbarRect.left &&
+            nativeRect.top < toolbarRect.bottom && nativeRect.bottom > toolbarRect.top
+        )
+      };
+    });
+
+    await openCard(page);
+    const context = await page.evaluate((cardSelector) => {
+      const card = document.querySelector(cardSelector);
+      const rows = Array.from(card?.querySelectorAll('.aside-context-block') ?? []);
+      return {
+        rolesIncluded: rows.filter((row) => row.querySelector('input')?.checked).map((row) => row.getAttribute('data-plan-role')),
+        precedingInPreview: (card?.querySelector('[data-aside-role="handoff-prompt"]')?.textContent ?? '').includes('Tell me about convexity.')
+      };
+    }, CARD);
+    await page.evaluate((cardSelector) => {
+      const row = document.querySelector(`${cardSelector} .aside-context-block[data-plan-role="preceding-question"] input`);
+      row?.click();
+    }, CARD);
+    const precedingGoneWhenUnticked = !(await cardState(page)).preview.includes('Tell me about convexity.');
+    await page.evaluate((cardSelector) => {
+      document.querySelector(`${cardSelector} .aside-context-block[data-plan-role="preceding-question"] input`)?.click();
+    }, CARD);
+
+    const darkThemeState = await page.evaluate((cardSelector) => ({
+      theme: document.documentElement.dataset.asideTheme ?? null,
+      panelBackground: getComputedStyle(document.querySelector(cardSelector)).backgroundColor
+    }), CARD);
+
+    // Escape and right-click OUTSIDE Aside belong to the provider.
+    await page.evaluate(() => {
+      document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    });
+    const cardSurvivesOutsideEscape = (await cardState(page)).sessionId !== null;
+    const contextMenuPrevented = await page.evaluate(() => {
+      const target = document.querySelector('article[data-message-author-role="assistant"] p');
+      const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+      target?.dispatchEvent(event);
+      return event.defaultPrevented;
+    });
+
+    // Hide: the card goes to the rail in free left space; the scratch is kept.
+    await clickCard(page, 'handoff-hide');
+    await page.waitForFunction(() => Boolean(document.querySelector('#aside-tabbar:not([hidden]) .aside-tab-handoff')), { timeout: 10_000 });
+    const minimizedState = await page.evaluate(() => {
+      const tabBar = document.querySelector('#aside-tabbar');
+      const tab = document.querySelector('.aside-tab-handoff');
+      const tabBarRect = tabBar?.getBoundingClientRect();
+      const tabRect = tab?.getBoundingClientRect();
+      const sidebarRect = document.querySelector('nav[aria-label]')?.getBoundingClientRect();
+      const columnRect = document.querySelector('main article, main #turns')?.getBoundingClientRect();
+      const overlaps = (a, b) => Boolean(a && b) && a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+      return {
+        placement: tabBar?.getAttribute('data-placement'),
+        tabBarLeft: tabBarRect ? Math.round(tabBarRect.left) : null,
+        sidebarRight: sidebarRect ? Math.round(sidebarRect.right) : null,
+        readingColumnLeft: columnRect ? Math.round(columnRect.left) : null,
+        overlapsSidebar: overlaps(tabBarRect, sidebarRect),
+        overlapsReadingColumn: overlaps(tabBarRect, columnRect),
+        tabHitInsideRail: Boolean(tabBarRect && tabRect && tabRect.left >= tabBarRect.left - 1 && tabRect.right <= tabBarRect.right + 1),
+        flexDirection: tabBar ? getComputedStyle(tabBar).flexDirection : null,
+        badge: tab?.querySelector('small')?.textContent ?? null,
+        cardHidden: document.querySelector('.aside-handoff') instanceof HTMLElement ? document.querySelector('.aside-handoff').hidden : null
+      };
+    });
+    const sessionsWhileHidden = (await handoffSessionKeys(browser)).length;
+
+    // A reload and a navigation in the SAME tab: the session comes back (session
+    // storage, not disk), and on another conversation it stays in the rail.
+    await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#aside-root', { timeout: 15_000 });
+    await page.waitForFunction(() => Boolean(document.querySelector('#aside-tabbar:not([hidden]) .aside-tab-handoff')), { timeout: 10_000 });
+    const homeRestoreState = await page.evaluate(() => {
+      const tabBar = document.querySelector('#aside-tabbar');
+      const sidebarRect = document.querySelector('nav[aria-label]')?.getBoundingClientRect();
+      const tabBarRect = tabBar?.getBoundingClientRect();
+      const overlaps = (a, b) => Boolean(a && b) && a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+      return {
+        location: window.location.href,
+        placement: tabBar?.getAttribute('data-placement'),
+        handoffTab: Boolean(document.querySelector('.aside-tab-handoff')),
+        cardHidden: document.querySelector('.aside-handoff') instanceof HTMLElement ? document.querySelector('.aside-handoff').hidden : null,
+        overlapsSidebar: overlaps(tabBarRect, sidebarRect)
+      };
+    });
+    // Clean up through the Owner's own path: open it from the rail and End it.
+    await page.evaluate(() => document.querySelector('.aside-tab-handoff button')?.click());
+    await page.waitForSelector(`${CARD}`, { timeout: 10_000 });
+    const jumpOnOtherConversation = await (async () => {
+      await clickCard(page, 'handoff-jump');
+      return (await cardState(page)).targetStatus;
+    })();
+    await clickCard(page, 'handoff-end');
+    await clickCard(page, 'handoff-end-confirm');
+    await page.waitForFunction(() => !document.querySelector('.aside-handoff'), { timeout: 10_000 });
+
+    return {
+      askState,
+      askOcclusion,
+      nativeOcclusion,
+      context,
+      precedingGoneWhenUnticked,
+      darkThemeState,
+      cardSurvivesOutsideEscape,
+      contextMenuPrevented,
+      minimizedState,
+      sessionsWhileHidden,
+      homeRestoreState,
+      jumpOnOtherConversation,
+      sessionsAfterEnd: (await handoffSessionKeys(browser)).length
+    };
+  } finally {
+    await page.close();
+  }
+}
+
+/**
+ * The whole ChatGPT lifecycle with a unique marker in the scratch content:
+ * select -> Ask -> inspect -> Copy & open -> the Owner confirms the mode, pastes
+ * and sends -> a follow-up in the native chat -> Return -> a second, independent
+ * question -> Hide -> End -> the native tab closed by hand. Persistence is
+ * observed throughout, not only at the end.
+ */
+async function runChatGPTHandoffScenario(browser) {
+  routeMap = { '/c/source-handoff': buildSourceHtml(), '/': buildNativeChatHtml({ provider: 'chatgpt' }) };
+  await installPersistenceProbe(browser);
+  const page = await createSourcePage(browser, '/c/source-handoff');
+  const sentinel = `owner clipboard sentinel ${MARK}-x`;
+  const result = { steps: {} };
+  try {
+    await writeClipboard(page, sentinel);
+    const pagesBefore = (await browser.pages()).length;
+
+    // 1. Selection alone: a local draft, nothing else.
+    await selectAssistantText(page);
+    await page.waitForFunction(() => {
+      const toolbar = document.querySelector('#aside-selection-toolbar');
+      return toolbar instanceof HTMLElement && !toolbar.hidden;
+    }, { timeout: 10_000 });
+    result.steps.afterSelection = {
+      clipboard: await readClipboard(page),
+      pages: (await browser.pages()).length - pagesBefore,
+      sessions: (await handoffSessionKeys(browser)).length
+    };
+
+    // 2. Ask: the card; still nothing copied, opened or saved.
+    await openCard(page);
+    result.steps.afterAsk = {
+      card: await cardState(page),
+      clipboard: await readClipboard(page),
+      pages: (await browser.pages()).length - pagesBefore,
+      sessions: (await handoffSessionKeys(browser)).length
+    };
+
+    // 3. The question and some background, both carrying the marker.
+    await page.type(`${CARD} textarea[data-aside-role="handoff-question"]`, `Why does it stay tight? ${MARK}`);
+    await page.evaluate((cardSelector) => {
+      const details = document.querySelector(`${cardSelector} details.aside-context`);
+      if (details) {
+        details.open = true;
+      }
+    }, CARD);
+    await page.type(`${CARD} textarea[data-aside-role="handoff-background"]`, `Background ${MARK}`);
+    await sleep(600);
+    const beforeCopy = await cardState(page);
+    result.steps.sessionHoldsMarker = (await workerEval(browser, async () => JSON.stringify(await chrome.storage.session.get(null)))).includes(MARK);
+
+    // 4. Copy & open, as a real click.
+    await clickCard(page, 'handoff-copy-open');
+    const target = await waitForPageAt(browser, CHATGPT_TEMPORARY_URL);
+    await page.bringToFront();
+    await page.waitForFunction((cardSelector) => document.querySelector(cardSelector)?.getAttribute('data-target') === 'open', { timeout: 10_000 }, CARD);
+    const copied = await readClipboard(page);
+    const afterOpen = await cardState(page);
+    const tabs = await tabsSnapshot(browser);
+    const sourceTab = tabs.find((tab) => tab.url === 'https://chatgpt.com/c/source-handoff');
+    const targetTab = tabs.find((tab) => tab.url === CHATGPT_TEMPORARY_URL);
+    result.steps.copyAndOpen = {
+      previewEqualsClipboard: copied === beforeCopy.preview,
+      clipboardHasMarker: copied.includes(MARK),
+      clipboardHasTex: copied.includes('SELECTED PASSAGE'),
+      card: afterOpen,
+      sourceUrl: page.url(),
+      targetInOwnWindow: Boolean(sourceTab && targetTab && sourceTab.windowId !== targetTab.windowId),
+      native: await target.evaluate(() => ({ ...window.__native, asideHost: Boolean(document.getElementById('aside-root')) }))
+    };
+
+    // 5. The Owner: turn the mode on, paste, send; then a follow-up there.
+    await target.bringToFront();
+    await target.evaluate(() => window.__ownerTurnOnMode());
+    await target.evaluate((text) => window.__ownerPasteAndSend(text), copied);
+    await target.evaluate(() => window.__ownerPasteAndSend('And if it were not convex?'));
+    // Selecting in the native page shows nothing of Aside's.
+    await target.evaluate(() => {
+      const paragraph = document.querySelector('#turns p');
+      const range = document.createRange();
+      range.selectNodeContents(paragraph);
+      getSelection()?.removeAllRanges();
+      getSelection()?.addRange(range);
+      document.dispatchEvent(new Event('selectionchange', { bubbles: true }));
+      document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    });
+    await sleep(500);
+    result.steps.owner = await target.evaluate(() => ({
+      prompts: window.__native.prompts,
+      modeClicks: window.__native.modeClicks,
+      sendClicks: window.__native.sendClicks,
+      composerInputs: window.__native.composerInputs,
+      keydowns: window.__native.keydowns,
+      asideToolbar: Boolean(document.getElementById('aside-selection-toolbar')),
+      asideHost: Boolean(document.getElementById('aside-root'))
+    }));
+    result.steps.owner.firstPromptIsCopied = result.steps.owner.prompts[0] === copied;
+    result.steps.owner.clipboardAfterFollowUp = await readClipboard(target);
+
+    // 6. Return to the source from the toolbar popup.
+    const popup = await openExtensionPage(browser, 'popup.html');
+    await popup.waitForSelector('.session', { timeout: 10_000 });
+    result.steps.popup = await popup.evaluate(() => ({
+      sessions: document.querySelectorAll('.session').length,
+      text: document.querySelector('.session')?.textContent ?? ''
+    }));
+    await popup.click('.session [data-aside-role="popup-return"]');
+    await popup.waitForFunction(() => /Back at|passage/.test(document.querySelector('.session .status')?.textContent ?? ''), { timeout: 10_000 });
+    result.steps.returned = {
+      popupStatus: await popup.evaluate(() => document.querySelector('.session .status')?.textContent ?? ''),
+      sourceActive: (await tabsSnapshot(browser)).find((tab) => tab.url === 'https://chatgpt.com/c/source-handoff')?.active ?? false,
+      // Drawn once the scroll settles, and cleared a couple of seconds later.
+      highlight: await page
+        .waitForSelector('#aside-highlight-overlay', { timeout: 4_000 })
+        .then(() => true, () => false)
+    };
+    await popup.close();
+
+    // 7. Continue focuses the SAME native tab; nothing new opens.
+    const pagesBeforeContinue = (await browser.pages()).length;
+    await clickCard(page, 'handoff-copy-open');
+    await sleep(600);
+    result.steps.continue = {
+      newPages: (await browser.pages()).length - pagesBeforeContinue,
+      targetActive: (await tabsSnapshot(browser)).find((tab) => tab.url === CHATGPT_TEMPORARY_URL)?.active ?? false,
+      clipboardUnchanged: (await readClipboard(page)) === copied
+    };
+
+    // 8. A second, independent question: its own session, its own native tab.
+    const firstSession = afterOpen.sessionId;
+    await page.bringToFront();
+    await selectAssistantText(page);
+    await openCard(page, '#aside-why-button');
+    const whyCard = await cardState(page);
+    await clickCard(page, 'handoff-copy-open');
+    await page.waitForFunction(
+      (cardSelector) => document.querySelector(cardSelector)?.getAttribute('data-target') === 'open',
+      { timeout: 15_000 },
+      CARD
+    );
+    const allTargets = (await tabsSnapshot(browser)).filter((tab) => tab.url === CHATGPT_TEMPORARY_URL);
+    result.steps.second = {
+      whyQuestion: whyCard.question,
+      distinctSession: whyCard.sessionId !== firstSession,
+      targets: allTargets.length,
+      sessions: (await handoffSessionKeys(browser)).length
+    };
+
+    // 9. Hide keeps it; the explicit clipboard clearing says what it does.
+    await clickCard(page, 'handoff-hide');
+    await page.waitForFunction(() => document.querySelectorAll('.aside-tab-handoff').length >= 1, { timeout: 10_000 });
+    result.steps.hidden = {
+      sessions: (await handoffSessionKeys(browser)).length,
+      railEntries: await page.evaluate(() => document.querySelectorAll('.aside-tab-handoff').length)
+    };
+
+    // 10. End the first session from its card: the owned native tab closes.
+    await page.evaluate((sessionId) => {
+      document.querySelector(`.aside-tab-handoff[data-session-id="${sessionId}"] button`)?.click();
+    }, firstSession);
+    await page.waitForFunction((sessionId) => document.querySelector(`.aside-handoff[data-session-id="${sessionId}"]`)?.hidden === false, { timeout: 10_000 }, firstSession);
+    await page.evaluate((cardSelector) => {
+      const more = document.querySelector(`${cardSelector} details.aside-panel-more`);
+      if (more) {
+        more.open = true;
+      }
+    }, CARD);
+    await clickCard(page, 'handoff-clear-clipboard');
+    result.steps.clipboardCleared = (await readClipboard(page)) === '';
+    await clickCard(page, 'handoff-end');
+    result.steps.endWarning = await page.evaluate((cardSelector) => document.querySelector(`${cardSelector} .aside-handoff-end-confirm p`)?.textContent ?? '', CARD);
+    await clickCard(page, 'handoff-end-confirm');
+    await page.waitForFunction((sessionId) => !document.querySelector(`.aside-handoff[data-session-id="${sessionId}"]`), { timeout: 10_000 }, firstSession);
+    await sleep(500);
+    result.steps.afterEnd = {
+      sessions: (await handoffSessionKeys(browser)).length,
+      targets: (await tabsSnapshot(browser)).filter((tab) => tab.url === CHATGPT_TEMPORARY_URL).length,
+      notice: await notices(page)
+    };
+
+    // 11. The Owner closes the second native tab by hand: that scratch ends too.
+    const secondTarget = (await browser.pages()).find((candidate) => candidate.url() === CHATGPT_TEMPORARY_URL);
+    const secondFound = Boolean(secondTarget);
+    const sessionsBeforeClose = (await handoffSessionKeys(browser)).length;
+    await secondTarget?.close();
+    const disposed = await page
+      .waitForFunction(() => !document.querySelector('.aside-handoff'), { timeout: 10_000 })
+      .then(() => true, () => false);
+    result.steps.afterTargetClose = {
+      secondFound,
+      sessionsBeforeClose,
+      disposed,
+      cards: await page.evaluate(() => Array.from(document.querySelectorAll('.aside-handoff')).map((card) => ({ id: card.getAttribute('data-session-id'), hidden: card.hidden }))),
+      tabs: await tabsSnapshot(browser),
+      sessions: (await handoffSessionKeys(browser)).length,
+      notice: await notices(page),
+      railEntries: await page.evaluate(() => document.querySelectorAll('.aside-tab-handoff').length)
+    };
+
+    // 12. Nothing durable, at any point.
+    const probe = await readPersistenceProbe(browser);
+    const storage = await readExtensionStorage(browser);
+    const database = await dumpQuestionDatabase(browser);
+    result.persistence = {
+      probeAlive: Boolean(probe),
+      localWritesWithMarker: (probe?.local ?? []).filter((entry) => entry.includes(MARK)).length,
+      syncWritesWithMarker: (probe?.sync ?? []).filter((entry) => entry.includes(MARK)).length,
+      authorityMessagesWithMarker: (probe?.messages ?? []).filter((entry) => entry.includes(MARK)).length,
+      localHasMarker: storage.local.includes(MARK),
+      sessionHasMarkerAfterEnd: storage.session.includes(MARK),
+      databaseHasMarker: database.includes(MARK),
+      consoleHasMarker: page.__consoleMessages.some((line) => line.includes(MARK))
+    };
+    return result;
+  } finally {
+    const pages = await browser.pages();
+    await Promise.all(pages.filter((candidate) => candidate.url().startsWith('https://chatgpt.com/?')).map((candidate) => candidate.close().catch(() => {})));
+    await page.close();
+  }
+}
+
+/** Closing the source leaves the native chat alone; the popup still reaches the session. */
+async function runSourceCloseScenario(browser) {
+  routeMap = { '/c/source-close': buildSourceHtml(), '/': buildNativeChatHtml({}) };
+  const page = await createSourcePage(browser, '/c/source-close');
+  await selectAssistantText(page);
+  await openCard(page);
+  await page.type(`${CARD} textarea[data-aside-role="handoff-question"]`, 'Source close question');
+  await clickCard(page, 'handoff-copy-open');
+  const target = await waitForPageAt(browser, CHATGPT_TEMPORARY_URL);
+  await page.close();
+  await sleep(500);
+  const popup = await openExtensionPage(browser, 'popup.html');
+  try {
+    await popup.waitForSelector('.session', { timeout: 10_000 });
+    const listed = await popup.evaluate(() => ({
+      text: document.querySelector('.session')?.textContent ?? '',
+      returnDisabled: document.querySelector('.session [data-aside-role="popup-return"]')?.disabled ?? null
+    }));
+    const targetOpenAfterSourceClose = !target.isClosed();
+    await popup.click('.session [data-aside-role="popup-end"]');
+    await popup.click('.session [data-aside-role="popup-end-confirm"]');
+    await popup.waitForFunction(() => /Cleared from Aside|still open/.test(document.querySelector('.session')?.textContent ?? ''), { timeout: 10_000 });
+    await sleep(500);
+    return {
+      listed,
+      targetOpenAfterSourceClose,
+      popupAfterEnd: await popup.evaluate(() => document.querySelector('.session')?.textContent ?? ''),
+      targetClosedByEnd: target.isClosed(),
+      sessions: (await handoffSessionKeys(browser)).length
+    };
+  } finally {
+    await popup.close();
+    if (!target.isClosed()) {
+      await target.close();
+    }
+  }
+}
+
+/** New-tab: same card and same contract, a tab beside the source instead of a window. */
+async function runNewTabScenario(browser) {
+  routeMap = { '/c/source-new-tab': buildSourceHtml(), '/': buildNativeChatHtml({}) };
+  const page = await createSourcePage(browser, '/c/source-new-tab');
+  try {
+    const pagesBefore = (await browser.pages()).length;
+    await selectAssistantText(page);
+    await openCard(page, '#aside-new-tab-button');
+    const card = await cardState(page);
+    const noTabBeforeQuestion = (await browser.pages()).length === pagesBefore;
+    await page.type(`${CARD} textarea[data-aside-role="handoff-question"]`, 'New tab question');
+    await clickCard(page, 'handoff-copy-open');
+    const target = await waitForPageAt(browser, CHATGPT_TEMPORARY_URL);
+    const tabs = await tabsSnapshot(browser);
+    const source = tabs.find((tab) => tab.url === 'https://chatgpt.com/c/source-new-tab');
+    const opened = tabs.find((tab) => tab.url === CHATGPT_TEMPORARY_URL);
+    const native = await target.evaluate(() => ({ ...window.__native }));
+    await clickCard(page, 'handoff-end');
+    await clickCard(page, 'handoff-end-confirm');
+    await page.waitForFunction(() => !document.querySelector('.aside-handoff'), { timeout: 10_000 });
+    await sleep(400);
+    return {
+      card,
+      noTabBeforeQuestion,
+      sameWindow: Boolean(source && opened && source.windowId === opened.windowId),
+      native,
+      targetClosedByEnd: target.isClosed()
+    };
+  } finally {
+    await page.close();
+  }
+}
+
+/** Why never inherits an old ordinary-mode preference, and writes nothing durable. */
+async function runWhyPreferenceScenario(browser) {
+  routeMap = { '/c/source-why': buildSourceHtml(), '/': buildNativeChatHtml({}) };
+  await workerEval(browser, async () => {
+    await chrome.storage.local.set({ 'aside:last-branch-kind:chatgpt': 'persistent', 'side-branches:last-branch-kind': 'persistent' });
+  });
+  await installPersistenceProbe(browser);
+  const messagesBefore = (await readPersistenceProbe(browser))?.messages.length ?? 0;
+  const page = await createSourcePage(browser, '/c/source-why');
+  try {
+    await selectAssistantText(page);
+    await openCard(page, '#aside-why-button');
+    const card = await cardState(page);
+    const session = await workerEval(browser, async () => JSON.stringify(await chrome.storage.session.get(null)));
+    await clickCard(page, 'handoff-end');
+    await clickCard(page, 'handoff-end-confirm');
+    await page.waitForFunction(() => !document.querySelector('.aside-handoff'), { timeout: 10_000 });
+    const probe = await readPersistenceProbe(browser);
+    return {
+      card,
+      temporaryIntended: session.includes('"policy":"temporary-intended"'),
+      entryWhy: session.includes('"entry":"why"'),
+      newAuthorityMessages: (probe?.messages.length ?? 0) - messagesBefore
+    };
+  } finally {
+    await page.close();
+  }
+}
+
+/** Claude: the plain new-chat page, the Owner starts Incognito there. */
+async function runClaudeScenario(browser, { variant = 'current' } = {}) {
+  routeMap = {};
+  claudeRouteMap = {
+    [`/chat/source-claude-${variant}`]: buildClaudeSourceHtml({ variant }),
+    '/new': buildNativeChatHtml({ provider: 'claude' }),
+    '*': buildNativeChatHtml({ provider: 'claude' })
+  };
+  const page = await createClaudePage(browser, `/chat/source-claude-${variant}`);
+  try {
+    await selectClaudeAssistantText(page);
+    await page.waitForFunction(() => {
+      const toolbar = document.querySelector('#aside-selection-toolbar');
+      return toolbar instanceof HTMLElement && !toolbar.hidden;
+    }, { timeout: 10_000 });
+    const toolbarLabel = await page.evaluate(() => document.querySelector('#aside-selection-toolbar')?.getAttribute('aria-label') ?? null);
+    await openCard(page);
+    await page.type(`${CARD} textarea[data-aside-role="handoff-question"]`, 'Why this assumption?');
+    await sleep(300);
+    const card = await cardState(page);
+    await capture(page, `handoff-claude-${variant}`);
+    await clickCard(page, 'handoff-copy-open');
+    const target = await waitForPageAt(browser, CLAUDE_NEW_URL);
+    await page.bringToFront();
+    const copied = await readClipboard(page);
+    const native = await target.evaluate(() => ({ ...window.__native, asideHost: Boolean(document.getElementById('aside-root')) }));
+    await clickCard(page, 'handoff-hide');
+    await page.waitForFunction(() => Boolean(document.querySelector('#aside-tabbar:not([hidden]) .aside-tab-handoff')), { timeout: 10_000 });
+    const railOverlapsSidebar = await page.evaluate(() => {
+      const nav = document.querySelector('nav[aria-label]')?.getBoundingClientRect();
+      const rail = document.querySelector('#aside-tabbar')?.getBoundingClientRect();
+      return Boolean(nav && rail && rail.left < nav.right && rail.right > nav.left);
+    });
+    await page.evaluate(() => document.querySelector('.aside-tab-handoff button')?.click());
+    await clickCard(page, 'handoff-end');
+    await clickCard(page, 'handoff-end-confirm');
+    await page.waitForFunction(() => !document.querySelector('.aside-handoff'), { timeout: 10_000 });
+    await sleep(400);
+    return {
+      variant,
+      toolbarLabel,
+      card,
+      previewEqualsClipboard: copied === card.preview,
+      native,
+      railOverlapsSidebar,
+      targetClosedByEnd: target.isClosed()
+    };
+  } finally {
+    await page.close();
+  }
+}
+
+/** Retired automation cannot be asked for by any client, and stale builds are refused. */
+async function runRetiredEndpointsScenario(browser) {
+  const page = await openExtensionPage(browser, 'popup.html');
+  try {
+    return await page.evaluate(async () => {
+      const send = (message) => chrome.runtime.sendMessage(message).catch((error) => ({ error: String(error) }));
+      const attempt = { providerId: 'chatgpt', panelId: 'p', attemptId: 'a' };
+      return {
+        createWindow: await send({ type: 'CREATE_BRANCH_WINDOW', ...attempt, prompt: 'x', launchUrl: 'https://chatgpt.com/', branchKind: 'temporary' }),
+        recheck: await send({ type: 'RECHECK_BRANCH_IN_TAB', ...attempt }),
+        automationEvent: await send({ type: 'BRANCH_AUTOMATION_EVENT', ...attempt, event: { kind: 'live' } }),
+        runInTab: await send({ type: 'RUN_BRANCH_PROMPT_IN_TAB', ...attempt, prompt: 'x', launchUrl: 'https://chatgpt.com/', branchKind: 'temporary' }),
+        staleOpen: await send({ type: 'HANDOFF_OPEN', buildId: 'an-older-build', sessionId: 'x', kind: 'window' }),
+        badUrl: await send({ type: 'OPEN_PROVIDER_URL', url: 'https://example.com/phish' })
+      };
+    });
+  } finally {
+    await page.close();
+  }
+}
+
+/** Many sessions opened and ended leave nothing behind in the page or in session storage. */
+async function runManySessionsScenario(browser) {
+  routeMap = { '/c/source-many': buildSourceHtml(), '/': buildNativeChatHtml({}) };
+  const page = await createSourcePage(browser, '/c/source-many');
+  try {
+    await selectAssistantText(page);
+    await openCard(page);
+    await clickCard(page, 'handoff-end');
+    await clickCard(page, 'handoff-end-confirm');
+    await page.waitForFunction(() => !document.querySelector('.aside-handoff'), { timeout: 10_000 });
+    const baselineNodes = await page.evaluate(() => document.getElementById('aside-root')?.querySelectorAll('*').length ?? 0);
+    for (let index = 0; index < 8; index += 1) {
+      await selectAssistantText(page);
+      await openCard(page);
+      await clickCard(page, 'handoff-end');
+      await clickCard(page, 'handoff-end-confirm');
+      await page.waitForFunction(() => !document.querySelector('.aside-handoff'), { timeout: 10_000 });
+    }
+    await sleep(300);
+    return {
+      baselineNodes,
+      finalNodes: await page.evaluate(() => document.getElementById('aside-root')?.querySelectorAll('*').length ?? 0),
+      cards: await page.evaluate(() => document.querySelectorAll('.aside-handoff').length),
+      sessions: (await handoffSessionKeys(browser)).length
+    };
+  } finally {
+    await page.close();
+  }
+}
+
+/**
+ * Saved data from before this release stays usable: the library, the legacy
+ * view on its source page (read-only, no frame, explicit navigation only), the
+ * question list, cross-tab view state, explicit delete, and the explicit local
+ * note from a new handoff.
+ */
+async function runRetainedDataScenario(browser, seedOutcome) {
+  routeMap = {
+    '/c/source-retained': buildSourceHtml(),
+    '/c/seed-legacy-branch': buildNativeChatHtml({ title: 'Saved legacy branch' }),
+    '/': buildNativeChatHtml({})
+  };
+  const library = await openExtensionPage(browser, 'library.html');
+  const result = { seedOutcome };
+  try {
+    await library.waitForSelector('#sources .source', { timeout: 20_000 });
+    result.footer = await library.evaluate(() => document.querySelector('#about')?.textContent ?? '');
+    // A phrase that exists only in the seeded captured answer.
+    await library.type('#search', 'Seeded saved answer');
+    await library.waitForSelector('#content .q', { timeout: 10_000 });
+    let previous = null;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await sleep(250);
+      const current = await library.evaluate(() => document.querySelector('#content')?.innerHTML ?? '');
+      if (current === previous) {
+        break;
+      }
+      previous = current;
+    }
+    result.searchHit = await library.evaluate(() => document.querySelector('#content .q small')?.textContent ?? '');
+    await library.evaluate(() => {
+      Array.from(document.querySelectorAll('#content .q button')).find((button) => button.textContent === 'View')?.click();
+    });
+    await library.waitForSelector('#content .msg[data-role="assistant"]', { timeout: 10_000 }).catch(() => null);
+    result.bundle = await library.evaluate(() => ({
+      content: (document.querySelector('#content')?.textContent ?? '').slice(0, 400),
+      assistantText: document.querySelector('#content .msg[data-role="assistant"]')?.textContent ?? null,
+      notes: document.querySelector('#content')?.textContent?.includes('Seeded note text') ?? false,
+      scripts: document.querySelectorAll('#content script').length
+    }));
+    result.lifecycle = await library.evaluate(async () => {
+      const send = (message) => chrome.runtime.sendMessage(message);
+      const bundle = (await send({ type: 'DOMAIN_QUERY', query: 'bundle', questionId: 'q_seed_resolve' })).bundle;
+      const resolved = await send({ type: 'DOMAIN_COMMAND', command: { type: 'ResolveQuestion', questionId: 'q_seed_resolve', baseRev: bundle.question.rev } });
+      const deleted = await send({ type: 'DOMAIN_COMMAND', command: { type: 'DeleteQuestion', questionId: 'q_seed_delete', descendants: 'reparent' } });
+      // A deleted question stays deleted: nothing can attach to it or recreate it.
+      const recreate = await send({
+        type: 'DOMAIN_COMMAND',
+        command: { type: 'SaveNote', note: { id: 'n_after_delete', questionId: 'q_seed_delete', sourceId: 'src_seed_chatgpt', text: 'x', messageId: null } }
+      });
+      const backup = await send({ type: 'DOMAIN_BACKUP' });
+      const markdown = await send({ type: 'DOMAIN_EXPORT_MARKDOWN', sourceId: 'src_seed_chatgpt' });
+      return {
+        resolved: resolved.outcome?.status,
+        deleted: deleted.outcome?.status,
+        noteOnDeleted: recreate.outcome?.status,
+        backupHasKept: (backup.backup?.data?.questions ?? []).some((question) => question.id === 'q_seed_kept'),
+        backupHasDeleted: (backup.backup?.data?.questions ?? []).some((question) => question.id === 'q_seed_delete'),
+        backupTombstoned: (backup.backup?.data?.tombstones ?? []).some((tombstone) => tombstone.id === 'q_seed_delete'),
+        markdownHasAnswer: JSON.stringify(markdown).includes('Seeded saved answer')
+      };
+    });
+  } finally {
+    await library.close();
+  }
+
+  // The legacy view on its source page.
+  const page = await createSourcePage(browser, '/c/source-retained');
+  try {
+    await page.waitForSelector('.aside-legacy-panel', { timeout: 15_000 });
+    result.legacyView = await page.evaluate(() => {
+      const panel = document.querySelector('.aside-legacy-panel');
+      return {
+        visible: panel instanceof HTMLElement && !panel.hidden,
+        questionBox: Boolean(panel?.querySelector('textarea[data-aside-role="question"]')),
+        startButton: Array.from(panel?.querySelectorAll('button') ?? []).some((button) => /Start branch|Try again/.test(button.textContent ?? '')),
+        iframe: Boolean(document.querySelector('#aside-root iframe')),
+        archive: panel?.querySelector('.aside-archive')?.textContent ?? '',
+        openConversation: Boolean(panel?.querySelector('[data-aside-role="legacy-open-conversation"]')),
+        askHandoff: Boolean(panel?.querySelector('[data-aside-role="legacy-ask-handoff"]'))
+      };
+    });
+    result.openButton = await page.evaluate(() => {
+      const button = document.querySelector('.aside-legacy-panel [data-aside-role="legacy-open-conversation"]');
+      const rect = button?.getBoundingClientRect();
+      const hit = rect ? document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) : null;
+      return {
+        display: button ? getComputedStyle(button).display : null,
+        width: rect ? Math.round(rect.width) : null,
+        hitIsButton: hit === button
+      };
+    });
+    await page.click('.aside-legacy-panel [data-aside-role="legacy-open-conversation"]');
+    try {
+      const saved = await waitForPageAt(browser, 'https://chatgpt.com/c/seed-legacy-branch');
+      result.savedLink = await saved.evaluate(() => ({ ...window.__native, asideHost: Boolean(document.getElementById('aside-root')) }));
+      await saved.close();
+    } catch (error) {
+      const opened = (await browser.pages()).find((candidate) => candidate.url() === 'https://chatgpt.com/c/seed-legacy-branch');
+      result.savedLink = {
+        openedPage: opened
+          ? await opened.evaluate(() => ({ title: document.title, ready: window.__fixtureReady ?? null, html: document.documentElement.outerHTML.slice(0, 300) })).catch((e) => String(e))
+          : null,
+        error: String(error),
+        notice: await notices(page),
+        log: (page.__consoleMessages ?? []).slice(-6)
+      };
+    }
+    await page.bringToFront();
+    const recordBefore = JSON.parse((await readExtensionStorage(browser)).local)['aside:panel:panel_seed_live'];
+    await page.click('.aside-legacy-panel [data-aside-role="legacy-ask-handoff"]');
+    await page.waitForSelector(`${CARD}`, { timeout: 10_000 });
+    result.handoffFromLegacy = await cardState(page);
+    // An explicit local note from the new handoff.
+    await clickCard(page, 'handoff-save-note-open');
+    await page.type(`${CARD} textarea[data-aside-role="handoff-note-text"]`, 'Note saved on purpose');
+    await clickCard(page, 'handoff-note-save');
+    await page.waitForFunction(() => /Saved to Aside/.test(document.querySelector('.aside-notice')?.textContent ?? ''), { timeout: 10_000 });
+    await clickCard(page, 'handoff-end');
+    await clickCard(page, 'handoff-end-confirm');
+    await page.waitForFunction(() => !document.querySelector('.aside-handoff'), { timeout: 10_000 });
+    const recordAfter = JSON.parse((await readExtensionStorage(browser)).local)['aside:panel:panel_seed_live'];
+    result.legacyRecordUnchanged = JSON.stringify(recordBefore?.state?.selection) === JSON.stringify(recordAfter?.state?.selection) &&
+      recordBefore?.state?.initialQuestion === recordAfter?.state?.initialQuestion;
+  } finally {
+    await page.close();
+  }
+
+  // Cross-tab: closing the legacy view in tab A does not close it in tab B.
+  const tabA = await createSourcePage(browser, '/c/source-retained');
+  const tabB = await createSourcePage(browser, '/c/source-retained');
+  try {
+    await tabA.waitForSelector('.aside-legacy-panel', { timeout: 15_000 });
+    await tabB.waitForSelector('.aside-legacy-panel', { timeout: 15_000 });
+    await tabA.evaluate(() => {
+      Array.from(document.querySelectorAll('.aside-legacy-panel .aside-panel-actions button')).find((button) => button.textContent === 'Close')?.click();
+    });
+    await sleep(800);
+    result.crossTab = {
+      closedInA: await tabA.evaluate(() => !document.querySelector('.aside-legacy-panel')),
+      stillInB: await tabB.evaluate(() => Boolean(document.querySelector('.aside-legacy-panel'))),
+      recordKept: Boolean(JSON.parse((await readExtensionStorage(browser)).local)['aside:panel:panel_seed_live'])
+    };
+  } finally {
+    await tabA.close();
+    await tabB.close();
+  }
+
+  const database = await dumpQuestionDatabase(browser);
+  result.database = {
+    kept: database.includes('q_seed_kept'),
+    note: database.includes('Note saved on purpose'),
+    handoffNoteMode: database.includes('native-handoff'),
+    tombstone: database.includes('"q_seed_delete"') && database.includes('tombstones'),
+    savedAnswer: database.includes('Seeded saved answer about retained convexity.')
+  };
+  const storage = await readExtensionStorage(browser);
+  result.journal = JSON.parse(storage.local)['aside:migration-journal'] ?? null;
+  return result;
 }
 
 await fs.rm(profilePath, { recursive: true, force: true });
@@ -2777,458 +1918,363 @@ const browser = await puppeteer.launch({
 
 let exitCode = 0;
 
+function check(condition, label, detail) {
+  if (!condition) {
+    throw new Error(`${label}: ${JSON.stringify(detail)}`);
+  }
+}
+
 try {
   await installBrowserInterception(browser);
+  watchForUnservedProviderPages(browser);
+  const context = browser.defaultBrowserContext();
+  for (const origin of ['https://chatgpt.com', 'https://claude.ai']) {
+    await context.overridePermissions(origin, ['clipboard-read', 'clipboard-write', 'clipboard-sanitized-write']);
+  }
+  await serviceWorker(browser);
 
-  const nonProject = await runNonProjectScenario(browser);
-  const why = includeNativeWindowSmoke ? await runWhyScenario(browser) : null;
-  const newTab = includeNativeWindowSmoke ? await runNewTabScenario(browser) : null;
-  const enterOnly = await runEnterOnlyScenario(browser);
-  const project = await runProjectScenario(browser);
-  const temporaryChatUnconfirmed = await runTemporaryChatUnconfirmedScenario(browser);
-  const temporaryChatVerified = await runTemporaryChatVerifiedScenario(browser);
-  const temporaryChatBlocked = await runTemporaryChatBlockedScenario(browser);
-  const temporaryChatMenuChooser = await runTemporaryChatMenuChooserScenario(browser);
-  const claudeIncognitoActive = await runClaudeIncognitoActiveScenario(browser);
+  // Saved data from before this release, present for the whole run.
+  const seedOutcome = await seedRetainedData(browser);
+  console.log('SEED', JSON.stringify(seedOutcome));
+
+  const coexistence = await runCoexistenceScenario(browser);
+  const chatgpt = await runChatGPTHandoffScenario(browser);
+  const sourceClose = await runSourceCloseScenario(browser);
+  const newTab = await runNewTabScenario(browser);
+  const whyPreference = await runWhyPreferenceScenario(browser);
   const claudeCurrent = await runClaudeScenario(browser, { variant: 'current' });
   const claudeLegacy = await runClaudeScenario(browser, { variant: 'legacy' });
-  const claudeEmbedded = await runClaudeEmbeddedScenario(browser);
+  const retired = await runRetiredEndpointsScenario(browser);
+  const many = await runManySessionsScenario(browser);
   const layoutMatrix = await runLayoutMatrixScenario(browser);
-  const crossTab = await runCrossTabScenario(browser);
-  const failure = await runFailureScenario(browser);
-  const library = await runLibraryScenario(browser, { questionId: nonProject.liveResult.questionId });
+  const retained = await runRetainedDataScenario(browser, seedOutcome);
 
-  const result = {
-    nonProject,
-    why,
-    newTab,
-    enterOnly,
-    project,
-    temporaryChatUnconfirmed,
-    temporaryChatVerified,
-    temporaryChatBlocked,
-    temporaryChatMenuChooser,
-    claudeIncognitoActive,
-    layoutMatrix,
-    claudeCurrent,
-    claudeLegacy,
-    claudeEmbedded,
-    crossTab,
-    failure,
-    library
-  };
-
+  const result = { coexistence, chatgpt, sourceClose, newTab, whyPreference, claudeCurrent, claudeLegacy, retired, many, layoutMatrix, retained };
   console.log(JSON.stringify(result, null, 2));
 
-  if (
-    library.extensionIdKnown !== true ||
-    (library.sourceCount ?? 0) < 1 ||
-    !/Aside build /.test(library.footer) ||
-    !/matched in (message|title|draft)/.test(library.searchHit) ||
-    !library.bundle.assistantText?.includes('This uses only the selected passage.') ||
-    library.bundle.promptShown !== true ||
-    // The non-project question's own record: answer complete, captured through,
-    // the frozen prompt equal to what the branch received, run submitted.
-    !library.record ||
-    library.record.title !== 'Why this assumption?' ||
-    library.record.lastAssistantText !== 'This uses only the selected passage.' ||
-    library.record.lastAssistantPartial !== false ||
-    library.record.capture !== 'captured-through' ||
-    library.record.snapshotPrompt !== nonProject.liveResult.prompt ||
-    library.record.conversationUrl !== 'https://chatgpt.com/c/generated-local' ||
-    // Captured text is rendered as text nodes only.
-    library.bundle.scripts !== 0 ||
-    // Migration ran and validated on this fresh profile (nothing legacy to migrate).
-    !library.journal || library.journal.validation?.ok !== true ||
-    library.dialogs.length !== 0
-  ) {
-    throw new Error(`Library scenario failed: ${JSON.stringify(library)}`);
-  }
+  /* ---------------------------- coexistence ---------------------------- */
+  check(coexistence.askOcclusion.allReachable === true, "Aside's own controls were covered by provider UI", coexistence.askOcclusion);
+  check(coexistence.nativeOcclusion.allReachable === true, "Aside covered the provider's own controls", coexistence.nativeOcclusion);
+  check(
+    coexistence.askState.visibleActions.join('|') === 'Ask|Why|New-tab' &&
+      coexistence.askState.toolbarIsLabelledAside === 'Aside branch actions' &&
+      coexistence.askState.nativeAskHitTargetIsNative === true &&
+      coexistence.askState.asideOverlapsNativeAsk === false,
+    'Native selection action must stay usable alongside Aside',
+    coexistence.askState
+  );
+  check(
+    coexistence.context.rolesIncluded.includes('focus') &&
+      coexistence.context.rolesIncluded.includes('preceding-question') &&
+      coexistence.context.precedingInPreview === true &&
+      coexistence.precedingGoneWhenUnticked === true,
+    'Context: the preceding question is in by default and leaves when unticked',
+    coexistence.context
+  );
+  check(
+    coexistence.darkThemeState.theme === 'dark' && isDarkRgb(coexistence.darkThemeState.panelBackground),
+    'Dark theme did not propagate to the card',
+    coexistence.darkThemeState
+  );
+  check(coexistence.cardSurvivesOutsideEscape === true && coexistence.contextMenuPrevented === false, 'Escape/right-click outside Aside must stay native', coexistence);
+  const rail = coexistence.minimizedState;
+  check(
+    rail.placement === 'left-gutter' &&
+      rail.flexDirection === 'column' &&
+      rail.overlapsSidebar === false &&
+      rail.overlapsReadingColumn === false &&
+      rail.tabHitInsideRail === true &&
+      rail.badge === 'temporary' &&
+      rail.cardHidden === true &&
+      (rail.tabBarLeft ?? 0) >= (rail.sidebarRight ?? 0) &&
+      (rail.tabBarLeft ?? 0) < (rail.readingColumnLeft ?? 0) &&
+      coexistence.sessionsWhileHidden === 1,
+    'Hidden handoff must sit in the left-gutter rail and keep its session',
+    { rail, sessions: coexistence.sessionsWhileHidden }
+  );
+  check(
+    coexistence.homeRestoreState.handoffTab === true &&
+      coexistence.homeRestoreState.cardHidden === true &&
+      coexistence.homeRestoreState.overlapsSidebar === false &&
+      /different conversation/.test(coexistence.jumpOnOtherConversation ?? '') &&
+      coexistence.sessionsAfterEnd === 0,
+    'A reload/navigation in the source tab must bring the session back to the rail, and End must clear it',
+    { home: coexistence.homeRestoreState, jump: coexistence.jumpOnOtherConversation, after: coexistence.sessionsAfterEnd }
+  );
 
-  layoutMatrix.forEach((entry) => {
-    if (
-      // Aside must always offer a way in.
-      entry.anythingShown !== true ||
-      // The RAIL belongs in left-side whitespace. The compact launcher is the
-      // documented fallback when no gutter exists and only has to be in verified
-      // free space, which at 768px with the sidebar open is not the left.
-      (entry.railShown && entry.onLeftHalf !== true) ||
-      entry.overlapsSidebar !== false ||
-      entry.overlapsColumn !== false ||
-      entry.overlapsNativeAsk !== false ||
-      entry.nativeAskHitTargetIsNative !== true ||
-      // And, for a popup that mounted after Aside had already placed itself:
-      // nothing of Aside's is painted over.
-      entry.occlusion?.allReachable !== true ||
-      entry.nativeOcclusion?.allReachable !== true ||
-      // The rail is either placed in the gutter or replaced by the compact launcher.
-      !(entry.placement === 'left-gutter' || entry.launcherShown) ||
-      entry.theme !== (entry.label.endsWith('dark') ? 'dark' : 'light')
-    ) {
-      throw new Error(`Layout matrix failed at ${entry.label}: ${JSON.stringify(entry)}`);
-    }
-  });
+  /* --------------------------- ChatGPT lifecycle --------------------------- */
+  const steps = chatgpt.steps;
+  check(
+    steps.afterSelection.clipboard.startsWith('owner clipboard sentinel') && steps.afterSelection.pages === 0 && steps.afterSelection.sessions === 0,
+    'Selection alone must not copy, open or store anything',
+    steps.afterSelection
+  );
+  check(
+    steps.afterAsk.card.label === 'Temporary handoff · Not saved in Aside' &&
+      /Confirm the temporary mode in the native page before pasting/.test(steps.afterAsk.card.instruction ?? '') &&
+      steps.afterAsk.card.question === '' &&
+      steps.afterAsk.card.questionFocused === true &&
+      steps.afterAsk.card.primary === 'Copy & open temporary chat' &&
+      steps.afterAsk.card.hasIframe === false &&
+      steps.afterAsk.clipboard.startsWith('owner clipboard sentinel') &&
+      steps.afterAsk.pages === 0 &&
+      steps.afterAsk.sessions === 1 &&
+      steps.sessionHoldsMarker === true,
+    'Ask must open a card and nothing else',
+    { afterAsk: steps.afterAsk, sessionHoldsMarker: steps.sessionHoldsMarker }
+  );
+  const open = steps.copyAndOpen;
+  check(
+    open.previewEqualsClipboard === true &&
+      open.clipboardHasMarker === true &&
+      open.clipboardHasTex === true &&
+      open.card.primary === 'Continue in ChatGPT' &&
+      /Copied: this exact prompt is on the clipboard\. Nothing has been sent\./.test(open.card.clipboardStatus ?? '') &&
+      /ChatGPT opened in a new window/.test(open.card.targetStatus ?? '') &&
+      open.sourceUrl === 'https://chatgpt.com/c/source-handoff' &&
+      open.targetInOwnWindow === true,
+    'Copy & open must copy exactly the preview and open a top-level window without moving the source',
+    open
+  );
+  check(
+    open.native.url === CHATGPT_TEMPORARY_URL &&
+      !open.native.url.includes(MARK) &&
+      open.native.referrer === '' &&
+      open.native.asideHost === false &&
+      open.native.modeClicks === 0 &&
+      open.native.sendClicks === 0 &&
+      open.native.composerInputs === 0 &&
+      open.native.keydowns === 0 &&
+      open.native.pastes === 0 &&
+      open.native.prompts.length === 0,
+    'The native page must receive nothing: no content in the URL or referrer, no clicks, typing, paste or send, no Aside UI',
+    open.native
+  );
+  check(
+    steps.owner.firstPromptIsCopied === true &&
+      steps.owner.prompts.length === 2 &&
+      steps.owner.prompts[1] === 'And if it were not convex?' &&
+      steps.owner.composerInputs === 0 &&
+      steps.owner.keydowns === 0 &&
+      steps.owner.asideToolbar === false &&
+      steps.owner.asideHost === false &&
+      steps.owner.clipboardAfterFollowUp === open.card.preview,
+    "The Owner's paste and follow-up stay native; Aside does not re-copy or appear in the native page",
+    steps.owner
+  );
+  check(
+    steps.popup.sessions === 1 &&
+      /temporary handoff/.test(steps.popup.text) &&
+      /Back at the passage/.test(steps.returned.popupStatus) &&
+      steps.returned.sourceActive === true &&
+      steps.returned.highlight === true,
+    'Return to source from the toolbar popup must focus the source and find the passage',
+    { popup: steps.popup, returned: steps.returned }
+  );
+  check(
+    steps.continue.newPages === 0 && steps.continue.targetActive === true && steps.continue.clipboardUnchanged === true,
+    'Continue must focus the same native tab without copying again',
+    steps.continue
+  );
+  check(
+    steps.second.whyQuestion === WHY_TEXT && steps.second.distinctSession === true && steps.second.targets === 2 && steps.second.sessions === 2,
+    'A second question must get its own session and its own native tab',
+    steps.second
+  );
+  check(steps.hidden.sessions === 2 && steps.hidden.railEntries >= 1, 'Hide must keep the session', steps.hidden);
+  check(steps.clipboardCleared === true, 'Explicit Clear clipboard must replace the clipboard', steps.clipboardCleared);
+  check(
+    /cannot be reopened after it is closed/.test(steps.endWarning) &&
+      steps.afterEnd.sessions === 1 &&
+      steps.afterEnd.targets === 1 &&
+      /Cleared from Aside/.test(steps.afterEnd.notice),
+    'End must warn, clear the session and close only its own native tab',
+    { warning: steps.endWarning, afterEnd: steps.afterEnd }
+  );
+  check(
+    steps.afterTargetClose.disposed === true &&
+      steps.afterTargetClose.sessions === 0 &&
+      /was closed/.test(steps.afterTargetClose.notice) &&
+      steps.afterTargetClose.railEntries === 0,
+    'Closing the native tab by hand must end its scratch in the source page',
+    steps.afterTargetClose
+  );
+  const persistence = chatgpt.persistence;
+  check(
+    persistence.probeAlive === true &&
+      persistence.localWritesWithMarker === 0 &&
+      persistence.syncWritesWithMarker === 0 &&
+      persistence.authorityMessagesWithMarker === 0 &&
+      persistence.localHasMarker === false &&
+      persistence.sessionHasMarkerAfterEnd === false &&
+      persistence.databaseHasMarker === false &&
+      persistence.consoleHasMarker === false,
+    'Scratch content must never reach durable storage, the question database or logs',
+    persistence
+  );
 
+  /* ----------------------------- other paths ----------------------------- */
+  check(
+    sourceClose.targetOpenAfterSourceClose === true &&
+      /source tab was closed/.test(sourceClose.listed.text) &&
+      sourceClose.listed.returnDisabled === true &&
+      sourceClose.targetClosedByEnd === true &&
+      sourceClose.sessions === 0,
+    'Closing the source must leave the native tab and keep End reachable from the toolbar',
+    sourceClose
+  );
+  check(
+    newTab.noTabBeforeQuestion === true &&
+      newTab.card.question === '' &&
+      newTab.card.primary === 'Copy & open temporary chat in a new tab' &&
+      newTab.sameWindow === true &&
+      newTab.native.sendClicks === 0 &&
+      newTab.native.composerInputs === 0 &&
+      newTab.targetClosedByEnd === true,
+    'New-tab must prepare first, then open a tab beside the source, with nothing sent',
+    newTab
+  );
+  check(
+    whyPreference.card.question === WHY_TEXT &&
+      whyPreference.card.label === 'Temporary handoff · Not saved in Aside' &&
+      whyPreference.card.primary === 'Copy & open temporary chat' &&
+      whyPreference.temporaryIntended === true &&
+      whyPreference.entryWhy === true &&
+      whyPreference.newAuthorityMessages === 0,
+    'Why must stay a temporary handoff whatever an old preference said, and write nothing durable',
+    whyPreference
+  );
   [claudeCurrent, claudeLegacy].forEach((claude) => {
-    if (
-      claude.toolbarState.visible !== true ||
-      claude.toolbarState.label !== 'Aside branch actions' ||
-      // The selection must reach a Claude branch on Claude, never a chatgpt.com URL.
-      !claude.branchState.location.startsWith('https://claude.ai/') ||
-      !claude.branchState.lastPrompt?.includes('SELECTED PASSAGE') ||
-      !claude.branchState.lastPrompt?.includes('convexity assumption') ||
-      !claude.branchState.lastPrompt?.includes('fallible excerpt') ||
-      !claude.branchState.assistantText?.includes('This answers the selected passage.') ||
-      // Claude refuses framing, so the branch must say it runs in a Claude window.
-      // Claude refuses framing, so the branch must report a Claude window surface.
-      !/Claude window/.test(claude.panelState.status || claude.panelState.surface || '') ||
-      claude.panelState.railOverlapsSidebar !== false ||
-      !claude.contextPreview.includes('SELECTED PASSAGE') ||
-      // Exactly one submit: the fallback chain must not post the question twice.
-      claude.branchState.sendClicks !== 1
-    ) {
-      throw new Error(`Claude ${claude.variant} scenario failed: ${JSON.stringify(claude)}`);
-    }
+    check(
+      claude.toolbarLabel === 'Aside branch actions' &&
+        claude.card.label === 'Temporary handoff · Not saved in Aside' &&
+        /SELECTED PASSAGE/.test(claude.card.preview ?? '') &&
+        claude.previewEqualsClipboard === true &&
+        claude.native.url === CLAUDE_NEW_URL &&
+        claude.native.referrer === '' &&
+        claude.native.asideHost === false &&
+        claude.native.modeClicks === 0 &&
+        claude.native.sendClicks === 0 &&
+        claude.native.composerInputs === 0 &&
+        claude.railOverlapsSidebar === false &&
+        claude.targetClosedByEnd === true,
+      `Claude ${claude.variant} handoff failed`,
+      claude
+    );
   });
+  check(
+    retired.createWindow?.code === 'retired' &&
+      retired.recheck?.code === 'retired' &&
+      retired.automationEvent?.code === 'retired' &&
+      retired.runInTab?.code === 'retired' &&
+      retired.staleOpen?.code === 'stale-client' &&
+      retired.badUrl?.ok === false,
+    'Retired automation and stale clients must be refused',
+    retired
+  );
+  check(
+    many.cards === 0 && many.sessions === 0 && many.finalNodes <= many.baselineNodes + 2,
+    'Opening and ending many sessions must not leave nodes or session entries behind',
+    many
+  );
+  layoutMatrix.forEach((entry) => {
+    check(
+      entry.anythingShown === true &&
+        (!entry.railShown || entry.onLeftHalf === true) &&
+        entry.overlapsSidebar === false &&
+        entry.overlapsColumn === false &&
+        entry.overlapsNativeAsk === false &&
+        entry.nativeAskHitTargetIsNative === true &&
+        entry.occlusion?.allReachable === true &&
+        entry.nativeOcclusion?.allReachable === true &&
+        entry.composerUnderCard?.applicable === true &&
+        entry.composerUnderCard?.reachable === true &&
+        (entry.placement === 'left-gutter' || entry.launcherShown) &&
+        entry.theme === (entry.label.includes('dark') ? 'dark' : 'light'),
+      `Layout matrix failed at ${entry.label}`,
+      entry
+    );
+  });
+
+  /* ------------------------------ saved data ------------------------------ */
+  check(
+    retained.seedOutcome.every((status) => status === 'applied' || status === 'ok') &&
+      /Aside build /.test(retained.footer) &&
+      /matched in (message|title|draft|note)/.test(retained.searchHit) &&
+      retained.bundle.assistantText === 'Seeded saved answer about retained convexity.' &&
+      retained.bundle.notes === true &&
+      retained.bundle.scripts === 0,
+    'Saved records must stay searchable and readable in the library',
+    retained
+  );
+  check(
+    retained.lifecycle.resolved === 'applied' &&
+      retained.lifecycle.deleted === 'applied' &&
+      retained.lifecycle.noteOnDeleted === 'rejected' &&
+      retained.lifecycle.backupHasKept === true &&
+      retained.lifecycle.backupHasDeleted === false &&
+      retained.lifecycle.backupTombstoned === true &&
+      retained.lifecycle.markdownHasAnswer === true,
+    'Resolve, delete (tombstoned), backup and export must keep working on saved records',
+    retained.lifecycle
+  );
+  check(
+    retained.legacyView.visible === true &&
+      retained.legacyView.questionBox === false &&
+      retained.legacyView.startButton === false &&
+      retained.legacyView.iframe === false &&
+      /Seeded legacy archived answer/.test(retained.legacyView.archive) &&
+      retained.legacyView.openConversation === true &&
+      retained.legacyView.askHandoff === true,
+    'A legacy view must be read-only: no send form, no frame',
+    retained.legacyView
+  );
+  check(
+    retained.savedLink.url === 'https://chatgpt.com/c/seed-legacy-branch' &&
+      retained.savedLink.sendClicks === 0 &&
+      retained.savedLink.composerInputs === 0 &&
+      retained.savedLink.asideHost === true,
+    'Opening a saved conversation must be plain navigation',
+    retained.savedLink
+  );
+  check(
+    retained.handoffFromLegacy.question === 'Seeded legacy question' &&
+      retained.handoffFromLegacy.label === 'Temporary handoff · Not saved in Aside' &&
+      retained.legacyRecordUnchanged === true,
+    'Asking from a legacy view must start a handoff and leave the record untouched',
+    { card: retained.handoffFromLegacy, unchanged: retained.legacyRecordUnchanged }
+  );
+  check(
+    retained.crossTab.closedInA === true && retained.crossTab.stillInB === true && retained.crossTab.recordKept === true,
+    'Closing a view in one tab must not close it in another or delete the record',
+    retained.crossTab
+  );
+  check(
+    retained.database.kept === true &&
+      retained.database.note === true &&
+      retained.database.handoffNoteMode === true &&
+      retained.database.tombstone === true &&
+      retained.database.savedAnswer === true &&
+      retained.journal?.validation?.ok === true,
+    'The question database must keep saved data, the explicit note and the migration state',
+    { database: retained.database, journal: retained.journal }
+  );
 
   if (networkEscapes.length) {
-    throw new Error(
-      `Requests escaped to hosts the harness does not serve: ${JSON.stringify([...new Set(networkEscapes)])}`
-    );
+    throw new Error(`Requests escaped to hosts the harness does not serve: ${JSON.stringify([...new Set(networkEscapes)])}`);
   }
-
-  if (
-    !crossTab.panelId ||
-    crossTab.panelStoredAfterEdit !== true ||
-
-    // Tab B's edit must never be silently lost. Either it reached the store, or
-    // the panel still holds it in the box. Which of the two happens depends on
-    // how the two tabs interleave, which a browser test should not have to win;
-    // the policy that decides it is unit-tested directly in
-    // tests/panel-store.spec.ts ("write conflict policy"). What is asserted here
-    // is the property that does not depend on timing: the text still exists.
-    !(
-      crossTab.editVisibleInStore === true ||
-      crossTab.tabBWriteState?.textareaValue === 'edited in tab B'
-    ) ||
-    // Close is presentation only: the record survives, no tombstone, and tab B's
-    // own view is not forced shut by tab A's close.
-    crossTab.panelKeptAfterClose !== true ||
-    crossTab.tombstoneAfterCloseOnly !== false ||
-    crossTab.tabBViewSurvivedClose !== true ||
-    (crossTab.listRowCount ?? 0) < 1 ||
-    // An explicit delete in tab A must leave a tombstone and must not be undone by tab B.
-    crossTab.tombstoneWritten !== true ||
-    crossTab.panelResurrectedAfterClose !== false ||
-    crossTab.lateWriteLanded !== false ||
-    crossTab.tabBStillShowsPanel !== false
-  ) {
-    throw new Error(`Cross-tab panel protocol failed: ${JSON.stringify(crossTab)}`);
-  }
-
-  // The live failure this exists for: Aside's toolbar was placed, was visible and
-  // was the right size, and the provider's popup was painted over half of it. A
-  // rectangle comparison cannot express that; asking the page what a click would
-  // actually reach can.
-  if (nonProject.askOcclusion?.allReachable !== true) {
-    throw new Error(
-      `Aside's own controls were covered by provider UI: ${JSON.stringify(nonProject.askOcclusion)}`
-    );
-  }
-
-  // The direction that actually shipped: Aside's host sits near the maximum
-  // z-index, so Aside covering the provider is the likely failure, not the
-  // reverse. Nothing asserted this until a live Claude run found it.
-  if (nonProject.nativeOcclusion?.allReachable !== true) {
-    throw new Error(
-      `Aside covered the provider's own controls: ${JSON.stringify(nonProject.nativeOcclusion)}`
-    );
-  }
-
-  // Claude must ATTEMPT the in-page panel. It opened a separate window for every
-  // branch because a capability flag said embedding was impossible — an assumption
-  // that, because the same flag gated the attempt, nothing could ever disprove.
-  if (claudeEmbedded.framedInPanel !== true || claudeEmbedded.openedSeparateWindow !== false) {
-    throw new Error(
-      `Claude did not run its branch in the in-page panel: ${JSON.stringify(claudeEmbedded)}`
-    );
-  }
-
-  if (
-    nonProject.askState.visibleActions.join('|') !== 'Ask|Why|New-tab' ||
-    // Aside must coexist with the provider's own selection action, not hide it.
-    nonProject.askState.nativeAskUsable !== true ||
-    nonProject.askState.nativeAskHitTargetIsNative !== true ||
-    nonProject.askState.asideOverlapsNativeAsk !== false ||
-    nonProject.askState.nativeAskClassList !== '' ||
-    nonProject.askState.toolbarIsLabelledAside !== 'Aside branch actions'
-  ) {
-    throw new Error(
-      `Native selection action must stay usable alongside Aside: ${JSON.stringify(nonProject.askState)}`
-    );
-  }
-
-  if (
-    nonProject.darkThemeState.theme !== 'dark' ||
-    !isDarkRgb(nonProject.darkThemeState.panelBackground)
-  ) {
-    throw new Error(`Dark theme did not propagate: ${JSON.stringify(nonProject.darkThemeState)}`);
-  }
-
-  if (
-    nonProject.liveResult.status !== 'Branch answer is ready in this window.' ||
-    nonProject.liveResult.title !== 'Why this assumption?' ||
-    // Preview equals submission, byte for byte.
-    nonProject.liveResult.contextPreviewMatchesPrompt !== true ||
-    nonProject.liveResult.precedingQuestionDefaultOn !== true ||
-    nonProject.liveResult.precedingQuestionPresentByDefault !== true ||
-    nonProject.liveResult.precedingQuestionGoneWhenUnticked !== true ||
-    nonProject.liveResult.branchLocation !== 'https://chatgpt.com/c/generated-local' ||
-    !nonProject.liveResult.openBranchVisible ||
-    nonProject.liveResult.pageCountBefore !== nonProject.liveResult.pageCountAfter ||
-    !nonProject.liveResult.promptContainsSelectedPassage ||
-    !nonProject.liveResult.promptContainsLocalSourceAnswer ||
-    !nonProject.liveResult.assistantText?.includes('This uses only the selected passage.') ||
-    // Captured, and said so: the fixture stops generating immediately, so the
-    // answer must settle to a complete message with a "captured through" label.
-    nonProject.liveResult.captureState?.assistantPartial !== 'false' ||
-    !/Captured through/.test(nonProject.liveResult.captureState?.archiveStatus ?? '')
-  ) {
-    throw new Error(`Non-project embedded branch scenario failed: ${JSON.stringify(nonProject.liveResult)}`);
-  }
-
-  if (
-    // The rail belongs in free LEFT-side whitespace: right of the provider sidebar,
-    // left of the reading column, overlapping neither.
-    nonProject.minimizedState.placement !== 'left-gutter' ||
-    nonProject.minimizedState.flexDirection !== 'column' ||
-    !nonProject.minimizedState.tabVisible ||
-    nonProject.minimizedState.panelHidden !== true ||
-    nonProject.minimizedState.overlapsSidebar !== false ||
-    nonProject.minimizedState.overlapsReadingColumn !== false ||
-    nonProject.minimizedState.tabHitInsideRail !== true ||
-    (nonProject.minimizedState.tabBarLeft ?? 0) < (nonProject.minimizedState.sidebarRight ?? 0) ||
-    (nonProject.minimizedState.tabBarLeft ?? 0) >= (nonProject.minimizedState.readingColumnLeft ?? 0)
-  ) {
-    throw new Error(`Vertical minimized rail scenario failed: ${JSON.stringify(nonProject.minimizedState)}`);
-  }
-
-  if (
-    nonProject.homeRestoreState.location !== 'https://chatgpt.com/' ||
-    !nonProject.homeRestoreState.tabVisible ||
-    nonProject.homeRestoreState.panelHidden !== true ||
-    (nonProject.homeRestoreState.tabWidth ?? 0) < 80 ||
-    // Restored panels use the same left-gutter placement, not the old right rail.
-    nonProject.homeRestoreState.placement !== 'left-gutter' ||
-    nonProject.homeRestoreState.overlapsSidebar !== false ||
-    nonProject.homeRestoreState.overlapsReadingColumn !== false
-  ) {
-    throw new Error(
-      `Global minimized restore scenario failed: ${JSON.stringify(nonProject.homeRestoreState)}`
-    );
-  }
-
-  if (
-    includeNativeWindowSmoke &&
-    why &&
-    (
-      why.status !== 'Branch answer is ready in its ChatGPT window.' ||
-      why.formVisible !== false ||
-      why.branchLocation !== 'https://chatgpt.com/c/generated-why' ||
-      !why.openBranchVisible ||
-      !why.assistantText?.includes('This uses only the selected passage.') ||
-      !why.prompt?.includes('QUESTION\nWhy?') ||
-      // The excerpt must be framed as fallible, not as truth to defend.
-      !why.prompt?.includes('fallible excerpt')
-    )
-  ) {
-    throw new Error(`Why action scenario failed: ${JSON.stringify(why)}`);
-  }
-
-  if (
-    includeNativeWindowSmoke &&
-    newTab &&
-    (
-      newTab.sourceLocation !== 'https://chatgpt.com/c/source-new-tab' ||
-      // The draft panel stays on the source page, reporting the branch's status.
-      newTab.panelVisible !== true ||
-      // No window opened merely because New-tab was pressed.
-      newTab.noWindowBeforeQuestion !== true ||
-      newTab.location !== 'https://chatgpt.com/c/generated-new-window' ||
-      newTab.branchPanelVisible !== false ||
-      newTab.composerVisible !== true ||
-      newTab.composerFocused !== true ||
-      !newTab.userPrompt?.includes('SELECTED PASSAGE') ||
-      !newTab.userPrompt?.includes('convexity assumption guarantees the relaxation stays tight') ||
-      // The actual question was sent, once — no bootstrap message.
-      !newTab.userPrompt?.includes('Why this assumption?') ||
-      /Ready for your question/.test(newTab.userPrompt ?? '') ||
-      !newTab.assistantText?.includes('This answers the question in its own window.')
-    )
-  ) {
-    throw new Error(`New-tab scenario failed: ${JSON.stringify(newTab)}`);
-  }
-
-  if (
-    project.status !== 'Branch answer is ready in this window.' ||
-    project.branchLocation !== 'https://chatgpt.com/g/g-p-demo-project/c/generated-project' ||
-    project.privacyNote.containerWarningVisible !== true ||
-    project.privacyNote.projectBulletHidden !== true ||
-    project.privacyNote.noteOpen !== false
-  ) {
-    throw new Error(`Project embedded branch scenario failed: ${JSON.stringify(project)}`);
-  }
-
-  if (
-    enterOnly.status !== 'Branch answer is ready in this window.' ||
-    enterOnly.branchLocation !== 'https://chatgpt.com/c/generated-enter-only' ||
-    !enterOnly.prompt?.includes('QUESTION')
-  ) {
-    throw new Error(`Enter-only scenario failed: ${JSON.stringify(enterOnly)}`);
-  }
-
-  if (
-    // Unverifiable privacy must block BEFORE anything is typed or sent.
-    temporaryChatUnconfirmed.status !== 'This branch was not sent.' ||
-    !/never confirmed it|did not report/i.test(temporaryChatUnconfirmed.errorText ?? '') ||
-    temporaryChatUnconfirmed.composerValue !== '' ||
-    temporaryChatUnconfirmed.lastPrompt !== null ||
-    temporaryChatUnconfirmed.turnsRendered !== 0 ||
-    temporaryChatUnconfirmed.branchLocation.includes('/c/') ||
-    // …and the user keeps their question and a way to retry.
-    temporaryChatUnconfirmed.questionPreserved !== 'Why this assumption?' ||
-    temporaryChatUnconfirmed.formVisible !== true ||
-    // The failed state the screenshots objected to: one error, no blank frame,
-    // diagnostics behind More, recovery near the question.
-    temporaryChatUnconfirmed.failedLayout.frameShellHidden !== true ||
-    temporaryChatUnconfirmed.failedLayout.errorCount !== 1 ||
-    temporaryChatUnconfirmed.failedLayout.errorTextOccurrences !== 1 ||
-    temporaryChatUnconfirmed.failedLayout.visibleHeaderButtons.includes('Copy log') ||
-    !temporaryChatUnconfirmed.failedLayout.moreButtons.includes('Copy log') ||
-    !temporaryChatUnconfirmed.failedLayout.moreButtons.includes('Copy log + text') ||
-    !temporaryChatUnconfirmed.failedLayout.moreButtons.includes('Select log') ||
-    temporaryChatUnconfirmed.failedLayout.recoveryVisible !== true ||
-    !temporaryChatUnconfirmed.failedLayout.recoveryButtons.includes('Check again') ||
-    !temporaryChatUnconfirmed.failedLayout.recoveryButtons.includes('Show branch window') ||
-    !temporaryChatUnconfirmed.failedLayout.recoveryButtons.includes('Use ordinary mode…') ||
-    temporaryChatUnconfirmed.failedLayout.shellVisibleAfterShow !== true ||
-    // Check again re-observes the SAME document and continues there, once.
-    temporaryChatUnconfirmed.recheck.docToken !== 'unconfirmed-doc' ||
-    temporaryChatUnconfirmed.recheck.submitCount !== 1 ||
-    !temporaryChatUnconfirmed.recheck.lastPrompt?.includes('SELECTED PASSAGE') ||
-    temporaryChatUnconfirmed.recheck.location.includes('/c/') ||
-    temporaryChatUnconfirmed.recheck.status !== 'Branch answer is ready in this window.'
-  ) {
-    throw new Error(
-      `Unverified temporary chat must block the send: ${JSON.stringify(temporaryChatUnconfirmed)}`
-    );
-  }
-
-  if (
-    temporaryChatMenuChooser.awaiting.status !== 'This branch was not sent.' ||
-    !/asking for a choice/i.test(temporaryChatMenuChooser.awaiting.errorText ?? '') ||
-    !/Make the choice/.test(temporaryChatMenuChooser.awaiting.hint ?? '') ||
-    temporaryChatMenuChooser.awaiting.errorCount !== 1 ||
-    temporaryChatMenuChooser.awaiting.frameShellHidden !== true ||
-    temporaryChatMenuChooser.awaiting.privacyNoteOpen !== false ||
-    !temporaryChatMenuChooser.awaiting.recoveryButtons.includes('Check again') ||
-    !temporaryChatMenuChooser.awaiting.recoveryButtons.includes('Show branch window') ||
-    // A chooser is the provider asking a question; ordinary mode is not an answer to it.
-    temporaryChatMenuChooser.awaiting.recoveryButtons.includes('Use ordinary mode…') ||
-    // Aside opened the menu once, selected the control once, and chose nothing.
-    temporaryChatMenuChooser.frameBefore.menuTriggerClicks !== 1 ||
-    temporaryChatMenuChooser.frameBefore.toggleClicks !== 1 ||
-    temporaryChatMenuChooser.frameBefore.chooserVisible !== true ||
-    temporaryChatMenuChooser.frameBefore.choice !== null ||
-    temporaryChatMenuChooser.frameBefore.composerValue !== '' ||
-    temporaryChatMenuChooser.frameBefore.lastPrompt !== null ||
-    temporaryChatMenuChooser.frameBefore.submitCount !== 0 ||
-    // After the owner's choice and Check again: same document, one send, private.
-    temporaryChatMenuChooser.after.docToken !== 'menu-doc' ||
-    temporaryChatMenuChooser.after.choice !== 'chooser-unpersonalized' ||
-    temporaryChatMenuChooser.after.submitCount !== 1 ||
-    !temporaryChatMenuChooser.after.lastPrompt?.includes('SELECTED PASSAGE') ||
-    temporaryChatMenuChooser.after.location.includes('/c/') ||
-    temporaryChatMenuChooser.after.toggleClicks !== 1 ||
-    temporaryChatMenuChooser.after.menuTriggerClicks !== 1 ||
-    temporaryChatMenuChooser.after.temporaryChatModeActive !== true ||
-    temporaryChatMenuChooser.privateTextInLocalStorage !== false ||
-    temporaryChatMenuChooser.privateTextInSessionStorage !== true
-  ) {
-    throw new Error(
-      `Temporary chat behind a menu with a chooser failed: ${JSON.stringify(temporaryChatMenuChooser)}`
-    );
-  }
-
-  if (
-    claudeIncognitoActive.openedSeparateWindow !== false ||
-    !claudeIncognitoActive.location.startsWith('https://claude.ai/') ||
-    claudeIncognitoActive.location.includes('/chat/generated') ||
-    claudeIncognitoActive.sendClicks !== 1 ||
-    claudeIncognitoActive.incognitoClicks !== 0 ||
-    !claudeIncognitoActive.lastPrompt?.includes('SELECTED PASSAGE') ||
-    claudeIncognitoActive.privateTextInLocalStorage !== false ||
-    claudeIncognitoActive.privateTextInSessionStorage !== true ||
-    claudeIncognitoActive.logMentionsMarker !== true
-  ) {
-    throw new Error(`Claude incognito-active scenario failed: ${JSON.stringify(claudeIncognitoActive)}`);
-  }
-
-  if (
-    temporaryChatVerified.status !== 'Branch answer is ready in this window.' ||
-    temporaryChatVerified.temporaryChatToggleClicks < 1 ||
-    temporaryChatVerified.temporaryChatModeActive !== true ||
-    temporaryChatVerified.temporaryChatState !== 'true' ||
-    temporaryChatVerified.branchLocation.includes('/c/') ||
-    !temporaryChatVerified.lastPrompt?.includes('SELECTED PASSAGE') ||
-    // A private branch must never reach durable storage.
-    temporaryChatVerified.privateTextInLocalStorage !== false ||
-    temporaryChatVerified.privateTextInSessionStorage !== true
-  ) {
-    throw new Error(
-      `Verified temporary chat should send normally: ${JSON.stringify(temporaryChatVerified)}`
-    );
-  }
-
-  if (
-    // A temporary chat that cannot be turned on must block, not leak. Previously
-    // this path typed the passage into a persistent chat and reported it afterwards.
-    temporaryChatBlocked.status !== 'This branch was not sent.' ||
-    !/never confirmed it|did not report|could not find/i.test(temporaryChatBlocked.errorText ?? '') ||
-    temporaryChatBlocked.composerValue !== '' ||
-    temporaryChatBlocked.lastPrompt !== null ||
-    temporaryChatBlocked.turnsRendered !== 0 ||
-    temporaryChatBlocked.branchLocation.includes('/c/') ||
-    temporaryChatBlocked.temporaryChatToggleClicks < 1 ||
-    // Ordinary mode is offered, and only as an explicit two-step choice.
-    !temporaryChatBlocked.failedLayout.recoveryButtons.includes('Use ordinary mode…') ||
-    temporaryChatBlocked.afterFirstClick.confirmVisible !== true ||
-    !/ordinary .* chat/i.test(temporaryChatBlocked.afterFirstClick.confirmText) ||
-    temporaryChatBlocked.afterFirstClick.status !== 'This branch was not sent.' ||
-    temporaryChatBlocked.afterFirstClick.lastPrompt !== null ||
-    // Confirmed: the branch is sent as an ordinary, saved chat and says so.
-    temporaryChatBlocked.ordinary.selectedKind !== 'branch-kind-persistent' ||
-    temporaryChatBlocked.ordinary.location !== 'https://chatgpt.com/c/generated-temp-blocked' ||
-    !temporaryChatBlocked.ordinary.lastPrompt?.includes('SELECTED PASSAGE') ||
-    temporaryChatBlocked.ordinary.temporaryChatModeActive !== false
-  ) {
-    throw new Error(
-      `Temporary-chat blocked scenario failed: ${JSON.stringify(temporaryChatBlocked)}`
-    );
-  }
-
-  if (
-    !/Local branch creation failed\.|Debug log copied\./.test(failure.status ?? '') ||
-    !failure.enterFallbackTriggered ||
-    !failure.branchLocation.startsWith('https://chatgpt.com/') ||
-    failure.pageCountBefore !== failure.pageCountAfter ||
-    failure.bodyText.includes('Branch answer is ready in this window.')
-  ) {
-    throw new Error(`False-live failure scenario failed: ${JSON.stringify(failure)}`);
+  if (unservedProviderPages.length) {
+    throw new Error(`A provider page loaded without the harness serving it: ${JSON.stringify(unservedProviderPages)}`);
   }
 } catch (error) {
   exitCode = 1;
   console.error(error);
+  // What the pages themselves reported, for diagnosing a failed step.
+  for (const openPage of await browser.pages().catch(() => [])) {
+    if (openPage.__consoleMessages?.length) {
+      console.error(`CONSOLE[${openPage.url()}]`, JSON.stringify(openPage.__consoleMessages.slice(-20)));
+    }
+  }
 } finally {
   await Promise.race([browser.close().catch(() => {}), sleep(5_000)]);
   process.exit(exitCode);

@@ -2,68 +2,7 @@ import type { ChatRole } from '../types';
 
 export type ProviderId = 'chatgpt' | 'claude';
 
-/**
- * How confident Aside is that a capability works on a provider.
- *
- * - `verified`     the adapter can positively observe the capability in the live DOM
- * - `fixture-only` implemented and exercised against local fixtures, but never
- *                  confirmed against a live logged-in account. Offered, because
- *                  refusing to offer it would be worse, but not claimed as proven
- * - `unverified`   Aside has not confirmed this works here. It is attempted once and
- *                  the outcome recorded; it is never claimed as proven
- * - `unsupported`  the provider does not expose it at all in a way Aside can drive
- */
-export type CapabilitySupport = 'verified' | 'fixture-only' | 'unverified' | 'unsupported';
-
-/** Support levels Aside is willing to CLAIM. Evidence, not permission to try. */
-export function surfaceIsAvailable(support: CapabilitySupport): boolean {
-  return support === 'verified' || support === 'fixture-only';
-}
-
-/** What actually happened the last time a surface was attempted in this session. */
-export type SurfaceObservation = 'unknown' | 'worked' | 'refused';
-
-/**
- * Whether a surface is worth attempting, which is not the same question as
- * whether Aside can claim it works.
- *
- * Tying the two together is how Claude ended up opening every branch in a separate
- * window: `embedded` was marked unsupported on an assumption about framing headers
- * that nobody had checked, and because the same flag gated the attempt, nothing
- * ever could check it. A surface whose only evidence comes from trying it has to
- * be allowed to try.
- *
- * `unsupported` remains a hard no, so this grants no provider an attempt it was
- * never meant to have.
- */
-export function surfaceMayBeAttempted(
-  support: CapabilitySupport,
-  observed: SurfaceObservation = 'unknown'
-): boolean {
-  if (observed === 'refused') {
-    return false;
-  }
-  if (observed === 'worked') {
-    return true;
-  }
-  return support !== 'unsupported';
-}
-
 export type PrivacyMode = 'persistent' | 'private';
-
-/** What the DOM says about the provider's private-mode control right now. */
-export type PrivacyControlState = 'active' | 'inactive' | 'unknown' | 'missing';
-
-export interface PrivacyCapabilityReport {
-  /** The provider's own name for the mode, shown in the UI. */
-  label: string;
-  support: CapabilitySupport;
-  state: PrivacyControlState;
-  /** Why the support level is what it is; surfaced to the user verbatim. */
-  detail: string;
-  /** True when entering private mode leaves the current project/container. */
-  leavesContainer: boolean;
-}
 
 /**
  * Identity of the page Aside is looking at.
@@ -147,46 +86,6 @@ export interface LayoutAdapter {
   getReadingColumnRect(doc: Document): DOMRect | null;
 }
 
-export interface ComposerAdapter {
-  /** Candidate selectors for the prompt input, best first. */
-  composerSelectors: string[];
-  /** Candidate selectors for the submit control. */
-  sendButtonSelectors: string[];
-  /** Selectors for the stop/generating indicator. */
-  stopButtonSelectors: string[];
-  /** Selectors for the private-mode control (temporary chat / incognito). */
-  privacyControlSelectors: string[];
-  /** Labels that positively identify the private-mode control. */
-  privacyControlLabelPattern: RegExp;
-  /** Label patterns that mean "private mode is currently OFF". */
-  privacyInactiveLabelPattern: RegExp;
-  /** Label patterns that mean "private mode is currently ON". */
-  privacyActiveLabelPattern: RegExp;
-  /**
-   * Menu openers near the composer that may reveal the private-mode control when
-   * it is not rendered. Opening a menu is reversible and identifiable
-   * (aria-haspopup); it is the only provider click made before verification.
-   */
-  privacyMenuTriggerSelectors?: string[];
-  /**
-   * Provider-owned markers of the ACTIVE private interface — the label or badge
-   * the provider itself renders once the mode is on. Matched only outside message
-   * content and outside Aside's UI. Candidates until observed live.
-   */
-  privacyActiveInterfaceSelectors?: string[];
-  /** Dialogs the provider shows to ask a choice before the first private send. */
-  privacyChooserSelectors?: string[];
-}
-
-export interface SurfaceSupport {
-  /** Whether the provider can be driven inside an in-page iframe. */
-  embedded: CapabilitySupport;
-  /** Whether Aside can drive a provider tab/window it opened. */
-  nativeWindow: CapabilitySupport;
-  /** Human-readable reason shown when a surface is not available. */
-  detail: string;
-}
-
 export interface ProviderAdapter {
   id: ProviderId;
   /** Display name used in the UI. */
@@ -206,14 +105,9 @@ export interface ProviderAdapter {
 
   transcript: TranscriptAdapter;
   layout: LayoutAdapter;
-  composer: ComposerAdapter;
-  surfaces: SurfaceSupport;
 
-  /** Static description of the provider's private mode. */
+  /** The provider's own name for its temporary conversation mode. */
   privacy: {
     label: string;
-    /** Documented constraints shown to the user before a private branch runs. */
-    constraints: string[];
-    leavesContainer: boolean;
   };
 }

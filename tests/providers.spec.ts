@@ -11,7 +11,6 @@ import {
   findChatAdapterForUrl,
   getAdapter
 } from '../src/shared/providers';
-import { surfaceIsAvailable, surfaceMayBeAttempted } from '../src/shared/providers/types';
 
 describe('provider routing', () => {
   it('routes each chat origin to its own adapter', () => {
@@ -143,96 +142,6 @@ describe('scope keys never collide across providers', () => {
     const claude = claudeAdapter.identify('https://claude.ai/chat/same-id', 'sess');
 
     expect(chatgpt.scopeKey).not.toBe(claude.scopeKey);
-  });
-});
-
-describe('declared capabilities are explicit, not optimistic', () => {
-  it('explains what happens to a Claude branch, including the fallback', () => {
-    expect(claudeAdapter.surfaces.detail).toMatch(/frame/i);
-    // The detail must still promise the fallback, since a refusal is possible on
-    // an account or policy this evidence does not cover.
-    expect(claudeAdapter.surfaces.detail).toMatch(/falls back/i);
-  });
-
-  it('claims no surface as live-verified', () => {
-    // `verified` means the adapter positively observes the capability in the live
-    // DOM. The runtime observation does that per session; the static declaration
-    // must not claim it for every account in advance.
-    [chatgptAdapter, claudeAdapter].forEach((adapter) => {
-      expect(adapter.surfaces.embedded).not.toBe('verified');
-      expect(adapter.surfaces.nativeWindow).not.toBe('verified');
-    });
-  });
-
-  it('offers every surface it has evidence for, on both providers', () => {
-    // Honesty about evidence must not turn into refusing to run. Claude's panel
-    // frame is claimable now: a live run observed it load, and a fixture
-    // exercises it.
-    expect(surfaceIsAvailable(claudeAdapter.surfaces.nativeWindow)).toBe(true);
-    expect(surfaceIsAvailable(claudeAdapter.surfaces.embedded)).toBe(true);
-    expect(surfaceIsAvailable(chatgptAdapter.surfaces.embedded)).toBe(true);
-    // Nothing is claimable that the provider genuinely does not expose.
-    expect(surfaceIsAvailable('unsupported')).toBe(false);
-  });
-
-  it('separates what may be attempted from what may be claimed', () => {
-    // The defect this exists for: Claude's embedded surface was marked
-    // unsupported on an unchecked assumption, and because the same flag gated the
-    // attempt, nothing could ever check it.
-    expect(surfaceMayBeAttempted('unverified')).toBe(true);
-    expect(surfaceIsAvailable('unverified')).toBe(false);
-  });
-
-  it('records that the Claude panel frame has been observed to load', () => {
-    // A live run logged frameRefused:false at claude.ai/new. Not 'verified':
-    // one account is not every account, and a refusal still falls back.
-    expect(claudeAdapter.surfaces.embedded).toBe('fixture-only');
-    expect(surfaceMayBeAttempted(claudeAdapter.surfaces.embedded)).toBe(true);
-  });
-
-  it('stops attempting a surface once it has been observed to fail', () => {
-    expect(surfaceMayBeAttempted('fixture-only', 'refused')).toBe(false);
-    expect(surfaceMayBeAttempted('unverified', 'worked')).toBe(true);
-  });
-
-  it('never attempts a surface declared unsupported, whatever was observed', () => {
-    // An observation must not be able to grant a surface a provider does not have.
-    expect(surfaceMayBeAttempted('unsupported', 'unknown')).toBe(false);
-    expect(surfaceMayBeAttempted('unsupported', 'refused')).toBe(false);
-  });
-
-  it('no longer states as fact that claude.ai refuses to be framed', () => {
-    // It sends X-Frame-Options: SAMEORIGIN and no frame-ancestors directive, and
-    // Aside's frame is a same-origin child of the claude.ai page.
-    expect(claudeAdapter.surfaces.detail).not.toMatch(/refuses to be embedded/i);
-    expect(claudeAdapter.surfaces.detail).toMatch(/falls back/i);
-  });
-
-  it('records that private mode leaves a project on both providers', () => {
-    // ChatGPT was `false` here on an assumption. A live run launched a Temporary
-    // branch at a project route and found the Temporary Chat control present but
-    // unrendered — a 0x0 box — which is what "not offered here" looks like from
-    // the DOM. Both providers now say what they do with the project.
-    expect(claudeAdapter.privacy.leavesContainer).toBe(true);
-    expect(chatgptAdapter.privacy.leavesContainer).toBe(true);
-    expect(claudeAdapter.privacy.constraints.join(' ')).toMatch(/project/i);
-    expect(chatgptAdapter.privacy.constraints.join(' ')).toMatch(/project/i);
-    expect(chatgptAdapter.privacy.constraints.join(' ')).toMatch(/personaliz/i);
-  });
-
-  it('offers a container-free launch url for a private branch', () => {
-    // The root cause of the live refusal: a private branch launched at the
-    // project route, where the provider does not offer its private mode at all.
-    const inProject = chatgptAdapter.identify(
-      'https://chatgpt.com/g/g-p-abc/c/conv-1',
-      'sess'
-    );
-    expect(inProject.containerId).toBeTruthy();
-    expect(inProject.launchUrl).toMatch(/\/project$/);
-    expect(inProject.rootLaunchUrl).toBe('https://chatgpt.com/');
-
-    const claudeProject = claudeAdapter.identify('https://claude.ai/project/p-1', 'sess');
-    expect(claudeProject.rootLaunchUrl).toBe('https://claude.ai/new');
   });
 });
 

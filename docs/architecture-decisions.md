@@ -3,6 +3,53 @@
 One record of what was chosen and why. It describes the implementation that
 shipped, not alternatives that were considered and dropped.
 
+## D0. The execution contract is a native human handoff (current)
+
+Aside prepares a question and hands it to the provider's own web page; the Owner
+completes it there. The active path is:
+
+selection → Ask / Why / New-tab → a scratch handoff card (context planned and
+previewed) → explicit **Copy & open** → a new top-level provider page → the
+Owner confirms Temporary/Incognito, personalization and model, pastes and sends
+→ answers and follow-ups stay native → return to source → explicit **End &
+discard** (or an explicit, previewed **Save local note**).
+
+Aside never activates a provider mode, never types, pastes, presses Enter or
+clicks Send in a provider page, never reads the new answer back, never frames a
+provider page, and never creates a durable record for a new question by default.
+The previous automatic runner (D5, D6, D9 below) is **retired**, not repaired:
+its code was removed from the content script and the worker, the worker refuses
+its message types from any client (`retired`), and the content script no longer
+runs in frames. The live failures reported against that runner (ChatGPT
+Temporary behind a menu, Claude Incognito shown as a label) are superseded by the
+manual handoff, not fixed by it.
+
+Why: a user-controlled handoff uses the Owner's existing sign-in and the
+provider's own privacy UI as they are, and removes the class of failures where a
+detector misreads a changing interface. The cost is explicit manual steps, which
+the card makes short and says plainly.
+
+Pieces (all under `src/handoff/` unless noted):
+
+- `routes.ts` — the typed provider descriptor: convenience and base routes,
+  hosts, short native steps and notes. Routes carry no content, ever.
+- `prompt.ts` — `preparePrompt`: the same `ContextPlan` compiler and template,
+  one frozen `PreparedPrompt` per revision; the preview and the clipboard both use
+  its `text`. A revision advances only when the text changes.
+- `authority.ts` — the worker's single writer for `ScratchHandoff` sessions:
+  memory mirrored to `chrome.storage.session` (never local/sync; memory-only when
+  session storage is unavailable), requests authorized by the sender's tab (or an
+  extension page), build-checked, epoch-checked, never an implicit create; target
+  ownership (blank tab first, registered, then navigated), focus-not-duplicate,
+  closure only of a demonstrably owned tab, purge before closure, purge on target
+  close, source close keeps the target, rehydration without any external action.
+- `save-note.ts` — one `CreateQuestion` command that carries its note, so the
+  explicit local note is atomic (`providerMode: 'native-handoff'`, no link, no
+  captured messages, no snapshot).
+- `src/content/handoff-card.ts` — the card; `src/ui/popup.ts` — the toolbar
+  popup of active sessions; a native destination page is inert (the worker tells
+  its content script it is a target, and nothing is mounted).
+
 ## D1. A question is a record, the panel is a view of it
 
 Durable questions live in an extension-origin IndexedDB (`aside-questions`,
@@ -59,7 +106,7 @@ stripper is kept only so an old answer that still carries the marker is not
 displayed with it. New-tab no longer sends a "Ready for your question." message
 to initialise a branch: it opens the same draft and sends the real question once.
 
-## D5. Capture is honest
+## D5. Capture is honest (retired for new questions — see D0)
 
 The branch page reads its exposed messages back with the same transcript
 extraction the reading page uses, plus streaming markers and the provider's
@@ -69,7 +116,7 @@ never from a timeout. Every saved thread carries one of three states: link only,
 partially captured (with the last capture time), captured through message N.
 "Captured through" is not a promise that nothing changed remotely afterwards.
 
-## D6. Execution surface (evidence-based)
+## D6. Execution surface (retired — see D0)
 
 Kept: the provider-native surface — the in-page frame where the provider allows
 framing, a window Aside drives where it does not — behind the runtime boundary.
@@ -94,14 +141,13 @@ view shut in another. What tabs do share is the record.
 ## D8. Diagnostics carry a build id
 
 `scripts/build.mjs` injects `<short sha>[-dirty]+<timestamp>` as `__ASIDE_BUILD__`;
-it appears in the panel's Copy-log header and the library footer so an installed
-candidate can be matched to a commit. The id also travels in every handshake —
-the worker's `PANEL_LIST` answer, the frame's `SB_FRAME_READY`, the branch tab's
-run and re-check responses, and every preparation/failure event — and a
-mismatch is logged as `stale-client` and surfaced as a reload notice. "It does
-nothing" reports that were really two builds talking are now visible as such.
+it appears in the popup, the library footer, a card's diagnostics and a saved
+view's Copy-log header, so an installed candidate can be matched to a commit.
+Every handoff request carries the page's build and is refused as `stale-client`
+when it differs from the worker's; `PANEL_LIST` answers with the worker's build.
+A native destination page runs no Aside handshake (it is inert by design).
 
-## D9. Private mode is a typed observation; preparation is a workflow
+## D9. Private mode as a typed observation (retired — see D0)
 
 `src/runtime/private-mode.ts` observes the branch document and returns three
 separate facts — capability (`available` / `not-observed-yet` /
@@ -146,3 +192,20 @@ Per provider and capability the evidence label is one of implemented /
 fixture-tested / live-tested / blocked / unsupported. Offline fixtures prove
 behaviour against a fixture, not a live site; the owner acceptance walkthrough
 is what settles live coverage.
+
+## D11. Saved records stay; their old runner does not
+
+Existing durable questions, notes, snapshots, captured threads and legacy panel
+view records are kept and usable (library, question list, search, lifecycle,
+delete with tombstones, export, backup/restore). A legacy panel on its source
+page is a read-only view: its provider link opens as ordinary navigation (blank
+tab first, then the URL), and "Ask about this passage" starts a new scratch
+handoff without touching the record. The content script sends no panel writes
+from these views except the per-tab view state (minimize/close).
+
+## D12. Passage return is validated, not guessed
+
+`locatePassage` accepts an occurrence only when its recorded context agrees; with
+message identity it searches that message, without it the whole page — and more
+than one agreeing place is reported as ambiguous rather than picked. A message
+whose passage changed is shown as such. No positional or scroll-offset fallback.

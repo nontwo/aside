@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Aside</title>
+    <style>
+      :root { color-scheme: light dark; --bg: #ffffff; --fg: #111827; --muted: #6b7280; --line: rgba(15,23,42,.12); --card: rgba(15,23,42,.03); --accent: #111827; --accent-fg: #fff; --danger: #991b1b; }
+      @media (prefers-color-scheme: dark) { :root { --bg: #0f1115; --fg: #e5e7eb; --muted: #9ca3af; --line: rgba(255,255,255,.12); --card: rgba(255,255,255,.04); --accent: #e5e7eb; --accent-fg: #0f1115; --danger: #fca5a5; } }
+      body { margin: 0; width: 360px; background: var(--bg); color: var(--fg); font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+      header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+      header h1 { margin: 0; font-size: 15px; }
+      main { padding: 10px 14px; display: grid; gap: 10px; }
+      h2 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+      button { font: inherit; padding: 5px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+      button.primary { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+      button:disabled { opacity: .5; cursor: default; }
+      .session { border: 1px solid var(--line); border-radius: 12px; padding: 10px; background: var(--card); display: grid; gap: 6px; }
+      .session p { margin: 0; }
+      .meta, .status, footer p, .empty { color: var(--muted); font-size: 12px; }
+      .row { display: flex; flex-wrap: wrap; gap: 6px; }
+      .confirm { border-top: 1px solid var(--line); padding-top: 6px; display: grid; gap: 6px; }
+      .confirm[hidden] { display: none; }
+      footer { padding: 8px 14px 12px; border-top: 1px solid var(--line); }
+      footer p { margin: 0 0 4px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Aside</h1>
+      <button id="open-library" type="button">Open library</button>
+    </header>
+    <main>
+      <h2>Active temporary handoffs</h2>
+      <div id="sessions"></div>
+    </main>
+    <footer>
+      <p>Temporary handoffs are not saved in Aside. They are cleared when you End them, when their chat tab closes, or when the browser or extension restarts.</p>
+      <p id="build"></p>
+    </footer>
+    <script src="assets/popup.js"></script>
+  </body>
+</html>

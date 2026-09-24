@@ -323,91 +323,9 @@ export const claudeAdapter: ProviderAdapter = {
     }
   },
 
-  composer: {
-    composerSelectors: [
-      'div[contenteditable="true"].ProseMirror',
-      'fieldset div[contenteditable="true"]',
-      'div[contenteditable="true"][role="textbox"]',
-      'div[contenteditable="true"][data-testid]',
-      'div[contenteditable="true"]'
-    ],
-    sendButtonSelectors: [
-      'button[aria-label="Send message" i]',
-      'button[aria-label*="send" i]',
-      'button[type="submit"]',
-      'button',
-      '[role="button"]'
-    ],
-    stopButtonSelectors: [
-      'button[aria-label*="stop" i]',
-      'button[aria-label*="停止"]',
-      '[data-testid="stop-button"]'
-    ],
-    privacyControlSelectors: [
-      'button[aria-label*="incognito" i]',
-      'button[title*="incognito" i]',
-      '[role="button"][aria-label*="incognito" i]',
-      '[role="button"][title*="incognito" i]',
-      '[role="menuitem"][aria-label*="incognito" i]',
-      'button[aria-label*="无痕" ]',
-      'button[title*="无痕"]'
-    ],
-    privacyControlLabelPattern: /incognito|无痕/i,
-    // Claude documents the launch control as a ghost icon in the upper right of a
-    // new chat outside projects. If it sits behind a menu, these openers are tried.
-    privacyMenuTriggerSelectors: [
-      'header button[aria-haspopup="menu"]',
-      'form button[aria-haspopup="menu"]',
-      'form button[aria-haspopup="true"]'
-    ],
-    // Claude documents the ACTIVE interface as a black border with an
-    // "Incognito chat" label in the upper left. Candidates for that label; matched
-    // only in provider chrome, never in message text.
-    privacyActiveInterfaceSelectors: [
-      '[data-testid*="incognito" i]',
-      'header [aria-label*="incognito" i]',
-      '[aria-label="Incognito chat" i]',
-      '[role="status"][aria-label*="incognito" i]',
-      'header [title*="incognito" i]'
-    ],
-    privacyInactiveLabelPattern:
-      /start incognito|new incognito|turn on incognito|enable incognito|incognito off|开启无痕|启用无痕/i,
-    privacyActiveLabelPattern:
-      /leave incognito|exit incognito|turn off incognito|disable incognito|incognito on|end incognito|关闭无痕|退出无痕/i
-  },
-
-  surfaces: {
-    // This said 'unsupported', with a comment asserting that claude.ai sends
-    // frame-ancestors headers blocking embedding. That was never checked, and the
-    // evidence available contradicts it: claude.ai sends `X-Frame-Options:
-    // SAMEORIGIN` and no frame-ancestors directive, and Aside's frame is a
-    // same-origin child of the claude.ai page, which SAMEORIGIN permits.
-    //
-    // That evidence is suggestive, not conclusive — it comes from an
-    // unauthenticated response — so this is not flipped to "supported" either.
-    // It is attempted once, the outcome is observed from the rendered frame, and
-    // a refusal falls back to a driven window for the rest of the session.
-    // Upgraded from 'unverified' on evidence from a live logged-in account: the
-    // frame loaded and completed its handshake at claude.ai/new, logged as
-    // "frameRefused": false. It is 'fixture-only' rather than 'verified' because
-    // one successful load on one account is not a guarantee for every account or
-    // enterprise policy — a refusal is still detected at runtime and falls back.
-    embedded: 'fixture-only',
-    // Implemented and fixture-exercised, never run against a live Claude account.
-    // See the SELECTOR PROVENANCE note at the top of this file.
-    nativeWindow: 'fixture-only',
-    detail:
-      'Aside runs Claude branches in an in-page panel frame, which has been observed to load on a live account. If claude.ai refuses to be framed on yours, the branch falls back to a window Aside controls and stays there for the rest of the session.'
-  },
-
+  // The provider's own name for its temporary conversation mode. Aside names it
+  // in the handoff guidance; it never operates the mode itself.
   privacy: {
-    label: 'Incognito chat',
-    constraints: [
-      'Claude starts an incognito chat from the ghost icon in the upper right of a new chat outside a project; the ghost icon is not shown inside a project, so a private branch from a project conversation starts outside it and its files and instructions do not travel with the branch.',
-      'Incognito chats open in Claude\'s previous chat experience, so Claude cannot create files or run code in them. Once on, the interface shows a black border and an "Incognito chat" label; Aside verifies that, it does not assume it.',
-      'An incognito chat is not saved to your chat history and is not used for training; Anthropic still retains it for a period (30 days by default, or your organisation\'s setting). A closed Incognito chat cannot be reopened.',
-      'Aside can only observe the page. It cannot prove anything about server-side retention.'
-    ],
-    leavesContainer: true
+    label: 'Incognito chat'
   }
 };
