@@ -797,7 +797,7 @@ export class HandoffCard {
       } else {
         this.noteStatus.textContent =
           response?.code === 'stale-client'
-            ? 'Not saved: Aside was updated. Reload this page first.'
+            ? "Not saved: Aside's page and background builds differ. Reload Aside in chrome://extensions, then this page."
             : 'Not saved. Nothing was written; your note is still here.';
       }
     } finally {
@@ -889,7 +889,7 @@ export class HandoffCard {
 
   markStale(): void {
     this.staleClient = true;
-    this.targetLine = 'Aside was updated. Reload this page to keep using it; this question is not affected until you do.';
+    this.targetLine = "Aside's page and background builds differ: press Reload on Aside in chrome://extensions, then reload this page.";
     this.render();
   }
 

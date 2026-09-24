@@ -179,7 +179,7 @@ function reportStaleClient(runtime: PanelRuntime | null, source: string, otherBu
   if (runtime) {
     appendPanelLog(runtime, entry);
   }
-  notifyAside('Aside was updated. Reload this page so it runs the current build.');
+  notifyAside("Aside's page and background builds differ: press Reload on Aside in chrome://extensions, then reload this page.");
 }
 
 function hasRuntimeAccess(): boolean {
@@ -4323,7 +4323,7 @@ async function openHandoff(entry: HandoffEntry, selection: SelectionPayload, que
     return;
   }
   if (response.code === 'stale-client') {
-    notifyAside('Aside was updated. Reload this page to use the new version.');
+    notifyAside("Aside's page and background builds differ: press Reload on Aside in chrome://extensions, then reload this page.");
     return;
   }
   if (!response.ok || !response.session) {
